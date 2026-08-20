@@ -1,51 +1,140 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import shutil
 import traceback
 import uuid
 from datetime import datetime
 from pathlib import Path
 
 import aiofiles
+import boto3
+from botocore.exceptions import ClientError
 from fastapi import UploadFile
 
 from app.application.jobs.job_manager import JobManager
 from app.application.jobs.job_status import JobStatus
 from app.core.constants import RAW_UPLOAD
 from app.etl.detector.detector import FileDetector
-from app.etl.detector.month_resolver import MonthResolver
-from app.etl.validator.validator import DatasetValidator
 
+
+# ==========================================================
+# CONFIGURATION
+# ==========================================================
 
 UPLOAD_FOLDER = RAW_UPLOAD
 
 CHUNK_SIZE = 20 * 1024 * 1024
 
+S3_ENDPOINT = os.getenv("S3_ENDPOINT", "").strip()
+S3_REGION = os.getenv(
+    "S3_REGION",
+    "ap-southeast-1",
+).strip()
+
+S3_ACCESS_KEY_ID = os.getenv(
+    "S3_ACCESS_KEY_ID",
+    "",
+).strip()
+
+S3_SECRET_ACCESS_KEY = os.getenv(
+    "S3_SECRET_ACCESS_KEY",
+    "",
+).strip()
+
+S3_BUCKET = os.getenv(
+    "S3_BUCKET",
+    "pln-analytics-uploads",
+).strip()
+
+# Prefixes inside Supabase Storage bucket.
+S3_CHUNK_PREFIX = "chunks"
+S3_JOB_PREFIX = "jobs"
+
+
+# ==========================================================
+# S3 CLIENT
+# ==========================================================
+
+
+def _create_s3_client():
+    """
+    Create an S3-compatible client for Supabase Storage.
+
+    The client is created lazily so the application can still
+    start locally when S3 environment variables are absent.
+    """
+
+    if not S3_ENDPOINT:
+        raise RuntimeError(
+            "S3_ENDPOINT environment variable is not configured."
+        )
+
+    if not S3_ACCESS_KEY_ID:
+        raise RuntimeError(
+            "S3_ACCESS_KEY_ID environment variable is not configured."
+        )
+
+    if not S3_SECRET_ACCESS_KEY:
+        raise RuntimeError(
+            "S3_SECRET_ACCESS_KEY environment variable is not configured."
+        )
+
+    return boto3.client(
+        "s3",
+        endpoint_url=S3_ENDPOINT,
+        region_name=S3_REGION,
+        aws_access_key_id=S3_ACCESS_KEY_ID,
+        aws_secret_access_key=S3_SECRET_ACCESS_KEY,
+    )
+
+
+# ==========================================================
+# UPLOAD SERVICE
+# ==========================================================
+
 
 class UploadService:
     """
-    Upload service.
+    Persistent upload service.
 
     SMALL FILE
         upload
+        -> local temporary file
         -> inspect
         -> manifest
 
     LARGE FILE
         chunk 1..N
+        -> each chunk uploaded to Supabase Storage
         -> /complete
-        -> return immediately
+        -> verify chunks in Supabase
+        -> create durable job metadata
         -> background assembly
+        -> download chunks from Supabase
+        -> assemble local file
         -> lightweight filename detection
         -> manifest
         -> ETL
 
     IMPORTANT:
-    Large chunked upload MUST NOT call MonthResolver or
-    DatasetValidator during assembly.
 
-    Those operations may read a 700+ MB Excel file.
+    Chunk data is NOT treated as durable local filesystem data.
+
+    Supabase Storage is the source of truth for chunked uploads.
+
+    Therefore a FastAPI Cloud restart/redeployment does not
+    destroy an unfinished upload.
+
+    Large Excel files are NEVER inspected during assembly.
+    MonthResolver and DatasetValidator remain deferred to ETL.
     """
+
+    # ==========================================================
+    # COORDINATE MASTER FILES
+    # ==========================================================
 
     COORDINATE_MASTER_FILES = {
         "to_prabayar.xlsx",
@@ -127,11 +216,271 @@ class UploadService:
         )
 
     # ==========================================================
+    # S3 KEY HELPERS
+    # ==========================================================
+
+    @staticmethod
+    def _chunk_s3_key(
+        upload_id: str,
+        chunk_number: int,
+    ) -> str:
+        return (
+            f"{S3_CHUNK_PREFIX}/"
+            f"{upload_id}/"
+            f"{chunk_number:08d}.part"
+        )
+
+    @staticmethod
+    def _job_file_s3_key(
+        job_id: str,
+        filename: str,
+    ) -> str:
+        return (
+            f"{S3_JOB_PREFIX}/"
+            f"{job_id}/"
+            f"{filename}"
+        )
+
+    @staticmethod
+    def _job_manifest_s3_key(
+        job_id: str,
+    ) -> str:
+        return (
+            f"{S3_JOB_PREFIX}/"
+            f"{job_id}/manifest.json"
+        )
+
+    @staticmethod
+    def _job_metadata_s3_key(
+        job_id: str,
+    ) -> str:
+        return (
+            f"{S3_JOB_PREFIX}/"
+            f"{job_id}/job.json"
+        )
+
+    # ==========================================================
+    # S3 HELPERS
+    # ==========================================================
+
+    @classmethod
+    async def _s3_put_file(
+        cls,
+        local_path: Path,
+        s3_key: str,
+    ) -> None:
+        """
+        Upload a local file to Supabase Storage.
+
+        boto3 is synchronous, therefore it is executed in a
+        worker thread so the FastAPI event loop is not blocked.
+        """
+
+        def _upload() -> None:
+            client = _create_s3_client()
+
+            client.upload_file(
+                str(local_path),
+                S3_BUCKET,
+                s3_key,
+                ExtraArgs={
+                    "ContentType": (
+                        "application/octet-stream"
+                    ),
+                },
+            )
+
+        await asyncio.to_thread(
+            _upload,
+        )
+
+    @classmethod
+    async def _s3_download_file(
+        cls,
+        s3_key: str,
+        local_path: Path,
+    ) -> None:
+        """
+        Download a file from Supabase Storage.
+        """
+
+        local_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        def _download() -> None:
+            client = _create_s3_client()
+
+            client.download_file(
+                S3_BUCKET,
+                s3_key,
+                str(local_path),
+            )
+
+        await asyncio.to_thread(
+            _download,
+        )
+
+    @classmethod
+    async def _s3_head(
+        cls,
+        s3_key: str,
+    ) -> bool:
+        """
+        Check whether an object exists.
+        """
+
+        def _head() -> bool:
+            client = _create_s3_client()
+
+            try:
+                client.head_object(
+                    Bucket=S3_BUCKET,
+                    Key=s3_key,
+                )
+                return True
+
+            except ClientError as exc:
+                error_code = (
+                    exc.response
+                    .get("Error", {})
+                    .get("Code")
+                )
+
+                if error_code in {
+                    "404",
+                    "NoSuchKey",
+                    "NotFound",
+                }:
+                    return False
+
+                raise
+
+        return await asyncio.to_thread(
+            _head,
+        )
+
+    @classmethod
+    async def _s3_put_json(
+        cls,
+        s3_key: str,
+        payload: dict,
+    ) -> None:
+        """
+        Store durable JSON metadata in Supabase Storage.
+        """
+
+        body = json.dumps(
+            payload,
+            indent=4,
+            default=str,
+        ).encode("utf-8")
+
+        def _put() -> None:
+            client = _create_s3_client()
+
+            client.put_object(
+                Bucket=S3_BUCKET,
+                Key=s3_key,
+                Body=body,
+                ContentType="application/json",
+            )
+
+        await asyncio.to_thread(
+            _put,
+        )
+
+    @classmethod
+    async def _s3_get_json(
+        cls,
+        s3_key: str,
+    ) -> dict:
+        """
+        Read durable JSON metadata from Supabase Storage.
+        """
+
+        def _get() -> dict:
+            client = _create_s3_client()
+
+            response = client.get_object(
+                Bucket=S3_BUCKET,
+                Key=s3_key,
+            )
+
+            raw = response["Body"].read()
+
+            return json.loads(
+                raw.decode("utf-8"),
+            )
+
+        return await asyncio.to_thread(
+            _get,
+        )
+
+    @classmethod
+    async def _s3_delete_prefix(
+        cls,
+        prefix: str,
+    ) -> None:
+        """
+        Delete all objects under a prefix.
+
+        Used only after successful assembly.
+        """
+
+        def _delete() -> None:
+            client = _create_s3_client()
+
+            paginator = client.get_paginator(
+                "list_objects_v2",
+            )
+
+            objects: list[dict] = []
+
+            for page in paginator.paginate(
+                Bucket=S3_BUCKET,
+                Prefix=prefix,
+            ):
+                objects.extend(
+                    page.get(
+                        "Contents",
+                        [],
+                    )
+                )
+
+            if not objects:
+                return
+
+            for offset in range(
+                0,
+                len(objects),
+                1000,
+            ):
+                batch = objects[
+                    offset : offset + 1000
+                ]
+
+                client.delete_objects(
+                    Bucket=S3_BUCKET,
+                    Delete={
+                        "Objects": [
+                            {
+                                "Key": item["Key"],
+                            }
+                            for item in batch
+                        ],
+                    },
+                )
+
+        await asyncio.to_thread(
+            _delete,
+        )
+
+    # ==========================================================
     # NORMAL FILE INSPECTION
     #
-    # Small files ONLY.
-    #
-    # Large chunked files must NOT use this during assembly.
+    # Small files only.
     # ==========================================================
 
     @classmethod
@@ -151,6 +500,16 @@ class UploadService:
         }
 
         try:
+            # Lazy imports intentionally kept out of the large
+            # chunk assembly path.
+
+            from app.etl.detector.month_resolver import (
+                MonthResolver,
+            )
+            from app.etl.validator.validator import (
+                DatasetValidator,
+            )
+
             dataset = FileDetector.detect(
                 destination,
             )
@@ -255,6 +614,7 @@ class UploadService:
 
         print("=" * 80)
         print("UPLOAD START")
+        print("UPLOAD MODE : NORMAL")
         print("=" * 80)
 
         job_id = cls._new_job_id()
@@ -272,6 +632,7 @@ class UploadService:
         uploaded: list[dict] = []
 
         for file in files:
+
             original_filename = (
                 file.filename
                 or "uploaded_file"
@@ -337,6 +698,10 @@ class UploadService:
 
     # ==========================================================
     # CHUNK UPLOAD
+    #
+    # CHUNK IS STORED IN SUPABASE.
+    #
+    # Local disk is only a temporary staging area.
     # ==========================================================
 
     @classmethod
@@ -369,74 +734,98 @@ class UploadService:
             filename,
         )
 
-        chunks_folder = (
+        # Temporary local staging.
+        temp_folder = (
             UPLOAD_FOLDER
-            / "_chunks"
+            / "_temp_chunks"
             / upload_id
         )
 
-        chunks_folder.mkdir(
+        temp_folder.mkdir(
             parents=True,
             exist_ok=True,
         )
 
-        chunk_path = (
-            chunks_folder
+        temp_path = (
+            temp_folder
             / f"{chunk_number:08d}.part"
         )
 
         received = 0
 
-        async with aiofiles.open(
-            chunk_path,
-            "wb",
-        ) as output:
+        try:
+            async with aiofiles.open(
+                temp_path,
+                "wb",
+            ) as output:
 
-            while True:
-                data = await file.read(
-                    1024 * 1024,
+                while True:
+                    data = await file.read(
+                        1024 * 1024,
+                    )
+
+                    if not data:
+                        break
+
+                    received += len(data)
+
+                    await output.write(
+                        data,
+                    )
+
+            s3_key = cls._chunk_s3_key(
+                upload_id,
+                chunk_number,
+            )
+
+            print("=" * 80)
+            print("CHUNK UPLOAD")
+            print("Upload ID :", upload_id)
+            print(
+                "Chunk     :",
+                f"{chunk_number + 1}/{total_chunks}",
+            )
+            print("Size      :", received)
+            print("S3 Key    :", s3_key)
+            print("=" * 80)
+
+            await cls._s3_put_file(
+                temp_path,
+                s3_key,
+            )
+
+            print(
+                "✓ CHUNK STORED IN SUPABASE:",
+                s3_key,
+            )
+
+            return {
+                "success": True,
+                "upload_id": upload_id,
+                "filename": safe_filename,
+                "chunk_number": chunk_number,
+                "total_chunks": total_chunks,
+                "received_bytes": received,
+                "storage": "supabase",
+            }
+
+        finally:
+            try:
+                temp_path.unlink(
+                    missing_ok=True,
                 )
-
-                if not data:
-                    break
-
-                received += len(data)
-
-                await output.write(
-                    data,
-                )
-
-        print(
-            "CHUNK RECEIVED:",
-            upload_id,
-            chunk_number,
-            "/",
-            total_chunks,
-            received,
-            "bytes",
-        )
-
-        return {
-            "success": True,
-            "upload_id": upload_id,
-            "filename": safe_filename,
-            "chunk_number": chunk_number,
-            "total_chunks": total_chunks,
-            "received_bytes": received,
-        }
+            except Exception:
+                traceback.print_exc()
 
     # ==========================================================
     # PREPARE CHUNK UPLOAD
     #
     # IMPORTANT:
-    # This is intentionally FAST.
     #
-    # It ONLY:
-    # - verifies chunks
-    # - creates job folder
-    # - writes chunk_upload.json
+    # This operation does NOT assemble the file.
     #
-    # NO ASSEMBLY.
+    # It verifies the chunks EXIST IN SUPABASE, creates a
+    # durable job metadata object, then returns immediately.
     # ==========================================================
 
     @classmethod
@@ -457,35 +846,38 @@ class UploadService:
             filename,
         )
 
-        chunks_folder = (
-            UPLOAD_FOLDER
-            / "_chunks"
-            / upload_id
-        )
-
-        if not chunks_folder.exists():
-            raise FileNotFoundError(
-                f"Upload '{upload_id}' not found.",
-            )
+        print("=" * 80)
+        print("PREPARING CHUNKED UPLOAD")
+        print("Upload ID    :", upload_id)
+        print("Filename     :", safe_filename)
+        print("Total chunks :", total_chunks)
+        print("Storage      : SUPABASE")
+        print("=" * 80)
 
         missing_chunks: list[int] = []
 
+        # Verify every chunk directly in durable storage.
         for index in range(
             total_chunks,
         ):
-            chunk_path = (
-                chunks_folder
-                / f"{index:08d}.part"
+
+            s3_key = cls._chunk_s3_key(
+                upload_id,
+                index,
             )
 
-            if not chunk_path.exists():
+            exists = await cls._s3_head(
+                s3_key,
+            )
+
+            if not exists:
                 missing_chunks.append(
                     index,
                 )
 
         if missing_chunks:
             raise ValueError(
-                "Missing chunks: "
+                "Missing chunks in Supabase Storage: "
                 + ", ".join(
                     map(
                         str,
@@ -513,11 +905,13 @@ class UploadService:
             "total_chunks": total_chunks,
             "content_type": content_type,
             "job_id": job_id,
+            "status": "ASSEMBLY_QUEUED",
             "created_at": (
                 datetime.now().isoformat()
             ),
         }
 
+        # Local copy for the current instance.
         metadata_path = (
             job_folder
             / "chunk_upload.json"
@@ -536,12 +930,21 @@ class UploadService:
                 )
             )
 
+        # DURABLE copy.
+        await cls._s3_put_json(
+            cls._job_metadata_s3_key(
+                job_id,
+            ),
+            upload_metadata,
+        )
+
         print("=" * 80)
         print("CHUNK UPLOAD ACCEPTED")
         print("Upload ID    :", upload_id)
         print("Job ID       :", job_id)
         print("Filename     :", safe_filename)
         print("Total chunks :", total_chunks)
+        print("Storage      : SUPABASE")
         print("Assembly     : QUEUED")
         print("=" * 80)
 
@@ -558,8 +961,6 @@ class UploadService:
 
     # ==========================================================
     # COMPLETE
-    #
-    # Alias retained for compatibility.
     # ==========================================================
 
     @classmethod
@@ -581,20 +982,9 @@ class UploadService:
     # ==========================================================
     # BACKGROUND ASSEMBLY
     #
-    # CRITICAL:
+    # SUPABASE -> LOCAL FILE
     #
-    # DO NOT:
-    #
-    # MonthResolver.resolve()
-    # DatasetValidator.validate()
-    # pandas.read_excel()
-    #
-    # here.
-    #
-    # The 746 MB Excel file must ONLY be copied together.
-    # Dataset detection is filename based.
-    #
-    # Manifest is created immediately afterward.
+    # Then ETL can consume the assembled local file.
     # ==========================================================
 
     @classmethod
@@ -611,12 +1001,6 @@ class UploadService:
             filename,
         )
 
-        chunks_folder = (
-            UPLOAD_FOLDER
-            / "_chunks"
-            / upload_id
-        )
-
         job_folder = (
             UPLOAD_FOLDER
             / job_id
@@ -627,7 +1011,13 @@ class UploadService:
             / safe_filename
         )
 
+        manifest_path = (
+            job_folder
+            / "manifest.json"
+        )
+
         try:
+
             print("=" * 80)
             print("BACKGROUND CHUNK ASSEMBLY START")
             print("Upload ID :", upload_id)
@@ -635,13 +1025,8 @@ class UploadService:
             print("Filename  :", safe_filename)
             print("Chunks    :", total_chunks)
             print("Target    :", destination)
+            print("Storage   : SUPABASE")
             print("=" * 80)
-
-            if not chunks_folder.exists():
-                raise FileNotFoundError(
-                    f"Chunk folder not found: "
-                    f"{chunks_folder}",
-                )
 
             job_folder.mkdir(
                 parents=True,
@@ -649,25 +1034,37 @@ class UploadService:
             )
 
             # --------------------------------------------------
-            # VERIFY CHUNKS
+            # VERIFY ALL CHUNKS IN SUPABASE
             # --------------------------------------------------
 
             for index in range(
                 total_chunks,
             ):
-                chunk_path = (
-                    chunks_folder
-                    / f"{index:08d}.part"
+
+                s3_key = cls._chunk_s3_key(
+                    upload_id,
+                    index,
                 )
 
-                if not chunk_path.exists():
+                exists = await cls._s3_head(
+                    s3_key,
+                )
+
+                if not exists:
                     raise FileNotFoundError(
-                        f"Missing chunk {index}",
+                        f"Missing Supabase chunk {index}: "
+                        f"{s3_key}",
                     )
 
             # --------------------------------------------------
             # ASSEMBLE
+            #
+            # Download one chunk at a time.
+            # Never load the 746 MB workbook into memory.
             # --------------------------------------------------
+
+            if destination.exists():
+                destination.unlink()
 
             async with aiofiles.open(
                 destination,
@@ -677,40 +1074,75 @@ class UploadService:
                 for index in range(
                     total_chunks,
                 ):
-                    chunk_path = (
-                        chunks_folder
-                        / f"{index:08d}.part"
+
+                    s3_key = cls._chunk_s3_key(
+                        upload_id,
+                        index,
                     )
 
-                    async with aiofiles.open(
-                        chunk_path,
-                        "rb",
-                    ) as source:
+                    temp_chunk = (
+                        job_folder
+                        / (
+                            f".chunk_{index:08d}"
+                            ".part"
+                        )
+                    )
 
-                        while True:
-                            data = await source.read(
-                                1024 * 1024,
+                    try:
+
+                        print(
+                            f"Downloading chunk "
+                            f"{index + 1}/"
+                            f"{total_chunks}"
+                        )
+
+                        await cls._s3_download_file(
+                            s3_key,
+                            temp_chunk,
+                        )
+
+                        async with aiofiles.open(
+                            temp_chunk,
+                            "rb",
+                        ) as source:
+
+                            while True:
+                                data = await source.read(
+                                    1024 * 1024,
+                                )
+
+                                if not data:
+                                    break
+
+                                await output.write(
+                                    data,
+                                )
+
+                        progress = (
+                            (index + 1)
+                            / total_chunks
+                            * 100
+                        )
+
+                        print(
+                            f"✓ Assembled "
+                            f"{index + 1}/"
+                            f"{total_chunks} "
+                            f"({progress:.1f}%)"
+                        )
+
+                    finally:
+
+                        try:
+                            temp_chunk.unlink(
+                                missing_ok=True,
                             )
+                        except Exception:
+                            traceback.print_exc()
 
-                            if not data:
-                                break
-
-                            await output.write(
-                                data,
-                            )
-
-                    progress = (
-                        (index + 1)
-                        / total_chunks
-                        * 100
-                    )
-
-                    print(
-                        f"✓ Assembled "
-                        f"{index + 1}/"
-                        f"{total_chunks} "
-                        f"({progress:.1f}%)"
-                    )
+            # --------------------------------------------------
+            # FINAL FILE
+            # --------------------------------------------------
 
             file_size = (
                 destination.stat().st_size
@@ -729,6 +1161,10 @@ class UploadService:
 
             # --------------------------------------------------
             # LIGHTWEIGHT DETECTION ONLY
+            #
+            # NO MonthResolver.
+            # NO DatasetValidator.
+            # NO pandas.read_excel().
             # --------------------------------------------------
 
             dataset = FileDetector.detect(
@@ -750,12 +1186,6 @@ class UploadService:
                     FileDetector.CUSTOMER_LOCATION
                 )
 
-            # IMPORTANT:
-            # Do NOT resolve month here.
-            #
-            # MonthResolver may read the entire Excel.
-            #
-            # ETL will resolve month later.
             month = None
 
             print(
@@ -768,7 +1198,7 @@ class UploadService:
             )
 
             # --------------------------------------------------
-            # CREATE MANIFEST
+            # MANIFEST
             # --------------------------------------------------
 
             metadata = {
@@ -784,6 +1214,8 @@ class UploadService:
                 "missing_columns": [],
                 "error": None,
                 "original_filename": filename,
+                "storage": "supabase",
+                "upload_id": upload_id,
             }
 
             result = await cls._finalize_job(
@@ -792,11 +1224,6 @@ class UploadService:
                 uploaded=[
                     metadata,
                 ],
-            )
-
-            manifest_path = (
-                job_folder
-                / "manifest.json"
             )
 
             if not manifest_path.exists():
@@ -811,23 +1238,60 @@ class UploadService:
             )
 
             # --------------------------------------------------
-            # DELETE CHUNKS
+            # COPY MANIFEST TO SUPABASE
             # --------------------------------------------------
 
-            try:
-                for chunk_path in (
-                    chunks_folder.glob(
-                        "*.part",
-                    )
-                ):
-                    chunk_path.unlink(
-                        missing_ok=True,
-                    )
+            await cls._s3_put_json(
+                cls._job_manifest_s3_key(
+                    job_id,
+                ),
+                {
+                    **json.loads(
+                        manifest_path.read_text(
+                            encoding="utf-8",
+                        )
+                    ),
+                    "storage": "supabase",
+                },
+            )
 
-                chunks_folder.rmdir()
+            # --------------------------------------------------
+            # STORE FINAL FILE IN SUPABASE
+            #
+            # This makes the assembled Excel durable too.
+            # --------------------------------------------------
 
-            except Exception:
-                traceback.print_exc()
+            final_s3_key = (
+                cls._job_file_s3_key(
+                    job_id,
+                    safe_filename,
+                )
+            )
+
+            await cls._s3_put_file(
+                destination,
+                final_s3_key,
+            )
+
+            print(
+                "✓ FINAL FILE STORED:",
+                final_s3_key,
+            )
+
+            # --------------------------------------------------
+            # DELETE CHUNKS FROM SUPABASE
+            #
+            # Only AFTER successful assembly.
+            # --------------------------------------------------
+
+            await cls._s3_delete_prefix(
+                f"{S3_CHUNK_PREFIX}/"
+                f"{upload_id}/",
+            )
+
+            print(
+                "✓ SOURCE CHUNKS DELETED FROM SUPABASE"
+            )
 
             print("=" * 80)
             print(
@@ -841,6 +1305,10 @@ class UploadService:
                 "MANIFEST:",
                 manifest_path,
             )
+            print(
+                "FINAL S3 FILE:",
+                final_s3_key,
+            )
             print("=" * 80)
 
             return {
@@ -849,9 +1317,12 @@ class UploadService:
                 "manifest_path": str(
                     manifest_path,
                 ),
+                "storage": "supabase",
+                "s3_key": final_s3_key,
             }
 
         except Exception as exc:
+
             print("=" * 80)
             print(
                 "BACKGROUND CHUNK ASSEMBLY FAILED"
@@ -881,16 +1352,10 @@ class UploadService:
             raise
 
     # ==========================================================
-    # RECOVER EXISTING ASSEMBLED FILE
+    # RECOVER EXISTING ASSEMBLED JOB
     #
-    # Useful for the job that already reached:
-    #
-    # FINAL FILE
-    # SIZE
-    #
-    # but never created manifest.json.
-    #
-    # NO Excel inspection.
+    # First checks local file.
+    # If missing, downloads durable file from Supabase.
     # ==========================================================
 
     @classmethod
@@ -910,21 +1375,48 @@ class UploadService:
             / job_id
         )
 
-        if not job_folder.exists():
-            raise FileNotFoundError(
-                f"Job folder not found: "
-                f"{job_folder}",
-            )
+        job_folder.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
         destination = (
             job_folder
             / safe_filename
         )
 
+        # --------------------------------------------------
+        # IF LOCAL FILE EXISTS
+        # --------------------------------------------------
+
         if not destination.exists():
-            raise FileNotFoundError(
-                f"Final file not found: "
-                f"{destination}",
+
+            final_s3_key = (
+                cls._job_file_s3_key(
+                    job_id,
+                    safe_filename,
+                )
+            )
+
+            exists = await cls._s3_head(
+                final_s3_key,
+            )
+
+            if not exists:
+                raise FileNotFoundError(
+                    f"Final file not found locally "
+                    f"or in Supabase Storage: "
+                    f"{safe_filename}",
+                )
+
+            print(
+                "Recovering final file from Supabase:",
+                final_s3_key,
+            )
+
+            await cls._s3_download_file(
+                final_s3_key,
+                destination,
             )
 
         file_size = (
@@ -963,6 +1455,7 @@ class UploadService:
             "missing_columns": [],
             "error": None,
             "original_filename": filename,
+            "storage": "supabase",
         }
 
         result = await cls._finalize_job(
@@ -973,22 +1466,20 @@ class UploadService:
             ],
         )
 
-        manifest_path = (
+        if not (
             job_folder
             / "manifest.json"
-        )
-
-        if not manifest_path.exists():
+        ).exists():
             raise FileNotFoundError(
-                f"Manifest was not created: "
-                f"{manifest_path}",
+                "Manifest was not created."
             )
 
         return {
             **result,
             "status": "ASSEMBLY_COMPLETED",
             "manifest_path": str(
-                manifest_path,
+                job_folder
+                / "manifest.json",
             ),
         }
 
@@ -1064,7 +1555,8 @@ class UploadService:
             for item in uploaded
             if item.get(
                 "validation",
-            ) not in (
+            )
+            not in (
                 "PASSED",
                 "PENDING",
             )

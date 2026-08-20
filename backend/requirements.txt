@@ -6,3 +6,4 @@ pandas
 openpyxl
 duckdb
 pyarrow
+boto3==1.43.75
