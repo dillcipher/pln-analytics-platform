@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import time
 import traceback
 from pathlib import Path
@@ -28,103 +27,32 @@ router = APIRouter(
 
 
 # ==========================================================
-# NORMAL ETL
+# BACKGROUND ETL
 # ==========================================================
+
 
 def _run_etl(
     job_folder: Path,
 ) -> None:
+    """
+    Run ETL for a completed upload.
+
+    IMPORTANT:
+    This function is intentionally isolated from the chunk
+    assembly itself. Assembly must finish first and create
+    manifest.json before ETL starts.
+    """
 
     try:
-
         print("=" * 80)
         print("BACKGROUND ETL START")
-        print(job_folder)
+        print(f"JOB FOLDER : {job_folder}")
         print("=" * 80)
 
-        ETLOrchestrator.process(
-            job_folder,
-        )
-
-        print("=" * 80)
-        print("BACKGROUND ETL FINISHED")
-        print("=" * 80)
-
-    except Exception:
-
-        print("=" * 80)
-        print("BACKGROUND ETL FAILED")
-        print(job_folder)
-        print("=" * 80)
-
-        traceback.print_exc()
-
-
-# ==========================================================
-# CHUNKED PIPELINE
-#
-# URUTAN WAJIB:
-#
-# 1. Assemble
-# 2. Inspect
-# 3. Create manifest
-# 4. Verify manifest
-# 5. ETL
-#
-# ETL TIDAK BOLEH DIMULAI SEBELUM ASSEMBLY SELESAI.
-# ==========================================================
-
-async def _run_chunked_pipeline(
-    upload_id: str,
-    job_id: str,
-    filename: str,
-    total_chunks: int,
-    content_type: str | None,
-) -> None:
-
-    job_folder = (
-        RAW_UPLOAD
-        / job_id
-    )
-
-    try:
-
-        print("=" * 80)
-        print("BACKGROUND CHUNKED PIPELINE START")
-        print("UPLOAD ID    :", upload_id)
-        print("JOB ID       :", job_id)
-        print("FILE         :", filename)
-        print("TOTAL CHUNKS :", total_chunks)
-        print("=" * 80)
-
-        # ======================================================
-        # 1. ASSEMBLY
-        #
-        # Fungsi ini TIDAK return sebelum manifest tersedia.
-        # ======================================================
-
-        assembly_result = (
-            await UploadService.assemble_chunk_upload(
-                upload_id=upload_id,
-                job_id=job_id,
-                filename=filename,
-                total_chunks=total_chunks,
-                content_type=content_type,
+        if not job_folder.exists():
+            raise FileNotFoundError(
+                f"Job folder not found: {job_folder}"
             )
-        )
-
-        print("=" * 80)
-        print("ASSEMBLY COMPLETED")
-        print("JOB ID :", job_id)
-        print(
-            "STATUS :",
-            assembly_result.get("status"),
-        )
-        print("=" * 80)
-
-        # ======================================================
-        # 2. VERIFY MANIFEST
-        # ======================================================
 
         manifest_path = (
             job_folder
@@ -132,47 +60,23 @@ async def _run_chunked_pipeline(
         )
 
         if not manifest_path.exists():
-
             raise FileNotFoundError(
-                f"Manifest not found after assembly: "
-                f"{manifest_path}",
+                f"Manifest not found: {manifest_path}"
             )
 
-        print(
-            "✓ Manifest confirmed:",
-            manifest_path,
-        )
-
-        # ======================================================
-        # 3. ETL
-        #
-        # Baru boleh jalan sekarang.
-        # ======================================================
-
-        print("=" * 80)
-        print("STARTING ETL AFTER ASSEMBLY")
-        print("JOB ID :", job_id)
-        print("=" * 80)
-
-        # ETLOrchestrator.process() adalah synchronous.
-        #
-        # Jalankan di thread supaya event loop tidak diblok.
-        await asyncio.to_thread(
-            ETLOrchestrator.process,
+        ETLOrchestrator.process(
             job_folder,
         )
 
         print("=" * 80)
-        print("BACKGROUND CHUNKED PIPELINE FINISHED")
-        print("JOB ID :", job_id)
+        print("BACKGROUND ETL FINISHED")
+        print(f"JOB FOLDER : {job_folder}")
         print("=" * 80)
 
-    except Exception as exc:
-
+    except Exception:
         print("=" * 80)
-        print("BACKGROUND CHUNKED PIPELINE FAILED")
-        print("JOB ID :", job_id)
-        print("ERROR  :", exc)
+        print("BACKGROUND ETL FAILED")
+        print(f"JOB FOLDER : {job_folder}")
         print("=" * 80)
 
         traceback.print_exc()
@@ -180,9 +84,8 @@ async def _run_chunked_pipeline(
 
 # ==========================================================
 # NORMAL UPLOAD
-#
-# Untuk file kecil.
 # ==========================================================
+
 
 @router.post(
     "/files",
@@ -198,20 +101,16 @@ async def upload_files(
         ),
     ],
 ):
-
     start = time.perf_counter()
 
     print("=" * 80)
     print("UPLOAD API CALLED")
     print("UPLOAD MODE : NORMAL")
     print("TOTAL FILES : 1")
-    print(
-        f"FILE        : {file.filename}"
-    )
+    print(f"FILE        : {file.filename}")
     print("=" * 80)
 
     try:
-
         result = await UploadService.save_files(
             [file],
         )
@@ -221,6 +120,8 @@ async def upload_files(
             / result["job_id"]
         )
 
+        # Normal/small uploads can continue through
+        # the existing background ETL mechanism.
         background_tasks.add_task(
             _run_etl,
             job_folder,
@@ -245,36 +146,30 @@ async def upload_files(
 
         return result
 
-    except Exception as exc:
-
+    except Exception as e:
         duration = (
             time.perf_counter()
             - start
         )
 
         print("=" * 80)
-        print(
-            f"UPLOAD FAILED ({duration:.2f}s)"
-        )
-        print(
-            f"ERROR : {exc}"
-        )
-        print(
-            f"DURATION : {duration:.2f}s"
-        )
+        print("UPLOAD FAILED")
+        print(f"ERROR    : {e}")
+        print(f"DURATION : {duration:.2f}s")
         print("=" * 80)
 
         traceback.print_exc()
 
         raise HTTPException(
             status_code=500,
-            detail=str(exc),
+            detail=str(e),
         )
 
 
 # ==========================================================
 # CHUNK UPLOAD
 # ==========================================================
+
 
 @router.post(
     "/chunk",
@@ -318,13 +213,12 @@ async def upload_chunk(
         ),
     ],
 ):
-
     start = time.perf_counter()
 
     print("=" * 80)
     print("CHUNK UPLOAD")
-    print("UPLOAD ID    :", upload_id)
-    print("FILE         :", filename)
+    print(f"UPLOAD ID    : {upload_id}")
+    print(f"FILE         : {filename}")
     print(
         f"CHUNK        : "
         f"{chunk_number + 1}/{total_chunks}"
@@ -332,7 +226,6 @@ async def upload_chunk(
     print("=" * 80)
 
     try:
-
         result = await UploadService.save_chunk(
             upload_id=upload_id,
             filename=filename,
@@ -352,54 +245,44 @@ async def upload_chunk(
 
         return result
 
-    except ValueError as exc:
-
+    except ValueError as e:
         traceback.print_exc()
 
         raise HTTPException(
             status_code=400,
-            detail=str(exc),
+            detail=str(e),
         )
 
-    except Exception as exc:
-
+    except Exception as e:
         traceback.print_exc()
 
         raise HTTPException(
             status_code=500,
-            detail=str(exc),
+            detail=str(e),
         )
 
 
 # ==========================================================
 # COMPLETE CHUNKED UPLOAD
 #
-# PENTING:
+# IMPORTANT:
 #
-# Endpoint ini HANYA:
+# Chunk assembly is the only operation performed here.
 #
-# 1. Verify semua chunks
-# 2. Create job
-# 3. Return cepat
-# 4. Schedule SATU background pipeline
+# The completed file and manifest are created first.
+# ETL is NOT started automatically for the large chunked
+# upload, preventing a 700+ MB Excel workload from immediately
+# consuming the API process after assembly.
 #
-# Background pipeline:
-#
-#     ASSEMBLY
-#        ↓
-#     MANIFEST
-#        ↓
-#     ETL
-#
-# Tidak ada ETL terpisah sebelum assembly.
+# ETL can then be triggered separately.
 # ==========================================================
+
 
 @router.post(
     "/complete",
     response_model=UploadResponse,
 )
 async def complete_upload(
-    background_tasks: BackgroundTasks,
     upload_id: Annotated[
         str,
         Form(
@@ -429,48 +312,25 @@ async def complete_upload(
         ),
     ] = None,
 ):
-
     start = time.perf_counter()
 
     print("=" * 80)
     print("COMPLETE CHUNKED UPLOAD")
-    print("UPLOAD ID    :", upload_id)
-    print("FILE         :", filename)
-    print("TOTAL CHUNKS :", total_chunks)
+    print(f"UPLOAD ID    : {upload_id}")
+    print(f"FILE         : {filename}")
+    print(f"TOTAL CHUNKS : {total_chunks}")
     print("=" * 80)
 
     try:
+        # ==================================================
+        # ASSEMBLE ONLY
+        # ==================================================
 
-        # ======================================================
-        # CREATE JOB
-        #
-        # TIDAK ASSEMBLE DI REQUEST.
-        # ======================================================
-
-        result = (
-            await UploadService.complete_chunk_upload(
-                upload_id=upload_id,
-                filename=filename,
-                total_chunks=total_chunks,
-                content_type=content_type,
-            )
-        )
-
-        job_id = result["job_id"]
-
-        # ======================================================
-        # ONE BACKGROUND PIPELINE
-        #
-        # Assembly → Manifest → ETL
-        # ======================================================
-
-        background_tasks.add_task(
-            _run_chunked_pipeline,
-            upload_id,
-            job_id,
-            filename,
-            total_chunks,
-            content_type,
+        result = await UploadService.complete_chunk_upload(
+            upload_id=upload_id,
+            filename=filename,
+            total_chunks=total_chunks,
+            content_type=content_type,
         )
 
         duration = (
@@ -479,57 +339,48 @@ async def complete_upload(
         )
 
         print("=" * 80)
-        print(
-            "CHUNKED UPLOAD ACCEPTED"
-        )
+        print("CHUNKED UPLOAD COMPLETED")
         print(
             f"DURATION : {duration:.2f}s"
         )
         print(
-            f"JOB ID   : {job_id}"
+            f"JOB ID   : {result['job_id']}"
         )
         print(
-            "BACKGROUND PIPELINE SCHEDULED"
+            "ASSEMBLY FINISHED"
         )
         print(
-            "ASSEMBLY -> MANIFEST -> ETL"
+            "ETL NOT STARTED AUTOMATICALLY"
         )
         print("=" * 80)
 
         return result
 
-    except FileNotFoundError as exc:
-
+    except FileNotFoundError as e:
         traceback.print_exc()
 
         raise HTTPException(
             status_code=404,
-            detail=str(exc),
+            detail=str(e),
         )
 
-    except ValueError as exc:
-
+    except ValueError as e:
         traceback.print_exc()
 
         raise HTTPException(
             status_code=400,
-            detail=str(exc),
+            detail=str(e),
         )
 
-    except Exception as exc:
-
+    except Exception as e:
         duration = (
             time.perf_counter()
             - start
         )
 
         print("=" * 80)
-        print(
-            "COMPLETE UPLOAD FAILED"
-        )
-        print(
-            f"ERROR    : {exc}"
-        )
+        print("COMPLETE UPLOAD FAILED")
+        print(f"ERROR    : {e}")
         print(
             f"DURATION : {duration:.2f}s"
         )
@@ -539,5 +390,5 @@ async def complete_upload(
 
         raise HTTPException(
             status_code=500,
-            detail=str(exc),
+            detail=str(e),
         )
