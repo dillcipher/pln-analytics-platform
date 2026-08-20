@@ -422,60 +422,191 @@ class UploadService:
     async def _s3_delete_prefix(
         cls,
         prefix: str,
-    ) -> None:
+    ) -> bool:
         """
-        Delete all objects under a prefix.
+        Best-effort deletion of all objects under a prefix.
 
-        Used only after successful assembly.
+        Cleanup is deliberately non-fatal. Supabase Storage is
+        S3-compatible, but provider-specific failures can occur for
+        DeleteObjects. A cleanup failure must never turn a successful
+        file assembly into ASSEMBLY_FAILED.
+
+        Strategy:
+        1. List all objects under the prefix.
+        2. Try DeleteObjects in batches of <= 1000.
+        3. If bulk deletion fails or partially fails, retry affected
+           objects individually with DeleteObject.
+        4. Log remaining failures and return False.
+        5. Never propagate cleanup exceptions.
         """
 
-        def _delete() -> None:
-            client = _create_s3_client()
+        def _delete() -> bool:
+            try:
+                client = _create_s3_client()
 
-            paginator = client.get_paginator(
-                "list_objects_v2",
-            )
+                paginator = client.get_paginator(
+                    "list_objects_v2",
+                )
 
-            objects: list[dict] = []
+                objects: list[dict] = []
 
-            for page in paginator.paginate(
-                Bucket=S3_BUCKET,
-                Prefix=prefix,
-            ):
-                objects.extend(
-                    page.get(
-                        "Contents",
-                        [],
+                try:
+                    for page in paginator.paginate(
+                        Bucket=S3_BUCKET,
+                        Prefix=prefix,
+                    ):
+                        objects.extend(
+                            page.get(
+                                "Contents",
+                                [],
+                            )
+                        )
+                except Exception as exc:
+                    print(
+                        "⚠ SUPABASE CHUNK CLEANUP: "
+                        "failed to list objects."
                     )
+                    print("   Prefix:", prefix)
+                    print("   Error :", repr(exc))
+                    traceback.print_exc()
+                    return False
+
+                if not objects:
+                    print(
+                        "✓ SUPABASE CHUNK CLEANUP: "
+                        "nothing to delete."
+                    )
+                    return True
+
+                all_deleted = True
+
+                for offset in range(
+                    0,
+                    len(objects),
+                    1000,
+                ):
+                    batch = objects[
+                        offset : offset + 1000
+                    ]
+
+                    keys = [
+                        item["Key"]
+                        for item in batch
+                        if item.get("Key")
+                    ]
+
+                    if not keys:
+                        continue
+
+                    failed_keys: set[str] = set()
+
+                    # --------------------------------------------------
+                    # BULK DELETE
+                    # --------------------------------------------------
+
+                    try:
+                        response = client.delete_objects(
+                            Bucket=S3_BUCKET,
+                            Delete={
+                                "Objects": [
+                                    {"Key": key}
+                                    for key in keys
+                                ],
+                                "Quiet": False,
+                            },
+                        )
+
+                        errors = response.get(
+                            "Errors",
+                            [],
+                        )
+
+                        failed_keys = {
+                            item.get("Key")
+                            for item in errors
+                            if item.get("Key")
+                        }
+
+                        if not failed_keys:
+                            print(
+                                "✓ Deleted Supabase chunk batch:",
+                                len(keys),
+                            )
+                            continue
+
+                        successful_count = (
+                            len(keys) - len(failed_keys)
+                        )
+
+                        if successful_count:
+                            print(
+                                "✓ Deleted Supabase chunks:",
+                                successful_count,
+                            )
+
+                        print(
+                            "⚠ Supabase bulk delete returned "
+                            f"{len(failed_keys)} error(s). "
+                            "Retrying individually."
+                        )
+
+                        all_deleted = False
+
+                    except Exception as exc:
+                        print(
+                            "⚠ Supabase DeleteObjects failed. "
+                            "Retrying individually."
+                        )
+                        print("   Error:", repr(exc))
+                        traceback.print_exc()
+
+                        failed_keys = set(keys)
+                        all_deleted = False
+
+                    # --------------------------------------------------
+                    # INDIVIDUAL FALLBACK
+                    # --------------------------------------------------
+
+                    for key in failed_keys:
+                        try:
+                            client.delete_object(
+                                Bucket=S3_BUCKET,
+                                Key=key,
+                            )
+
+                            print(
+                                "✓ Deleted Supabase chunk:",
+                                key,
+                            )
+
+                        except Exception as exc:
+                            all_deleted = False
+
+                            print(
+                                "⚠ Could not delete Supabase chunk:",
+                                key,
+                            )
+                            print(
+                                "   Error:",
+                                repr(exc),
+                            )
+                            traceback.print_exc()
+
+                return all_deleted
+
+            except Exception as exc:
+                print(
+                    "⚠ SUPABASE CHUNK CLEANUP FAILED "
+                    "UNEXPECTEDLY."
                 )
+                print("   Prefix:", prefix)
+                print("   Error :", repr(exc))
+                traceback.print_exc()
 
-            if not objects:
-                return
+                # NEVER allow cleanup to fail the assembled job.
+                return False
 
-            for offset in range(
-                0,
-                len(objects),
-                1000,
-            ):
-                batch = objects[
-                    offset : offset + 1000
-                ]
-
-                client.delete_objects(
-                    Bucket=S3_BUCKET,
-                    Delete={
-                        "Objects": [
-                            {
-                                "Key": item["Key"],
-                            }
-                            for item in batch
-                        ],
-                    },
-                )
-
-        await asyncio.to_thread(
-            _delete,
-        )
+        return await asyncio.to_thread(_delete)
 
     # ==========================================================
     # NORMAL FILE INSPECTION
@@ -1284,14 +1415,20 @@ class UploadService:
             # Only AFTER successful assembly.
             # --------------------------------------------------
 
-            await cls._s3_delete_prefix(
+            cleanup_ok = await cls._s3_delete_prefix(
                 f"{S3_CHUNK_PREFIX}/"
                 f"{upload_id}/",
             )
 
-            print(
-                "✓ SOURCE CHUNKS DELETED FROM SUPABASE"
-            )
+            if cleanup_ok:
+                print(
+                    "✓ SOURCE CHUNKS DELETED FROM SUPABASE"
+                )
+            else:
+                print(
+                    "⚠ SOURCE CHUNK CLEANUP INCOMPLETE. "
+                    "ASSEMBLY REMAINS SUCCESSFUL."
+                )
 
             print("=" * 80)
             print(
