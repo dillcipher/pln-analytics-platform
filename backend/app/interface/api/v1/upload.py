@@ -392,3 +392,40 @@ async def complete_upload(
             status_code=500,
             detail=str(e),
         )
+# ==========================================================
+# PROCESS EXISTING JOB
+# ==========================================================
+
+@router.post(
+    "/process/{job_id}",
+)
+async def process_existing_job(
+    job_id: str,
+    background_tasks: BackgroundTasks,
+):
+    job_folder = RAW_UPLOAD / job_id
+
+    if not job_folder.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Job folder not found: {job_folder}",
+        )
+
+    manifest_path = job_folder / "manifest.json"
+
+    if not manifest_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Manifest not found: {manifest_path}",
+        )
+
+    background_tasks.add_task(
+        _run_etl,
+        job_folder,
+    )
+
+    return {
+        "success": True,
+        "job_id": job_id,
+        "message": "ETL scheduled",
+    }
