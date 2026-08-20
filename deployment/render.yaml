@@ -1,34 +1,114 @@
-# Render Blueprint — deploy the backend with "New +" -> "Blueprint" and
-# pointing Render at this repo, or configure a Web Service manually using
-# these same values. Free tier is sufficient to start.
-#
-# https://render.com/docs/blueprint-spec
+# ==========================================================
+# PLN ANALYTICS PLATFORM
+# Render Blueprint - FastAPI Backend
+# ==========================================================
 
 services:
   - type: web
     name: pln-analytics-api
     runtime: python
     plan: free
+
+    # Backend source directory
     rootDir: backend
+
+    # Python dependencies
     buildCommand: pip install -r requirements.txt
+
+    # FastAPI production server
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /api/health
+
+    # Actual health endpoint from app/main.py
+    healthCheckPath: /health
+
     envVars:
+
+      # ======================================================
+      # APPLICATION
+      # ======================================================
+
+      - key: APP_NAME
+        value: PLN Analytics Platform API
+
       - key: ENVIRONMENT
         value: production
+
       - key: DEBUG
         value: "false"
+
+
+      # ======================================================
+      # CORS
+      # ======================================================
+      #
+      # IMPORTANT:
+      # Replace this with the actual Vercel production URL
+      # if your final URL differs.
+      #
+      # ======================================================
+
       - key: CORS_ORIGINS
-        value: https://pln-analytics-platform.pages.dev
+        value: https://pln-analytics.vercel.app
+
+
+      # ======================================================
+      # AUTH
+      # ======================================================
+
       - key: JWT_SECRET_KEY
         generateValue: true
+
       - key: JWT_EXPIRES_MINUTES
         value: "480"
+
+
+      # ======================================================
+      # LOCAL AUTH FILE
+      # ======================================================
+      #
+      # users.json is intentionally NOT committed to Git.
+      # If authentication is required in production, this path
+      # must be provisioned separately.
+      #
+      # ======================================================
+
       - key: USERS_FILE
-        value: data/auth/users.json
+        value: /opt/render/project/src/backend/data/auth/users.json
+
+
+      # ======================================================
+      # DATA
+      # ======================================================
+      #
+      # IMPORTANT:
+      # The local warehouse is NOT stored in Git.
+      #
+      # Production data must be provisioned separately because
+      # warehouse.duckdb is several GB.
+      #
+      # This path is where the backend expects processed data
+      # when it is available on the deployed filesystem.
+      #
+      # ======================================================
+
       - key: DATA_PROCESSED_DIR
-        value: ../data/processed
+        value: /opt/render/project/src/backend/data/processed
+
+
+      # ======================================================
+      # PAGINATION
+      # ======================================================
+
       - key: DEFAULT_PAGE_SIZE
         value: "50"
+
       - key: MAX_PAGE_SIZE
         value: "500"
+
+
+      # ======================================================
+      # CACHE
+      # ======================================================
+
+      - key: CACHE_TTL_SECONDS
+        value: "120"
