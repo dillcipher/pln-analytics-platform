@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import traceback
 from pathlib import Path
+from typing import Annotated
 
 from fastapi import (
     APIRouter,
@@ -12,10 +13,11 @@ from fastapi import (
     UploadFile,
 )
 
-from app.core.constants import RAW_UPLOAD
 from app.application.etl.etl_orchestrator import ETLOrchestrator
+from app.core.constants import RAW_UPLOAD
 from app.schemas.upload_schema import UploadResponse
 from app.services.upload_service import UploadService
+
 
 router = APIRouter(
     prefix="/upload",
@@ -26,9 +28,7 @@ router = APIRouter(
 def _run_etl(
     job_folder: Path,
 ) -> None:
-
     try:
-
         print("=" * 80)
         print("BACKGROUND ETL START")
         print(job_folder)
@@ -43,7 +43,6 @@ def _run_etl(
         print("=" * 80)
 
     except Exception:
-
         traceback.print_exc()
 
 
@@ -53,9 +52,14 @@ def _run_etl(
 )
 async def upload_files(
     background_tasks: BackgroundTasks,
-    files: list[UploadFile] = File(...),
+    files: Annotated[
+        list[UploadFile],
+        File(
+            ...,
+            description="Excel files to upload",
+        ),
+    ],
 ):
-
     start = time.perf_counter()
 
     print("=" * 80)
@@ -64,7 +68,6 @@ async def upload_files(
     print("=" * 80)
 
     try:
-
         # ==================================================
         # SAVE FILES
         # ==================================================
@@ -104,7 +107,6 @@ async def upload_files(
         return result
 
     except Exception as e:
-
         duration = (
             time.perf_counter()
             - start
