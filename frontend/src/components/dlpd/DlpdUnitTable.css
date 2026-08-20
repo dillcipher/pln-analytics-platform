@@ -1,0 +1,159 @@
+.table-toolbar {
+    display: flex;
+    width: 100%;
+    margin-bottom: 12px;
+}
+
+.table-toolbar input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 10px 12px;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    outline: none;
+    background: #0f172a;
+    color: #e2e8f0;
+    font-size: 12px;
+}
+
+.table-toolbar input::placeholder {
+    color: #64748b;
+}
+
+.table-toolbar input:focus {
+    border-color: #3b82f6;
+}
+
+.ulp-dashboard-error {
+    margin-bottom: 12px;
+    padding: 10px 12px;
+    border: 1px solid #7f1d1d;
+    border-radius: 8px;
+    background: #2a1217;
+    color: #fca5a5;
+    font-size: 12px;
+}
+
+.panel-body > table {
+    width: 100%;
+    border-collapse: collapse;
+    background: #0f172a;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.panel-body > table th {
+    padding: 10px 12px;
+    background: #111c2f;
+    border-bottom: 1px solid #334155;
+    color: #8fb0d3;
+    font-size: 11px;
+    font-weight: 700;
+    text-align: left;
+    white-space: nowrap;
+}
+
+.panel-body > table td {
+    padding: 10px 12px;
+    border-bottom: 1px solid #243247;
+    color: #dbe7f5;
+    background: #0f172a;
+    font-size: 12px;
+}
+
+.panel-body > table tbody tr {
+    transition:
+        background 0.12s ease,
+        box-shadow 0.12s ease;
+}
+
+.panel-body > table tbody tr:hover td {
+    background: #17243a;
+}
+
+.panel-body > table tbody tr[role="button"] {
+    cursor: pointer;
+}
+
+.panel-body > table tbody tr[role="button"]:focus-visible {
+    outline: 2px solid #3b82f6;
+    outline-offset: -2px;
+}
+
+.panel-body > table tbody tr[role="button"]:active td {
+    background: #1e3a5f;
+}
+
+.ulp-unit-cell {
+    min-width: 180px;
+}
+
+.ulp-unit-name {
+    color: #e2e8f0;
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1.35;
+}
+
+.ulp-unit-code {
+    margin-top: 2px;
+    color: #64748b;
+    font-size: 10px;
+    line-height: 1.2;
+}
+
+.ulp-row-arrow {
+    margin-left: auto;
+    color: #64748b;
+    font-size: 14px;
+    line-height: 1;
+    transition:
+        color 0.12s ease,
+        transform 0.12s ease;
+}
+
+.panel-body > table tbody tr:hover .ulp-row-arrow {
+    color: #60a5fa;
+    transform: translateX(2px);
+}
+
+/* Keep wide ULP tables usable on smaller screens. */
+.panel-body {
+    min-width: 0;
+}
+
+@media (max-width: 900px) {
+    .panel-body > table {
+        display: block;
+        overflow-x: auto;
+        white-space: nowrap;
+    }
+
+    .panel-body > table thead,
+    .panel-body > table tbody,
+    .panel-body > table tr {
+        width: max-content;
+        min-width: 100%;
+    }
+}
+
+@media (max-width: 700px) {
+    .table-toolbar {
+        margin-bottom: 10px;
+    }
+
+    .table-toolbar input {
+        padding: 9px 10px;
+        font-size: 11px;
+    }
+
+    .panel-body > table th,
+    .panel-body > table td {
+        padding: 9px 10px;
+    }
+
+    .ulp-unit-cell {
+        min-width: 150px;
+    }
+}

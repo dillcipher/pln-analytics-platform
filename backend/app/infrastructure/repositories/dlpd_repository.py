@@ -1,0 +1,2634 @@
+from __future__ import annotations
+
+import logging
+from typing import Any
+from urllib.parse import quote_plus
+
+from app.core.month_utils import month_keys_to_options
+from app.domain.entities import (
+    DlpdCustomerDetail,
+    DlpdDashboard,
+    DlpdDashboardUlp,
+    InspectionHistory,
+    MonthOption,
+    PageResult,
+)
+from app.domain.repositories import (
+    CustomerType,
+    DlpdFilters,
+    DlpdRepository,
+)
+from app.infrastructure.duckdb.connection import dataset_exists, get_connection
+from app.infrastructure.duckdb.query_helpers import (
+    build_equality_filters,
+    build_search_clause,
+    paginate,
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+_FILTER_COLUMN_MAP = {
+    "unitupi": "d.UNITUPI",
+    "unitap": "d.UNITAP",
+    "unitup": "d.UNITUP",
+}
+
+
+def _normalize_month_key(month_key: str | None) -> str | None:
+    """Normalize a month value to YYYYMM; None/ALL means all months."""
+    if month_key is None:
+        return None
+    value = str(month_key).strip()
+    if not value or value.upper() in {
+        "__ALL_MONTHS__", "ALL", "ALL_MONTHS", "SEMUA", "SEMUA BULAN",
+    }:
+        return None
+    value = value.replace("-", "").replace("/", "").replace(" ", "")
+    digits = "".join(ch for ch in value if ch.isdigit())
+    if len(digits) < 6:
+        return None
+    normalized = digits[:6]
+    try:
+        year = int(normalized[:4])
+        month = int(normalized[4:6])
+    except ValueError:
+        return None
+    if year < 1900 or not 1 <= month <= 12:
+        return None
+    return normalized
+
+
+def _normalize_idpel(value: Any) -> str:
+    """Normalize IDPEL values so Excel/Parquet numeric strings match safely."""
+    if value is None:
+        return ""
+    value = str(value).strip()
+    return value[:-2] if value.endswith(".0") else value
+
+
+def _google_maps_search_url(
+    *,
+    latitude: Any = None,
+    longitude: Any = None,
+    address: Any = None,
+    idpel: Any = None,
+) -> str | None:
+    """Build a Google Maps search URL without a Google Maps API key."""
+    try:
+        lat = float(latitude) if latitude is not None else None
+        lon = float(longitude) if longitude is not None else None
+        if lat is not None and lon is not None:
+            return (
+                "https://www.google.com/maps/search/?api=1&query="
+                f"{lat:.7f},{lon:.7f}"
+            )
+    except (TypeError, ValueError):
+        pass
+
+    parts: list[str] = []
+    if address is not None and str(address).strip():
+        parts.append(str(address).strip())
+    if idpel is not None and str(idpel).strip():
+        parts.append(f"IDPEL {str(idpel).strip()}")
+
+    if not parts:
+        return None
+
+    return (
+        "https://www.google.com/maps/search/?api=1&query="
+        + quote_plus(" ".join(parts))
+    )
+
+
+class DuckDbDlpdRepository(DlpdRepository):
+
+    # MONTH is normalized to YYYYMM at query time. This keeps the API
+    # stable when parquet sources store the same month as 202606,
+    # 2026-06, 2026/06, or a date/timestamp such as 2026-06-01.
+    #
+    # IMPORTANT:
+    #     month_key=None means "SEMUA BULAN".
+    #     In that mode no MONTH predicate is added to the query.
+    #
+    # The dashboard, customer list, export and map therefore share
+    # exactly the same month semantics.
+
+    # ==========================================================
+    # INTERNAL
+    # ==========================================================
+
+    @staticmethod
+    def _table(
+        customer_type: CustomerType,
+    ) -> str:
+
+        if customer_type == "prabayar":
+            return "fact_dlpd_prabayar"
+
+        return "fact_dlpd_pascabayar"
+
+    @staticmethod
+    def _inspection_cte() -> str:
+        """Return a safe latest-inspection CTE.
+
+        The DLPD page must still work when the inspection dataset is not
+        present yet: every customer is then treated as not inspected.
+        """
+        if not dataset_exists("fact_pengecekan"):
+            return """
+            latest_inspection AS (
+                SELECT
+                    CAST(NULL AS VARCHAR) AS IDPEL,
+                    CAST(NULL AS VARCHAR) AS STATUSKWH,
+                    CAST(NULL AS VARCHAR) AS UPDATESTATUS,
+                    CAST(NULL AS VARCHAR) AS CATATAN,
+                    CAST(NULL AS VARCHAR) AS NAMAPETUGAS,
+                    CAST(NULL AS VARCHAR) AS REGU,
+                    CAST(NULL AS TIMESTAMP) AS WAKTUPERIKSA,
+                    CAST(NULL AS VARCHAR) AS TINDAKLANJUTPEMERIKSAAN,
+                    CAST(NULL AS BIGINT) AS rn
+                WHERE FALSE
+            )
+            """
+
+        return """
+        latest_inspection AS (
+            SELECT
+                CAST(IDPEL AS VARCHAR) AS IDPEL,
+                STATUS_KWH AS STATUSKWH,
+                UPDATE_STATUS AS UPDATESTATUS,
+                CATATAN,
+                NAMA_PETUGAS AS NAMAPETUGAS,
+                REGU,
+                WAKTU_PERIKSA AS WAKTUPERIKSA,
+                TINDAK_LANJUT_PEMERIKSAAN AS TINDAKLANJUTPEMERIKSAAN,
+                ROW_NUMBER() OVER (
+                    PARTITION BY IDPEL
+                    ORDER BY WAKTUPERIKSA DESC NULLS LAST
+                ) AS rn
+            FROM fact_pengecekan
+        )
+        """
+
+    @staticmethod
+    def _status_case() -> str:
+
+        return """
+        CASE
+
+            WHEN p.IDPEL IS NULL
+                THEN 'BELUM'
+
+            WHEN UPPER(
+                COALESCE(
+                    p.STATUSKWH,
+                    p.UPDATESTATUS,
+                    ''
+                )
+            ) LIKE '%NORMAL%'
+                THEN 'NORMAL'
+
+            ELSE 'TEMUAN'
+
+        END
+        """
+
+    @staticmethod
+    def _previous_months(
+        month_key: str,
+        total: int = 6,
+    ) -> list[str]:
+
+        normalized = _normalize_month_key(month_key)
+        if normalized is None:
+            return []
+
+        month_key = normalized
+
+        if len(month_key) != 6:
+            return [month_key]
+
+        year = int(month_key[:4])
+        month = int(month_key[4:])
+
+        result: list[str] = []
+
+        for _ in range(total):
+
+            result.append(
+                f"{year:04d}{month:02d}"
+            )
+
+            month -= 1
+
+            if month == 0:
+                month = 12
+                year -= 1
+
+        result.reverse()
+
+        return result
+
+    def _repeat_cte(
+        self,
+        customer_type: CustomerType,
+        month_key: str | None,
+    ) -> tuple[str, list[Any]]:
+
+        table = self._table(
+            customer_type,
+        )
+
+        # "Semua Bulan" -> tidak membatasi repeat ke 6 bulan tertentu.
+        # Repeat dihitung terhadap seluruh periode yang tersedia.
+        if not month_key:
+            sql = f"""
+            repeat_history AS (
+                SELECT
+                    IDPEL,
+                    COUNT(
+                        DISTINCT SUBSTR(
+                            REGEXP_REPLACE(
+                                CAST(MONTH AS VARCHAR),
+                                '[^0-9]',
+                                '',
+                                'g'
+                            ),
+                            1,
+                            6
+                        )
+                    ) AS REPEAT_COUNT
+                FROM {table}
+                WHERE MONTH IS NOT NULL
+                GROUP BY IDPEL
+            )
+            """
+
+            return sql, []
+
+        months = self._previous_months(
+            month_key,
+            6,
+        )
+
+        placeholders = ",".join(
+            "?"
+            for _ in months
+        )
+
+        sql = f"""
+        repeat_history AS (
+            SELECT
+                IDPEL,
+                COUNT(
+                    DISTINCT SUBSTR(
+                        REGEXP_REPLACE(
+                            CAST(MONTH AS VARCHAR),
+                            '[^0-9]',
+                            '',
+                            'g'
+                        ),
+                        1,
+                        6
+                    )
+                ) AS REPEAT_COUNT
+            FROM {table}
+            WHERE
+                SUBSTR(
+                    REGEXP_REPLACE(
+                        CAST(MONTH AS VARCHAR),
+                        '[^0-9]',
+                        '',
+                        'g'
+                    ),
+                    1,
+                    6
+                ) IN ({placeholders})
+            GROUP BY IDPEL
+        )
+        """
+
+        return (
+            sql,
+            months,
+        )
+
+    def _build_where(
+        self,
+        customer_type: CustomerType,
+        month_key: str | None,
+        filters: DlpdFilters,
+    ) -> tuple[str, list[Any]]:
+
+        clauses: list[str] = []
+        params: list[Any] = []
+
+        # Normalize the month at the SQL boundary. This is critical for
+        # the frontend's ALL_MONTHS sentinel: it must become None so no
+        # MONTH predicate is generated.
+        month_key = _normalize_month_key(month_key)
+
+        # ======================================================
+        # MONTH
+        #
+        # month_key = YYYYMM
+        #     -> filter hanya bulan tersebut
+        #
+        # month_key = None
+        #     -> SEMUA BULAN
+        #     -> jangan tambahkan predicate MONTH
+        # ======================================================
+
+        if month_key:
+            normalized_month = (
+                str(month_key)
+                .strip()
+                .replace("-", "")
+                .replace("/", "")[:6]
+            )
+
+            if normalized_month:
+                clauses.append(
+                    """
+                    SUBSTR(
+                        REGEXP_REPLACE(
+                            CAST(d.MONTH AS VARCHAR),
+                            '[^0-9]',
+                            '',
+                            'g'
+                        ),
+                        1,
+                        6
+                    ) = ?
+                    """
+                )
+                params.append(
+                    normalized_month
+                )
+
+        # ======================================================
+        # MASTER FILTER
+        # ======================================================
+
+        mapping = {
+            "unitupi": (
+                "d.UNITUPI"
+                if customer_type == "prabayar"
+                else "SUBSTR(CAST(d.UNITAP AS VARCHAR), 1, 2)"
+            ),
+            "unitap": "d.UNITAP",
+            "unitup": "d.UNITUP",
+        }
+
+        equality_sql, equality_params = build_equality_filters(
+            {
+                "unitupi": filters.unitupi,
+                "unitap": filters.unitap,
+                "unitup": filters.unitup,
+            },
+            mapping,
+        )
+
+        if equality_sql:
+            cleaned = (
+                equality_sql
+                .replace("AND ", "")
+                .strip()
+            )
+
+            if cleaned:
+                clauses.append(cleaned)
+
+            params.extend(
+                equality_params
+            )
+
+        # ======================================================
+        # SEARCH
+        # ======================================================
+
+        search_sql, search_params = build_search_clause(
+            (
+                filters.search_idpel
+                or filters.search_nama
+            ),
+            [
+                "CAST(d.IDPEL AS VARCHAR)",
+                "d.NAMA",
+            ],
+        )
+
+        if search_sql:
+            cleaned = (
+                search_sql
+                .replace("AND ", "")
+                .strip()
+            )
+
+            if cleaned:
+                clauses.append(cleaned)
+
+            params.extend(
+                search_params
+            )
+
+        # ======================================================
+        # STATUS HASIL
+        # ======================================================
+
+        if filters.status:
+            normalized_status = (
+                filters.status
+                .strip()
+                .lower()
+            )
+
+            if normalized_status == "normal":
+                clauses.append(
+                    """
+                    p.IDPEL IS NOT NULL
+                    AND UPPER(
+                        COALESCE(
+                            p.STATUSKWH,
+                            p.UPDATESTATUS,
+                            ''
+                        )
+                    ) LIKE '%NORMAL%'
+                    """
+                )
+
+            elif normalized_status == "temuan":
+                clauses.append(
+                    """
+                    p.IDPEL IS NOT NULL
+                    AND UPPER(
+                        COALESCE(
+                            p.STATUSKWH,
+                            p.UPDATESTATUS,
+                            ''
+                        )
+                    ) NOT LIKE '%NORMAL%'
+                    """
+                )
+
+        # ======================================================
+        # STATUS PEMERIKSAAN
+        # ======================================================
+
+        if filters.inspection_status:
+            normalized_inspection = (
+                filters.inspection_status
+                .strip()
+                .lower()
+            )
+
+            if normalized_inspection in (
+                "sudah periksa",
+                "sudah",
+                "sudah diperiksa",
+            ):
+                clauses.append(
+                    "p.IDPEL IS NOT NULL"
+                )
+
+            elif normalized_inspection in (
+                "belum periksa",
+                "belum",
+                "belum diperiksa",
+            ):
+                clauses.append(
+                    "p.IDPEL IS NULL"
+                )
+
+        # ======================================================
+        # KENDALA
+        #
+        # PRABAYAR  -> KETERANGAN
+        # PASCABAYAR -> DLPD
+        # ======================================================
+
+        if filters.kendala:
+            kendala_column = (
+                "d.KETERANGAN"
+                if customer_type == "prabayar"
+                else "d.DLPD"
+            )
+
+            clauses.append(
+                f"""
+                TRIM(
+                    COALESCE(
+                        CAST({kendala_column} AS VARCHAR),
+                        ''
+                    )
+                ) = ?
+                """
+            )
+
+            params.append(
+                str(filters.kendala).strip()
+            )
+
+        # ======================================================
+        # PERULANGAN
+        #
+        # HANYA PASCABAYAR
+        #
+        # Untuk bulan tertentu:
+        #     hitung 6 bulan sampai bulan terpilih.
+        #
+        # Untuk Semua Bulan:
+        #     hitung seluruh bulan yang tersedia.
+        # ======================================================
+
+        if (
+            customer_type == "pascabayar"
+            and filters.dlpd_repeat
+        ):
+            repeat_value = int(
+                filters.dlpd_repeat
+            )
+
+            if month_key:
+                repeat_months = self._previous_months(
+                    str(month_key),
+                    6,
+                )
+                repeat_placeholders = ",".join(
+                    "?"
+                    for _ in repeat_months
+                )
+
+                clauses.append(
+                    f"""
+                    COALESCE(
+                        (
+                            SELECT COUNT(
+                                DISTINCT SUBSTR(
+                                    REGEXP_REPLACE(
+                                        CAST(rr.MONTH AS VARCHAR),
+                                        '[^0-9]',
+                                        '',
+                                        'g'
+                                    ),
+                                    1,
+                                    6
+                                )
+                            )
+                            FROM {self._table(customer_type)} rr
+                            WHERE
+                                CAST(rr.IDPEL AS VARCHAR) = CAST(d.IDPEL AS VARCHAR)
+                                AND SUBSTR(
+                                    REGEXP_REPLACE(
+                                        CAST(rr.MONTH AS VARCHAR),
+                                        '[^0-9]',
+                                        '',
+                                        'g'
+                                    ),
+                                    1,
+                                    6
+                                ) IN ({repeat_placeholders})
+                        ),
+                        0
+                    ) = ?
+                    """
+                )
+
+                params.extend(repeat_months)
+                params.append(repeat_value)
+
+            else:
+                clauses.append(
+                    f"""
+                    COALESCE(
+                        (
+                            SELECT COUNT(
+                                DISTINCT SUBSTR(
+                                    REGEXP_REPLACE(
+                                        CAST(rr.MONTH AS VARCHAR),
+                                        '[^0-9]',
+                                        '',
+                                        'g'
+                                    ),
+                                    1,
+                                    6
+                                )
+                            )
+                            FROM {self._table(customer_type)} rr
+                            WHERE
+                                CAST(rr.IDPEL AS VARCHAR) = CAST(d.IDPEL AS VARCHAR)
+                                AND rr.MONTH IS NOT NULL
+                        ),
+                        0
+                    ) = ?
+                    """
+                )
+
+                params.append(
+                    repeat_value
+                )
+
+        if not clauses:
+            return "", params
+
+        return (
+            "WHERE "
+            + "\nAND ".join(
+                f"({clause.strip()})"
+                for clause in clauses
+                if clause.strip()
+            ),
+            params,
+        )
+
+    # ==========================================================
+    # MONTH
+    # ==========================================================
+
+    def get_available_months(
+        self,
+        customer_type: CustomerType,
+    ) -> list[MonthOption]:
+
+        conn = get_connection()
+
+        table = self._table(
+            customer_type,
+        )
+
+        if not dataset_exists(table):
+            return []
+
+        rows = conn.execute(
+            f"""
+            SELECT
+                SUBSTR(REGEXP_REPLACE(CAST(MONTH AS VARCHAR), '[^0-9]', '', 'g'), 1, 6) AS MONTH,
+                COUNT(*) AS TOTAL
+
+            FROM {table}
+
+            WHERE
+                MONTH IS NOT NULL
+                AND TRIM(CAST(MONTH AS VARCHAR)) <> ''
+                AND LENGTH(TRIM(SUBSTR(REGEXP_REPLACE(CAST(MONTH AS VARCHAR), '[^0-9]', '', 'g'), 1, 6))) >= 6
+
+            GROUP BY
+                SUBSTR(REGEXP_REPLACE(CAST(MONTH AS VARCHAR), '[^0-9]', '', 'g'), 1, 6)
+
+            ORDER BY
+                SUBSTR(REGEXP_REPLACE(CAST(MONTH AS VARCHAR), '[^0-9]', '', 'g'), 1, 6)
+            """
+        ).fetchall()
+
+        return month_keys_to_options(
+            [
+                str(row[0])
+                for row in rows
+            ]
+        )
+
+    # ==========================================================
+    # FILTER
+    # ==========================================================
+
+    def get_filter_options(
+        self,
+        customer_type: CustomerType,
+        month_key: str | None,
+    ) -> dict[str, list[str]]:
+
+        conn = get_connection()
+
+        table = self._table(
+            customer_type,
+        )
+
+        if not dataset_exists(table):
+            return {
+                "months": [],
+                "unitupi": [],
+                "unitap": [],
+                "unitup": [],
+                "status": [],
+                "inspection_status": [],
+                "dlpd_repeat": [],
+                "kendala": [],
+            }
+
+        where_clauses: list[str] = []
+        params: list[Any] = []
+
+        normalized_month = _normalize_month_key(month_key)
+
+        if normalized_month:
+            where_clauses.append(
+                "SUBSTR(REGEXP_REPLACE(CAST(MONTH AS VARCHAR), '[^0-9]', '', 'g'), 1, 6) = ?"
+            )
+            params.append(normalized_month)
+
+        where_sql = (
+            "WHERE "
+            + " AND ".join(where_clauses)
+            if where_clauses
+            else ""
+        )
+
+        def distinct(
+            column: str,
+        ) -> list[str]:
+
+            if where_sql:
+
+                condition_sql = (
+                    f"{where_sql} "
+                    f"AND {column} IS NOT NULL "
+                    f"AND TRIM(CAST({column} AS VARCHAR)) <> ''"
+                )
+
+            else:
+
+                condition_sql = f"""
+                WHERE
+                    {column} IS NOT NULL
+                    AND TRIM(
+                        CAST({column} AS VARCHAR)
+                    ) <> ''
+                """
+
+            sql = f"""
+            SELECT DISTINCT
+                TRIM(
+                    CAST({column} AS VARCHAR)
+                ) AS VALUE
+
+            FROM {table}
+
+            {condition_sql}
+
+            ORDER BY VALUE
+            """
+
+            rows = conn.execute(
+                sql,
+                params,
+            ).fetchall()
+
+            return [
+                str(row[0])
+                for row in rows
+                if row[0] is not None
+                and str(row[0]).strip() != ""
+            ]
+
+        # ======================================================
+        # KENDALA
+        # ======================================================
+
+        kendala_column = (
+            "KETERANGAN"
+            if customer_type == "prabayar"
+            else "DLPD"
+        )
+
+        if where_sql:
+
+            kendala_condition_sql = (
+                f"{where_sql} "
+                f"AND {kendala_column} IS NOT NULL "
+                f"AND TRIM(CAST({kendala_column} AS VARCHAR)) <> ''"
+            )
+
+        else:
+
+            kendala_condition_sql = f"""
+            WHERE
+                {kendala_column} IS NOT NULL
+                AND TRIM(
+                    CAST({kendala_column} AS VARCHAR)
+                ) <> ''
+            """
+
+        kendala_sql = f"""
+        SELECT DISTINCT
+            TRIM(
+                CAST({kendala_column} AS VARCHAR)
+            ) AS VALUE
+
+        FROM {table}
+
+        {kendala_condition_sql}
+
+        ORDER BY VALUE
+        """
+
+        kendala_rows = conn.execute(
+            kendala_sql,
+            params,
+        ).fetchall()
+
+        kendala_values = [
+            str(row[0])
+            for row in kendala_rows
+            if row[0] is not None
+            and str(row[0]).strip() != ""
+        ]
+
+        # ======================================================
+        # BASE
+        # ======================================================
+
+        result: dict[str, list[str]] = {
+            "months": [
+                month.month_key
+                for month in self.get_available_months(
+                    customer_type,
+                )
+            ],
+
+            "unitupi": [],
+            "unitap": distinct("UNITAP"),
+            "unitup": distinct("UNITUP"),
+
+            "status": [
+                "NORMAL",
+                "TEMUAN",
+            ],
+
+            "inspection_status": [
+                "SUDAH PERIKSA",
+                "BELUM PERIKSA",
+            ],
+
+            "kendala": kendala_values,
+
+            "dlpd_repeat": [],
+        }
+
+        # ======================================================
+        # UNITUPI
+        # HANYA PRABAYAR
+        # ======================================================
+
+        if customer_type == "prabayar":
+
+            result["unitupi"] = distinct(
+                "UNITUPI",
+            )
+
+        # ======================================================
+        # PERULANGAN
+        # HANYA PASCABAYAR
+        # ======================================================
+
+        if customer_type == "pascabayar":
+
+            repeat_month_key = _normalize_month_key(month_key)
+
+            if repeat_month_key:
+
+                months = self._previous_months(
+                    repeat_month_key,
+                    6,
+                )
+
+                placeholders = ",".join(
+                    "?"
+                    for _ in months
+                )
+
+                repeat_sql = f"""
+                SELECT DISTINCT
+                    REPEAT_COUNT
+
+                FROM (
+                    SELECT
+                        IDPEL,
+                        COUNT(DISTINCT SUBSTR(REGEXP_REPLACE(CAST(MONTH AS VARCHAR), '[^0-9]', '', 'g'), 1, 6)) AS REPEAT_COUNT
+
+                    FROM {table}
+
+                    WHERE SUBSTR(REGEXP_REPLACE(CAST(MONTH AS VARCHAR), '[^0-9]', '', 'g'), 1, 6)
+                        IN ({placeholders})
+
+                    GROUP BY IDPEL
+                ) x
+
+                WHERE REPEAT_COUNT >= 1
+
+                ORDER BY REPEAT_COUNT
+                """
+
+                repeat_rows = conn.execute(
+                    repeat_sql,
+                    months,
+                ).fetchall()
+
+                result["dlpd_repeat"] = [
+                    str(row[0])
+                    for row in repeat_rows
+                    if row[0] is not None
+                ]
+
+        # ======================================================
+        # PRABAYAR
+        # BULAN = FILTER UTAMA DI UI
+        # ======================================================
+
+        if customer_type == "prabayar":
+            result["dlpd_repeat"] = []
+
+        return result
+
+    # ==========================================================
+    # DASHBOARD KPI
+    # ==========================================================
+
+    def get_dashboard(
+        self,
+        customer_type: CustomerType,
+        month_key: str | None,
+        filters: DlpdFilters,
+    ) -> dict[str, Any]:
+
+        month_key = _normalize_month_key(month_key)
+
+        conn = get_connection()
+
+        table = self._table(
+            customer_type,
+        )
+
+        if not dataset_exists(table):
+            return {
+                "total_target": 0,
+                "normal": 0,
+                "temuan": 0,
+                "belum_periksa": 0,
+                "sudah_periksa": 0,
+                "progress_pct": 0.0,
+            }
+
+        where_sql, params = self._build_where(
+            customer_type,
+            month_key,
+            filters,
+        )
+
+        sql = f"""
+        WITH
+        {self._inspection_cte()}
+
+        SELECT
+
+            COUNT(*) AS total_target,
+
+            SUM(
+                CASE
+                    WHEN UPPER(
+                        COALESCE(
+                            p.STATUSKWH,
+                            p.UPDATESTATUS,
+                            ''
+                        )
+                    ) LIKE '%NORMAL%'
+                    THEN 1
+                    ELSE 0
+                END
+            ) AS normal,
+
+            SUM(
+                CASE
+                    WHEN p.IDPEL IS NOT NULL
+                    AND UPPER(
+                        COALESCE(
+                            p.STATUSKWH,
+                            p.UPDATESTATUS,
+                            ''
+                        )
+                    ) NOT LIKE '%NORMAL%'
+                    THEN 1
+                    ELSE 0
+                END
+            ) AS temuan,
+
+            SUM(
+                CASE
+                    WHEN p.IDPEL IS NULL
+                    THEN 1
+                    ELSE 0
+                END
+            ) AS belum_periksa
+
+        FROM {table} d
+
+        LEFT JOIN latest_inspection p
+            ON CAST(d.IDPEL AS VARCHAR) = p.IDPEL
+            AND p.rn = 1
+
+        {where_sql}
+        """
+
+        row = conn.execute(
+            sql,
+            params,
+        ).fetchone()
+
+        if row is None:
+
+            return {
+                "total_target": 0,
+                "normal": 0,
+                "temuan": 0,
+                "belum_periksa": 0,
+                "sudah_periksa": 0,
+                "progress_pct": 0.0,
+            }
+
+        total = int(
+            row[0] or 0
+        )
+
+        normal = int(
+            row[1] or 0
+        )
+
+        temuan = int(
+            row[2] or 0
+        )
+
+        belum = int(
+            row[3] or 0
+        )
+
+        sudah_periksa = max(
+            total - belum,
+            0,
+        )
+
+        progress = (
+            sudah_periksa
+            / total
+            * 100
+            if total > 0
+            else 0.0
+        )
+
+        return {
+            "total_target": total,
+            "normal": normal,
+            "temuan": temuan,
+            "belum_periksa": belum,
+            "sudah_periksa": sudah_periksa,
+            "progress_pct": round(
+                progress,
+                2,
+            ),
+        }
+
+    # ==========================================================
+    # DASHBOARD ULP
+    # ==========================================================
+
+    def get_dashboard_ulp(
+        self,
+        customer_type: CustomerType,
+        month_key: str | None,
+        filters: DlpdFilters,
+    ) -> list[dict]:
+        """Return the ULP summary used by the DLPD dashboard.
+
+        This method is deliberately defensive because the ULP panel is a
+        secondary dashboard section: a missing dataset or malformed DLPD
+        value must not make the whole DLPD page return HTTP 500.
+        """
+        month_key = _normalize_month_key(month_key)
+        table = self._table(customer_type)
+
+        if not dataset_exists(table):
+            return []
+
+        conn = get_connection()
+        try:
+            where_sql, params = self._build_where(
+                customer_type,
+                month_key,
+                filters,
+            )
+
+            extra_sql = ""
+            if customer_type == "pascabayar":
+                extra_sql = """
+                ,
+                SUM(
+                    CASE
+                        WHEN TRY_CAST(d.DLPD AS DOUBLE) < 40
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS kwh_lt40,
+
+                SUM(
+                    CASE
+                        WHEN TRY_CAST(d.DLPD AS DOUBLE) = 0
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS kwh_zero
+                """
+
+            sql = f"""
+            WITH
+            {self._inspection_cte()}
+
+            SELECT
+                CAST(d.UNITUP AS VARCHAR) AS UNITUP,
+                CAST(d.UNITUP AS VARCHAR) AS UNIT_NAME,
+                COUNT(*) AS TOTAL,
+
+                SUM(
+                    CASE
+                        WHEN UPPER(
+                            COALESCE(
+                                p.STATUSKWH,
+                                p.UPDATESTATUS,
+                                ''
+                            )
+                        ) LIKE '%NORMAL%'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS NORMAL,
+
+                SUM(
+                    CASE
+                        WHEN p.IDPEL IS NOT NULL
+                        AND UPPER(
+                            COALESCE(
+                                p.STATUSKWH,
+                                p.UPDATESTATUS,
+                                ''
+                            )
+                        ) NOT LIKE '%NORMAL%'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS TEMUAN,
+
+                SUM(
+                    CASE
+                        WHEN p.IDPEL IS NULL
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS BELUM_PERIKSA
+
+                {extra_sql}
+
+            FROM {table} d
+
+            LEFT JOIN latest_inspection p
+                ON CAST(d.IDPEL AS VARCHAR) = p.IDPEL
+                AND p.rn = 1
+
+            {where_sql}
+
+            GROUP BY
+                CAST(d.UNITUP AS VARCHAR)
+
+            ORDER BY
+                CAST(d.UNITUP AS VARCHAR)
+            """
+
+            rows = conn.execute(sql, params).fetchall()
+            result: list[dict] = []
+
+            for row in rows:
+                total = int(row[2] or 0)
+                normal = int(row[3] or 0)
+                temuan = int(row[4] or 0)
+                belum = int(row[5] or 0)
+                inspected = max(normal + temuan, 0)
+
+                result.append(
+                    {
+                        "unitup": str(row[0]) if row[0] is not None else "",
+                        "unit_name": str(row[1]) if row[1] is not None else "",
+                        "total": total,
+                        "normal": normal,
+                        "temuan": temuan,
+                        "belum_periksa": belum,
+                        "total_pemeriksaan": inspected,
+                        "percentage": round(
+                            inspected / total * 100 if total else 0.0,
+                            2,
+                        ),
+                        **(
+                            {
+                                "kwh_lt40": int(row[6] or 0),
+                                "kwh_zero": int(row[7] or 0),
+                            }
+                            if customer_type == "pascabayar"
+                            else {}
+                        ),
+                    }
+                )
+
+            return result
+
+        except Exception:
+            logger.exception(
+                "Failed to build DLPD ULP dashboard: type=%s month=%s",
+                customer_type,
+                month_key,
+            )
+            return []
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    # ==========================================================
+    # CUSTOMER LIST
+    # ==========================================================
+
+    def get_customers(
+        self,
+        customer_type: CustomerType,
+        month_key: str | None,
+        filters: DlpdFilters,
+        page: int,
+        page_size: int,
+    ) -> PageResult:
+
+        month_key = _normalize_month_key(month_key)
+
+        conn = get_connection()
+
+        table = self._table(
+            customer_type,
+        )
+
+        if not dataset_exists(table):
+            return PageResult(
+                items=[],
+                total_rows=0,
+                page=page,
+                page_size=page_size,
+            )
+
+        where_sql, params = self._build_where(
+            customer_type,
+            month_key,
+            filters,
+        )
+
+        offset, page_size = paginate(
+            page,
+            page_size,
+            500,
+        )
+
+        if customer_type == "prabayar":
+            unitupi_sql = "d.UNITUPI"
+        else:
+            unitupi_sql = "NULL"
+
+        repeat_cte, repeat_params = (
+            self._repeat_cte(
+                customer_type,
+                month_key,
+            )
+        )
+
+        sql = f"""
+        WITH
+
+        {self._inspection_cte()},
+
+        {repeat_cte}
+
+        SELECT
+
+            d.IDPEL,
+
+            d.NAMA,
+
+            {unitupi_sql} AS UNITUPI,
+
+            d.UNITAP,
+
+            d.UNITUP,
+
+            d.TARIF,
+
+            d.DAYA,
+
+            d.ALAMAT,
+
+            CASE
+
+                WHEN p.IDPEL IS NULL
+                    THEN 'Belum Periksa'
+
+                WHEN UPPER(
+                    COALESCE(
+                        p.STATUSKWH,
+                        p.UPDATESTATUS,
+                        ''
+                    )
+                ) LIKE '%NORMAL%'
+                    THEN 'Normal'
+
+                ELSE 'Temuan'
+
+            END AS STATUS,
+
+            COALESCE(
+                r.repeat_count,
+                1
+            ) AS DLPD_REPEAT,
+
+            p.STATUSKWH,
+
+            {("d.KETERANGAN" if customer_type == "prabayar" else "d.DLPD")} AS KETERANGAN,
+
+            {("d.KETERANGAN" if customer_type == "prabayar" else "d.DLPD")} AS ALASAN,
+
+            p.CATATAN,
+
+            p.NAMAPETUGAS,
+
+            p.REGU,
+
+            p.WAKTUPERIKSA,
+
+            p.TINDAKLANJUTPEMERIKSAAN
+
+        FROM {table} d
+
+        LEFT JOIN latest_inspection p
+            ON CAST(d.IDPEL AS VARCHAR) = p.IDPEL
+            AND p.rn = 1
+
+        LEFT JOIN repeat_history r
+            ON CAST(d.IDPEL AS VARCHAR) = r.IDPEL
+
+        {where_sql}
+        """
+
+        count_params = list(
+            params
+        )
+
+        # dlpd_repeat sudah diterapkan oleh _build_where().
+        # Jangan menambahkan predicate kedua di sini.
+
+        sql += """
+        ORDER BY
+            d.UNITUP,
+            d.NAMA
+
+        LIMIT ?
+        OFFSET ?
+        """
+
+        params.extend(
+            [
+                page_size,
+                offset,
+            ]
+        )
+
+        rows = conn.execute(
+            sql,
+            [
+                *repeat_params,
+                *params,
+            ],
+        ).fetchall()
+
+        count_sql = f"""
+        WITH
+
+        {self._inspection_cte()},
+
+        {repeat_cte}
+
+        SELECT
+            COUNT(*)
+
+        FROM {table} d
+
+        LEFT JOIN latest_inspection p
+            ON CAST(d.IDPEL AS VARCHAR) = p.IDPEL
+            AND p.rn = 1
+
+        LEFT JOIN repeat_history r
+            ON CAST(d.IDPEL AS VARCHAR) = r.IDPEL
+
+        {where_sql}
+        """
+
+        # dlpd_repeat sudah diterapkan oleh _build_where().
+        total_row = conn.execute(
+            count_sql,
+            [
+                *repeat_params,
+                *count_params,
+            ],
+        ).fetchone()
+
+        total_rows = (
+            total_row[0]
+            if total_row is not None
+            else 0
+        )
+
+        items = []
+
+        for row in rows:
+
+            items.append(
+                {
+                    "idpel": str(
+                        row[0]
+                    ),
+
+                    "nama": row[1],
+
+                    "unitupi": row[2],
+
+                    "unitap": row[3],
+
+                    "unitup": row[4],
+
+                    "tariff": row[5],
+
+                    "daya": row[6],
+
+                    "alamat": row[7],
+
+                    "status": row[8],
+
+                    "dlpd_repeat": str(
+                        row[9]
+                    ),
+
+                    "kategori": row[10],
+
+                    "keterangan": row[11],
+
+                    "alasan": row[12],
+
+                    "catatan": row[13],
+
+                    "petugas": row[14],
+
+                    "regu": row[15],
+
+                    "waktu_periksa": row[16],
+
+                    "google_maps_url": _google_maps_search_url(
+                        address=row[7],
+                        idpel=row[0],
+                    ),
+                }
+            )
+
+        return PageResult(
+            items=items,
+            total_rows=total_rows,
+            page=page,
+            page_size=page_size,
+        )
+
+    # ==========================================================
+    # CUSTOMER DETAIL
+    # ==========================================================
+
+    def get_customer_detail(
+        self,
+        customer_type: CustomerType,
+        idpel: str,
+        month_key: str | None,
+    ) -> DlpdCustomerDetail | None:
+        """Return one customer plus inspection history and Maps metadata."""
+        conn = get_connection()
+        table = self._table(customer_type)
+
+        if not dataset_exists(table):
+            return None
+
+        normalized_idpel = _normalize_idpel(idpel)
+        if not normalized_idpel:
+            return None
+
+        unitupi_sql = "d.UNITUPI" if customer_type == "prabayar" else "NULL"
+        kendala_sql = "d.KETERANGAN" if customer_type == "prabayar" else "d.DLPD"
+        kategori_sql = "p.STATUSKWH" if customer_type == "prabayar" else "d.DLPD"
+        normalized_month = _normalize_month_key(month_key)
+
+        if normalized_month:
+            repeat_months = self._previous_months(normalized_month, 6)
+            repeat_placeholders = ",".join("?" for _ in repeat_months)
+
+            repeat_cte = f"""
+            repeat_history AS (
+                SELECT
+                    REGEXP_REPLACE(
+                        TRIM(CAST(IDPEL AS VARCHAR)),
+                        '\\.0$',
+                        ''
+                    ) AS IDPEL,
+                    COUNT(
+                        DISTINCT SUBSTR(
+                            REGEXP_REPLACE(
+                                CAST(MONTH AS VARCHAR),
+                                '[^0-9]',
+                                '',
+                                'g'
+                            ),
+                            1,
+                            6
+                        )
+                    ) AS REPEAT_COUNT
+                FROM {table}
+                WHERE
+                    SUBSTR(
+                        REGEXP_REPLACE(
+                            CAST(MONTH AS VARCHAR),
+                            '[^0-9]',
+                            '',
+                            'g'
+                        ),
+                        1,
+                        6
+                    ) IN ({repeat_placeholders})
+                GROUP BY
+                    REGEXP_REPLACE(
+                        TRIM(CAST(IDPEL AS VARCHAR)),
+                        '\\.0$',
+                        ''
+                    )
+            )
+            """
+            repeat_params = repeat_months
+            month_condition = """
+                SUBSTR(
+                    REGEXP_REPLACE(
+                        CAST(d.MONTH AS VARCHAR),
+                        '[^0-9]',
+                        '',
+                        'g'
+                    ),
+                    1,
+                    6
+                ) = ?
+                AND
+            """
+            month_params = [normalized_month]
+        else:
+            repeat_cte = f"""
+            repeat_history AS (
+                SELECT
+                    REGEXP_REPLACE(
+                        TRIM(CAST(IDPEL AS VARCHAR)),
+                        '\\.0$',
+                        ''
+                    ) AS IDPEL,
+                    COUNT(
+                        DISTINCT SUBSTR(
+                            REGEXP_REPLACE(
+                                CAST(MONTH AS VARCHAR),
+                                '[^0-9]',
+                                '',
+                                'g'
+                            ),
+                            1,
+                            6
+                        )
+                    ) AS REPEAT_COUNT
+                FROM {table}
+                WHERE MONTH IS NOT NULL
+                GROUP BY
+                    REGEXP_REPLACE(
+                        TRIM(CAST(IDPEL AS VARCHAR)),
+                        '\\.0$',
+                        ''
+                    )
+            )
+            """
+            repeat_params = []
+            month_condition = ""
+            month_params = []
+
+        # Same coordinate precedence as the map:
+        # permanent customer location -> latest valid inspection coordinate.
+        customer_location_source = (
+            "fact_customer_location"
+            if dataset_exists("fact_customer_location")
+            else (
+                "(SELECT CAST(NULL AS VARCHAR) AS IDPEL, "
+                "CAST(NULL AS VARCHAR) AS KOORDINAT_X, "
+                "CAST(NULL AS VARCHAR) AS KOORDINAT_Y WHERE FALSE)"
+            )
+        )
+        pengecekan_source = (
+            "fact_pengecekan"
+            if dataset_exists("fact_pengecekan")
+            else (
+                "(SELECT CAST(NULL AS VARCHAR) AS IDPEL, "
+                "CAST(NULL AS VARCHAR) AS LATITUDE, "
+                "CAST(NULL AS VARCHAR) AS LONGITUDE, "
+                "CAST(NULL AS TIMESTAMP) AS WAKTUPERIKSA WHERE FALSE)"
+            )
+        )
+
+        lat_min, lat_max = -6.6, -3.7
+        lon_min, lon_max = 103.0, 106.5
+
+        sql = f"""
+        WITH
+        {self._inspection_cte()},
+        {repeat_cte},
+
+        customer_location_raw AS (
+            SELECT
+                REGEXP_REPLACE(
+                    TRIM(CAST(IDPEL AS VARCHAR)),
+                    '\\.0$',
+                    ''
+                ) AS IDPEL,
+                TRY_CAST(
+                    REPLACE(TRIM(CAST(KOORDINAT_X AS VARCHAR)), ',', '.')
+                    AS DOUBLE
+                ) AS RAW_X,
+                TRY_CAST(
+                    REPLACE(TRIM(CAST(KOORDINAT_Y AS VARCHAR)), ',', '.')
+                    AS DOUBLE
+                ) AS RAW_Y
+            FROM {customer_location_source}
+            WHERE IDPEL IS NOT NULL
+        ),
+
+        customer_location_normalized AS (
+            SELECT
+                IDPEL,
+                CASE
+                    WHEN RAW_X BETWEEN {lat_min} AND {lat_max}
+                     AND RAW_Y BETWEEN {lon_min} AND {lon_max}
+                    THEN RAW_X
+                    WHEN RAW_X BETWEEN {lon_min} AND {lon_max}
+                     AND RAW_Y BETWEEN {lat_min} AND {lat_max}
+                    THEN RAW_Y
+                    ELSE NULL
+                END AS LATITUDE,
+                CASE
+                    WHEN RAW_X BETWEEN {lat_min} AND {lat_max}
+                     AND RAW_Y BETWEEN {lon_min} AND {lon_max}
+                    THEN RAW_Y
+                    WHEN RAW_X BETWEEN {lon_min} AND {lon_max}
+                     AND RAW_Y BETWEEN {lat_min} AND {lat_max}
+                    THEN RAW_X
+                    ELSE NULL
+                END AS LONGITUDE
+            FROM customer_location_raw
+        ),
+
+        customer_location_by_idpel AS (
+            SELECT IDPEL, LATITUDE, LONGITUDE
+            FROM (
+                SELECT
+                    IDPEL,
+                    LATITUDE,
+                    LONGITUDE,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY IDPEL
+                        ORDER BY
+                            CASE
+                                WHEN LATITUDE IS NOT NULL
+                                 AND LONGITUDE IS NOT NULL
+                                THEN 0
+                                ELSE 1
+                            END
+                    ) AS RN
+                FROM customer_location_normalized
+                WHERE LATITUDE IS NOT NULL
+                  AND LONGITUDE IS NOT NULL
+            ) x
+            WHERE RN = 1
+        ),
+
+        pengecekan_raw AS (
+            SELECT
+                REGEXP_REPLACE(
+                    TRIM(CAST(IDPEL AS VARCHAR)),
+                    '\\.0$',
+                    ''
+                ) AS IDPEL,
+                TRY_CAST(
+                    REPLACE(TRIM(CAST(LATITUDE AS VARCHAR)), ',', '.')
+                    AS DOUBLE
+                ) AS RAW_LATITUDE,
+                TRY_CAST(
+                    REPLACE(TRIM(CAST(LONGITUDE AS VARCHAR)), ',', '.')
+                    AS DOUBLE
+                ) AS RAW_LONGITUDE,
+                WAKTUPERIKSA
+            FROM {pengecekan_source}
+            WHERE IDPEL IS NOT NULL
+        ),
+
+        pengecekan_normalized AS (
+            SELECT
+                IDPEL,
+                CASE
+                    WHEN RAW_LATITUDE BETWEEN {lat_min} AND {lat_max}
+                     AND RAW_LONGITUDE BETWEEN {lon_min} AND {lon_max}
+                    THEN RAW_LATITUDE
+                    WHEN RAW_LATITUDE BETWEEN {lon_min} AND {lon_max}
+                     AND RAW_LONGITUDE BETWEEN {lat_min} AND {lat_max}
+                    THEN RAW_LONGITUDE
+                    ELSE NULL
+                END AS LATITUDE,
+                CASE
+                    WHEN RAW_LATITUDE BETWEEN {lat_min} AND {lat_max}
+                     AND RAW_LONGITUDE BETWEEN {lon_min} AND {lon_max}
+                    THEN RAW_LONGITUDE
+                    WHEN RAW_LATITUDE BETWEEN {lon_min} AND {lon_max}
+                     AND RAW_LONGITUDE BETWEEN {lat_min} AND {lat_max}
+                    THEN RAW_LATITUDE
+                    ELSE NULL
+                END AS LONGITUDE,
+                WAKTUPERIKSA
+            FROM pengecekan_raw
+        ),
+
+        pengecekan_by_idpel AS (
+            SELECT IDPEL, LATITUDE, LONGITUDE
+            FROM (
+                SELECT
+                    IDPEL,
+                    LATITUDE,
+                    LONGITUDE,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY IDPEL
+                        ORDER BY WAKTUPERIKSA DESC NULLS LAST
+                    ) AS RN
+                FROM pengecekan_normalized
+                WHERE LATITUDE IS NOT NULL
+                  AND LONGITUDE IS NOT NULL
+            ) x
+            WHERE RN = 1
+        )
+
+        SELECT
+            CAST(d.IDPEL AS VARCHAR) AS idpel,
+            CAST(d.NAMA AS VARCHAR) AS nama,
+            CAST({unitupi_sql} AS VARCHAR) AS unitupi,
+            CAST(d.UNITAP AS VARCHAR) AS unitap,
+            CAST(d.UNITUP AS VARCHAR) AS unitup,
+            CAST(d.TARIF AS VARCHAR) AS tariff,
+            TRY_CAST(d.DAYA AS BIGINT) AS daya,
+            CAST(d.ALAMAT AS VARCHAR) AS alamat,
+
+            CASE
+                WHEN p.IDPEL IS NULL
+                    THEN 'Belum Periksa'
+                WHEN UPPER(
+                    COALESCE(
+                        p.STATUSKWH,
+                        p.UPDATESTATUS,
+                        ''
+                    )
+                ) LIKE '%NORMAL%'
+                    THEN 'Normal'
+                ELSE 'Temuan'
+            END AS status,
+
+            CAST(COALESCE(r.REPEAT_COUNT, 1) AS VARCHAR) AS dlpd_repeat,
+            CAST({kategori_sql} AS VARCHAR) AS kategori,
+            CAST({kendala_sql} AS VARCHAR) AS keterangan,
+            CAST({kendala_sql} AS VARCHAR) AS alasan,
+            CAST(p.CATATAN AS VARCHAR) AS catatan,
+            CAST(p.NAMAPETUGAS AS VARCHAR) AS petugas,
+            CAST(p.REGU AS VARCHAR) AS regu,
+            p.WAKTUPERIKSA AS waktu_periksa,
+
+            c.LATITUDE AS latitude_customer,
+            c.LONGITUDE AS longitude_customer,
+            q.LATITUDE AS latitude_inspection,
+            q.LONGITUDE AS longitude_inspection
+
+        FROM {table} d
+
+        LEFT JOIN latest_inspection p
+            ON REGEXP_REPLACE(
+                TRIM(CAST(d.IDPEL AS VARCHAR)),
+                '\\.0$',
+                ''
+            ) = p.IDPEL
+            AND p.rn = 1
+
+        LEFT JOIN repeat_history r
+            ON REGEXP_REPLACE(
+                TRIM(CAST(d.IDPEL AS VARCHAR)),
+                '\\.0$',
+                ''
+            ) = r.IDPEL
+
+        LEFT JOIN customer_location_by_idpel c
+            ON REGEXP_REPLACE(
+                TRIM(CAST(d.IDPEL AS VARCHAR)),
+                '\\.0$',
+                ''
+            ) = c.IDPEL
+
+        LEFT JOIN pengecekan_by_idpel q
+            ON REGEXP_REPLACE(
+                TRIM(CAST(d.IDPEL AS VARCHAR)),
+                '\\.0$',
+                ''
+            ) = q.IDPEL
+
+        WHERE
+            {month_condition}
+            REGEXP_REPLACE(
+                TRIM(CAST(d.IDPEL AS VARCHAR)),
+                '\\.0$',
+                ''
+            ) = ?
+
+        ORDER BY
+            SUBSTR(
+                REGEXP_REPLACE(
+                    CAST(d.MONTH AS VARCHAR),
+                    '[^0-9]',
+                    '',
+                    'g'
+                ),
+                1,
+                6
+            ) DESC
+        LIMIT 1
+        """
+
+        try:
+            row = conn.execute(
+                sql,
+                [
+                    *repeat_params,
+                    *month_params,
+                    normalized_idpel,
+                ],
+            ).fetchone()
+        except Exception:
+            logger.exception(
+                "Failed to load DLPD customer detail: type=%s idpel=%s month=%s",
+                customer_type,
+                normalized_idpel,
+                normalized_month,
+            )
+            return None
+
+        if row is None:
+            return None
+
+        keys = [
+            "idpel",
+            "nama",
+            "unitupi",
+            "unitap",
+            "unitup",
+            "tariff",
+            "daya",
+            "alamat",
+            "status",
+            "dlpd_repeat",
+            "kategori",
+            "keterangan",
+            "alasan",
+            "catatan",
+            "petugas",
+            "regu",
+            "waktu_periksa",
+            "latitude_customer",
+            "longitude_customer",
+            "latitude_inspection",
+            "longitude_inspection",
+        ]
+        customer = dict(zip(keys, row))
+
+        latitude = customer.pop("latitude_customer", None)
+        longitude = customer.pop("longitude_customer", None)
+        coordinate_source = None
+
+        if latitude is not None and longitude is not None:
+            coordinate_source = "customer_location"
+        else:
+            latitude = customer.pop("latitude_inspection", None)
+            longitude = customer.pop("longitude_inspection", None)
+            if latitude is not None and longitude is not None:
+                coordinate_source = "pengecekan"
+            else:
+                customer.pop("latitude_inspection", None)
+                customer.pop("longitude_inspection", None)
+
+        customer["latitude"] = (
+            float(latitude) if latitude is not None else None
+        )
+        customer["longitude"] = (
+            float(longitude) if longitude is not None else None
+        )
+        customer["coordinate_source"] = coordinate_source
+        customer["google_maps_url"] = _google_maps_search_url(
+            latitude=latitude,
+            longitude=longitude,
+            address=customer.get("alamat"),
+            idpel=customer.get("idpel"),
+        )
+
+        history: list[InspectionHistory] = []
+        if dataset_exists("fact_pengecekan"):
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        WAKTU_PERIKSA AS WAKTUPERIKSA,
+                        STATUS_KWH AS STATUSKWH,
+                        NAMA_PETUGAS AS NAMAPETUGAS,
+                        REGU,
+                        CATATAN,
+                        TINDAK_LANJUT_PEMERIKSAAN AS TINDAKLANJUTPEMERIKSAAN
+                    FROM fact_pengecekan
+                    WHERE REGEXP_REPLACE(
+                        TRIM(CAST(IDPEL AS VARCHAR)),
+                        '\\.0$',
+                        ''
+                    ) = ?
+                    ORDER BY WAKTUPERIKSA DESC NULLS LAST
+                    """,
+                    [normalized_idpel],
+                ).fetchall()
+
+                history = [
+                    InspectionHistory(
+                        waktu_periksa=r[0],
+                        status=r[1],
+                        petugas=r[2],
+                        regu=r[3],
+                        catatan=r[4],
+                        tindak_lanjut=r[5],
+                    )
+                    for r in rows
+                ]
+            except Exception:
+                logger.exception(
+                    "Failed to load inspection history: idpel=%s",
+                    normalized_idpel,
+                )
+
+        return DlpdCustomerDetail(
+            customer=customer,
+            inspection_history=history,
+        )
+
+    # ==========================================================
+    # EXPORT
+    # ==========================================================
+
+    def export_customers(
+        self,
+        customer_type: str,
+        month_key: str | None,
+        filters: DlpdFilters,
+    ) -> list[dict]:
+
+        month_key = _normalize_month_key(month_key)
+
+        conn = get_connection()
+
+        table = self._table(
+            customer_type,
+        )
+
+        if not dataset_exists(table):
+            return []
+
+        where_sql, params = self._build_where(
+            customer_type,
+            month_key,
+            filters,
+        )
+
+        sql = f"""
+        WITH
+        {self._inspection_cte()}
+
+        SELECT
+
+            d.IDPEL,
+
+            d.NAMA,
+
+            d.ALAMAT,
+
+            {
+                "d.UNITUPI"
+                if customer_type == "prabayar"
+                else "NULL"
+            } AS UNITUPI,
+
+            d.UNITAP,
+
+            d.UNITUP,
+
+            d.TARIF,
+
+            d.DAYA,
+
+            d.DLPD,
+
+            CASE
+
+                WHEN p.IDPEL IS NULL
+                    THEN 'Belum Periksa'
+
+                WHEN UPPER(
+                    COALESCE(
+                        p.STATUSKWH,
+                        p.UPDATESTATUS,
+                        ''
+                    )
+                ) LIKE '%NORMAL%'
+                    THEN 'Normal'
+
+                ELSE 'Temuan'
+
+            END AS STATUS,
+
+            p.WAKTUPERIKSA,
+
+            p.UPDATESTATUS,
+
+            p.NAMAPETUGAS,
+
+            p.REGU
+
+        FROM {table} d
+
+        LEFT JOIN latest_inspection p
+            ON CAST(d.IDPEL AS VARCHAR) = p.IDPEL
+            AND p.rn = 1
+
+        {where_sql}
+
+        ORDER BY
+            d.UNITUP,
+            d.NAMA
+        """
+
+        rows = conn.execute(
+            sql,
+            params,
+        ).fetchall()
+
+        columns = [
+            c[0].lower()
+            for c in conn.description
+        ]
+
+        return [
+            dict(
+                zip(
+                    columns,
+                    row,
+                )
+            )
+            for row in rows
+        ]
+
+    # ==========================================================
+    # SPATIAL / MAP
+    # ==========================================================
+
+
+    def get_map_points(
+        self,
+        customer_type: CustomerType,
+        month_key: str | None,
+        filters: DlpdFilters | None = None,
+        limit: int = 100_000,
+    ) -> dict[str, Any]:
+
+        month_key = _normalize_month_key(month_key)
+        """
+        Return DLPD map points with deterministic coordinate matching.
+
+        Coordinate precedence:
+            1. fact_customer_location
+            2. fact_pengecekan
+
+        Both sources are normalized and restricted to the PLN Lampung
+        operating area. Invalid coordinates are never plotted.
+
+        This is intentionally stricter than accepting any coordinate in
+        Indonesia because the source warehouse contains malformed values
+        such as sub-degree latitude values and coordinates from unrelated
+        regions.
+        """
+
+        empty = {
+            "total": 0,
+            "location_matched": 0,
+            "mapped": 0,
+            "unmapped": 0,
+            "points": [],
+        }
+
+        conn = get_connection()
+
+        try:
+            table = self._table(customer_type)
+            filters = filters or DlpdFilters()
+
+            if not dataset_exists(table):
+                return empty
+
+            safe_limit = max(
+                1,
+                min(int(limit), 100_000),
+            )
+
+            normalized_map_month = _normalize_month_key(month_key)
+
+            where_sql, params = self._build_where(
+                customer_type,
+                normalized_map_month,
+                filters,
+            )
+
+            unitupi_sql = (
+                "d.UNITUPI"
+                if customer_type == "prabayar"
+                else "SUBSTR(CAST(d.UNITAP AS VARCHAR), 1, 2)"
+            )
+
+            # Lampung / UID Lampung coordinate guard.
+            # The warehouse is UID 17, so coordinates outside this
+            # geographic envelope are treated as invalid rather than
+            # placing customers in the ocean or another province.
+            lat_min = -6.6
+            lat_max = -3.7
+            lon_min = 103.0
+            lon_max = 106.5
+
+            customer_location_source = (
+                "fact_customer_location"
+                if dataset_exists("fact_customer_location")
+                else "(SELECT CAST(NULL AS VARCHAR) AS IDPEL, CAST(NULL AS VARCHAR) AS KOORDINAT_X, CAST(NULL AS VARCHAR) AS KOORDINAT_Y WHERE FALSE)"
+            )
+            pengecekan_source = (
+                "fact_pengecekan"
+                if dataset_exists("fact_pengecekan")
+                else "(SELECT CAST(NULL AS VARCHAR) AS IDPEL, CAST(NULL AS VARCHAR) AS LATITUDE, CAST(NULL AS VARCHAR) AS LONGITUDE, CAST(NULL AS TIMESTAMP) AS WAKTUPERIKSA WHERE FALSE)"
+            )
+
+            sql = f"""
+            WITH
+            {self._inspection_cte()},
+
+            filtered_dlpd AS (
+                SELECT
+                    REGEXP_REPLACE(
+                        TRIM(CAST(d.IDPEL AS VARCHAR)),
+                        '\\.0$',
+                        ''
+                    ) AS IDPEL,
+                    d.NAMA,
+                    {unitupi_sql} AS UNITUPI,
+                    d.UNITAP,
+                    d.UNITUP,
+                    d.TARIF,
+                    d.DAYA,
+                    d.ALAMAT,
+                    d.DLPD,
+
+                    CASE
+                        WHEN p.IDPEL IS NULL
+                            THEN 'BELUM'
+                        WHEN UPPER(
+                            COALESCE(
+                                p.STATUSKWH,
+                                p.UPDATESTATUS,
+                                ''
+                            )
+                        ) LIKE '%NORMAL%'
+                            THEN 'NORMAL'
+                        ELSE 'TEMUAN'
+                    END AS STATUS
+
+                FROM {table} d
+
+                LEFT JOIN latest_inspection p
+                    ON d.IDPEL = p.IDPEL
+                    AND p.rn = 1
+
+                {where_sql}
+            ),
+
+            customer_location_raw AS (
+                SELECT
+                    REGEXP_REPLACE(
+                        TRIM(CAST(IDPEL AS VARCHAR)),
+                        '\\.0$',
+                        ''
+                    ) AS IDPEL,
+                    TRY_CAST(REPLACE(TRIM(CAST(KOORDINAT_X AS VARCHAR)), ',', '.') AS DOUBLE) AS RAW_X,
+                    TRY_CAST(REPLACE(TRIM(CAST(KOORDINAT_Y AS VARCHAR)), ',', '.') AS DOUBLE) AS RAW_Y
+                FROM {customer_location_source}
+                WHERE IDPEL IS NOT NULL
+            ),
+
+            customer_location_normalized AS (
+                SELECT
+                    IDPEL,
+
+                    CASE
+                        WHEN
+                            RAW_X BETWEEN {lat_min} AND {lat_max}
+                            AND RAW_Y BETWEEN {lon_min} AND {lon_max}
+                        THEN RAW_X
+
+                        WHEN
+                            RAW_X BETWEEN {lon_min} AND {lon_max}
+                            AND RAW_Y BETWEEN {lat_min} AND {lat_max}
+                        THEN RAW_Y
+
+                        ELSE NULL
+                    END AS LATITUDE,
+
+                    CASE
+                        WHEN
+                            RAW_X BETWEEN {lat_min} AND {lat_max}
+                            AND RAW_Y BETWEEN {lon_min} AND {lon_max}
+                        THEN RAW_Y
+
+                        WHEN
+                            RAW_X BETWEEN {lon_min} AND {lon_max}
+                            AND RAW_Y BETWEEN {lat_min} AND {lat_max}
+                        THEN RAW_X
+
+                        ELSE NULL
+                    END AS LONGITUDE
+
+                FROM customer_location_raw
+            ),
+
+            customer_location_by_idpel AS (
+                SELECT
+                    IDPEL,
+                    LATITUDE,
+                    LONGITUDE
+                FROM (
+                    SELECT
+                        IDPEL,
+                        LATITUDE,
+                        LONGITUDE,
+
+                        ROW_NUMBER() OVER (
+                            PARTITION BY IDPEL
+                            ORDER BY
+                                CASE
+                                    WHEN
+                                        LATITUDE IS NOT NULL
+                                        AND LONGITUDE IS NOT NULL
+                                    THEN 0
+                                    ELSE 1
+                                END
+                        ) AS RN
+
+                    FROM customer_location_normalized
+
+                    WHERE
+                        LATITUDE IS NOT NULL
+                        AND LONGITUDE IS NOT NULL
+                ) x
+
+                WHERE RN = 1
+            ),
+
+            pengecekan_raw AS (
+                SELECT REGEXP_REPLACE(TRIM(CAST(IDPEL AS VARCHAR)), '\\.0$', '') AS IDPEL,
+                       TRY_CAST(REPLACE(TRIM(CAST(LATITUDE AS VARCHAR)), ',', '.') AS DOUBLE) AS RAW_LATITUDE,
+                       TRY_CAST(REPLACE(TRIM(CAST(LONGITUDE AS VARCHAR)), ',', '.') AS DOUBLE) AS RAW_LONGITUDE, WAKTUPERIKSA
+                FROM {pengecekan_source} WHERE IDPEL IS NOT NULL
+            ),
+            pengecekan_normalized AS (
+                SELECT IDPEL,
+                       CASE WHEN RAW_LATITUDE BETWEEN {lat_min} AND {lat_max} AND RAW_LONGITUDE BETWEEN {lon_min} AND {lon_max} THEN RAW_LATITUDE
+                            WHEN RAW_LATITUDE BETWEEN {lon_min} AND {lon_max} AND RAW_LONGITUDE BETWEEN {lat_min} AND {lat_max} THEN RAW_LONGITUDE ELSE NULL END AS LATITUDE,
+                       CASE WHEN RAW_LATITUDE BETWEEN {lat_min} AND {lat_max} AND RAW_LONGITUDE BETWEEN {lon_min} AND {lon_max} THEN RAW_LONGITUDE
+                            WHEN RAW_LATITUDE BETWEEN {lon_min} AND {lon_max} AND RAW_LONGITUDE BETWEEN {lat_min} AND {lat_max} THEN RAW_LATITUDE ELSE NULL END AS LONGITUDE,
+                       WAKTUPERIKSA
+                FROM pengecekan_raw
+            ),
+            pengecekan_by_idpel AS (
+                SELECT IDPEL,LATITUDE,LONGITUDE FROM (
+                    SELECT IDPEL,LATITUDE,LONGITUDE,ROW_NUMBER() OVER(PARTITION BY IDPEL ORDER BY WAKTUPERIKSA DESC NULLS LAST) AS RN
+                    FROM pengecekan_normalized WHERE LATITUDE IS NOT NULL AND LONGITUDE IS NOT NULL
+                ) x WHERE RN=1
+            ),
+
+            mapped AS (
+                SELECT
+                    d.IDPEL,
+                    d.NAMA,
+                    d.UNITUPI,
+                    d.UNITAP,
+                    d.UNITUP,
+                    d.TARIF,
+                    d.DAYA,
+                    d.ALAMAT,
+                    d.DLPD,
+                    d.STATUS,
+
+                    CASE
+                        WHEN
+                            c.LATITUDE IS NOT NULL
+                            AND c.LONGITUDE IS NOT NULL
+                        THEN c.LATITUDE
+                        ELSE p.LATITUDE
+                    END AS LATITUDE,
+
+                    CASE
+                        WHEN
+                            c.LATITUDE IS NOT NULL
+                            AND c.LONGITUDE IS NOT NULL
+                        THEN c.LONGITUDE
+                        ELSE p.LONGITUDE
+                    END AS LONGITUDE,
+
+                    CASE
+                        WHEN
+                            c.LATITUDE IS NOT NULL
+                            AND c.LONGITUDE IS NOT NULL
+                        THEN 'customer_location'
+
+                        WHEN
+                            p.LATITUDE IS NOT NULL
+                            AND p.LONGITUDE IS NOT NULL
+                        THEN 'pengecekan'
+
+                        ELSE NULL
+                    END AS COORDINATE_SOURCE
+
+                FROM filtered_dlpd d
+
+                LEFT JOIN customer_location_by_idpel c
+                    ON d.IDPEL = c.IDPEL
+
+                LEFT JOIN pengecekan_by_idpel p
+                    ON d.IDPEL = p.IDPEL
+            )
+
+            SELECT
+                IDPEL,
+                NAMA,
+                UNITUPI,
+                UNITAP,
+                UNITUP,
+                TARIF,
+                DAYA,
+                ALAMAT,
+                DLPD,
+                STATUS,
+                LATITUDE,
+                LONGITUDE,
+                COORDINATE_SOURCE
+
+            FROM mapped
+
+            WHERE
+                LATITUDE IS NOT NULL
+                AND LONGITUDE IS NOT NULL
+
+            ORDER BY
+                UNITUP,
+                IDPEL
+
+            LIMIT ?
+            """
+
+            rows = conn.execute(
+                sql,
+                [
+                    *params,
+                    safe_limit,
+                ],
+            ).fetchall()
+
+            points: list[dict[str, Any]] = []
+
+            for row in rows:
+                points.append(
+                    {
+                        "idpel": str(row[0]),
+                        "nama": row[1],
+                        "unitupi": (
+                            str(row[2])
+                            if row[2] is not None
+                            else None
+                        ),
+                        "unitap": (
+                            str(row[3])
+                            if row[3] is not None
+                            else None
+                        ),
+                        "unitup": (
+                            str(row[4])
+                            if row[4] is not None
+                            else None
+                        ),
+                        "tariff": (
+                            str(row[5])
+                            if row[5] is not None
+                            else None
+                        ),
+                        "daya": (
+                            float(row[6])
+                            if row[6] is not None
+                            else None
+                        ),
+                        "alamat": row[7],
+                        "dlpd": (
+                            str(row[8])
+                            if row[8] is not None
+                            else None
+                        ),
+                        "status": row[9],
+                        "latitude": float(row[10]),
+                        "longitude": float(row[11]),
+                        "coordinate_source": row[12],
+                        "google_maps_url": _google_maps_search_url(
+                            latitude=row[10],
+                            longitude=row[11],
+                            address=row[7],
+                            idpel=row[0],
+                        ),
+                    }
+                )
+
+            coverage_sql = f"""
+            WITH
+            {self._inspection_cte()},
+
+            filtered_dlpd AS (
+                SELECT
+                    CAST(d.IDPEL AS VARCHAR) AS IDPEL
+                FROM {table} d
+                LEFT JOIN latest_inspection p
+                    ON d.IDPEL = p.IDPEL
+                    AND p.rn = 1
+                {where_sql}
+            ),
+
+            all_location AS (
+                SELECT DISTINCT
+                    REGEXP_REPLACE(
+                        TRIM(CAST(IDPEL AS VARCHAR)),
+                        '\\.0$',
+                        ''
+                    ) AS IDPEL
+                FROM {customer_location_source}
+                WHERE IDPEL IS NOT NULL
+            ),
+
+            customer_valid AS (
+                SELECT DISTINCT
+                    REGEXP_REPLACE(
+                        TRIM(CAST(IDPEL AS VARCHAR)),
+                        '\\.0$',
+                        ''
+                    ) AS IDPEL
+                FROM {customer_location_source}
+                WHERE IDPEL IS NOT NULL
+                  AND (
+                      (
+                          TRY_CAST(REPLACE(TRIM(CAST(KOORDINAT_X AS VARCHAR)), ',', '.') AS DOUBLE)
+                              BETWEEN {lat_min} AND {lat_max}
+                          AND
+                          TRY_CAST(REPLACE(TRIM(CAST(KOORDINAT_Y AS VARCHAR)), ',', '.') AS DOUBLE)
+                              BETWEEN {lon_min} AND {lon_max}
+                      )
+                      OR
+                      (
+                          TRY_CAST(REPLACE(TRIM(CAST(KOORDINAT_X AS VARCHAR)), ',', '.') AS DOUBLE)
+                              BETWEEN {lon_min} AND {lon_max}
+                          AND
+                          TRY_CAST(REPLACE(TRIM(CAST(KOORDINAT_Y AS VARCHAR)), ',', '.') AS DOUBLE)
+                              BETWEEN {lat_min} AND {lat_max}
+                      )
+                  )
+            ),
+
+            pengecekan_valid AS (
+                SELECT DISTINCT
+                    REGEXP_REPLACE(TRIM(CAST(IDPEL AS VARCHAR)), '\\.0$', '') AS IDPEL
+                FROM {pengecekan_source}
+                WHERE IDPEL IS NOT NULL
+                  AND (
+                      (
+                          TRY_CAST(
+                              REPLACE(TRIM(CAST(LATITUDE AS VARCHAR)), ',', '.')
+                              AS DOUBLE
+                          ) BETWEEN {lat_min} AND {lat_max}
+                          AND
+                          TRY_CAST(
+                              REPLACE(TRIM(CAST(LONGITUDE AS VARCHAR)), ',', '.')
+                              AS DOUBLE
+                          ) BETWEEN {lon_min} AND {lon_max}
+                      )
+                      OR
+                      (
+                          TRY_CAST(
+                              REPLACE(TRIM(CAST(LATITUDE AS VARCHAR)), ',', '.')
+                              AS DOUBLE
+                          ) BETWEEN {lon_min} AND {lon_max}
+                          AND
+                          TRY_CAST(
+                              REPLACE(TRIM(CAST(LONGITUDE AS VARCHAR)), ',', '.')
+                              AS DOUBLE
+                          ) BETWEEN {lat_min} AND {lat_max}
+                      )
+                  )
+            )
+
+            SELECT
+                COUNT(DISTINCT d.IDPEL) AS TOTAL,
+                COUNT(DISTINCT a.IDPEL) AS LOCATION_MATCHED,
+                COUNT(
+                    DISTINCT CASE
+                        WHEN
+                            c.IDPEL IS NOT NULL
+                            OR p.IDPEL IS NOT NULL
+                        THEN d.IDPEL
+                    END
+                ) AS MAPPED
+
+            FROM filtered_dlpd d
+
+            LEFT JOIN all_location a
+                ON d.IDPEL = a.IDPEL
+
+            LEFT JOIN customer_valid c
+                ON d.IDPEL = c.IDPEL
+
+            LEFT JOIN pengecekan_valid p
+                ON d.IDPEL = p.IDPEL
+            """
+
+            coverage = conn.execute(
+                coverage_sql,
+                params,
+            ).fetchone()
+
+            total = int(
+                coverage[0] or 0
+            ) if coverage else 0
+
+            location_matched = int(
+                coverage[1] or 0
+            ) if coverage else 0
+
+            mapped = int(
+                coverage[2] or 0
+            ) if coverage else 0
+
+            return {
+                "total": total,
+                "location_matched": location_matched,
+                "mapped": mapped,
+                "unmapped": max(
+                    total - mapped,
+                    0,
+                ),
+                "points": points,
+            }
+
+        except Exception:
+            logger.exception(
+                "Failed to load DLPD map points: type=%s month=%s",
+                customer_type,
+                month_key,
+            )
+            return empty
+
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass

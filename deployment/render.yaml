@@ -1,0 +1,34 @@
+# Render Blueprint — deploy the backend with "New +" -> "Blueprint" and
+# pointing Render at this repo, or configure a Web Service manually using
+# these same values. Free tier is sufficient to start.
+#
+# https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: pln-analytics-api
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DEBUG
+        value: "false"
+      - key: CORS_ORIGINS
+        value: https://pln-analytics-platform.pages.dev
+      - key: JWT_SECRET_KEY
+        generateValue: true
+      - key: JWT_EXPIRES_MINUTES
+        value: "480"
+      - key: USERS_FILE
+        value: data/auth/users.json
+      - key: DATA_PROCESSED_DIR
+        value: ../data/processed
+      - key: DEFAULT_PAGE_SIZE
+        value: "50"
+      - key: MAX_PAGE_SIZE
+        value: "500"

@@ -1,0 +1,4214 @@
+﻿============================================================
+FILE: .\src\api\dlpd.ts
+============================================================
+import api from "./api";
+
+
+/* ==========================================================
+ * TYPES
+ * ========================================================== */
+
+
+export type CustomerType =
+    | "prabayar"
+    | "pascabayar";
+
+
+export interface MonthOption {
+    month_key: string;
+    label: string;
+}
+
+
+export interface DlpdDashboard {
+    total_target: number;
+    normal: number;
+    temuan: number;
+    belum_periksa: number;
+    sudah_periksa: number;
+    progress_pct: number;
+}
+
+
+export interface DlpdDashboardUlp {
+    unitup: string;
+    unit_name: string;
+    total: number;
+    normal: number;
+    temuan: number;
+    belum_periksa: number;
+    total_pemeriksaan: number;
+    percentage: number;
+
+    kwh_lt40?: number;
+    kwh_zero?: number;
+}
+
+
+export interface DlpdFilters {
+    months: string[];
+
+    unitupi: string[];
+
+    unitap: string[];
+
+    unitup: string[];
+
+    tariff: string[];
+
+    /*
+     * STATUS HASIL PEMERIKSAAN
+     *
+     * NORMAL
+     * TEMUAN
+     */
+    status: string[];
+
+    /*
+     * STATUS PEMERIKSAAN
+     *
+     * SUDAH PERIKSA
+     * BELUM PERIKSA
+     */
+    inspection_status: string[];
+
+    dlpd_repeat: string[];
+
+    kendala: string[];
+}
+
+
+export interface DlpdCustomer {
+    idpel: string;
+
+    nama: string;
+
+    unitupi?: string;
+
+    unitap?: string;
+
+    unitup?: string;
+
+    tariff?: string;
+
+    daya?: number;
+
+    alamat?: string;
+
+    /*
+     * Status hasil pemeriksaan:
+     *
+     * NORMAL
+     * TEMUAN
+     */
+    status: string;
+
+    dlpd_repeat?: string;
+
+    kategori?: string;
+
+    keterangan?: string;
+
+    alasan?: string;
+
+    catatan?: string;
+
+    petugas?: string;
+
+    regu?: string;
+
+    waktu_periksa?: string;
+}
+
+
+export interface DlpdCustomerList {
+    items: DlpdCustomer[];
+
+    total_rows: number;
+
+    page: number;
+
+    page_size: number;
+
+    total_pages: number;
+}
+
+
+export interface InspectionHistory {
+    waktu_periksa?: string;
+
+    status?: string;
+
+    petugas?: string;
+
+    regu?: string;
+
+    catatan?: string;
+
+    tindak_lanjut?: string;
+}
+
+
+export interface DlpdCustomerDetail {
+    customer: DlpdCustomer | null;
+
+    inspection_history: InspectionHistory[];
+}
+/* ==========================================================
+ * MAP POINTS
+ * ========================================================== */
+
+export interface DlpdMapPoint {
+    idpel: string;
+    nama: string;
+
+    unitupi?: string;
+    unitap?: string;
+    unitup?: string;
+
+    tariff?: string;
+    daya?: number;
+
+    alamat?: string;
+
+    dlpd?: string | null;
+    status?: string | null;
+
+    longitude: number;
+    latitude: number;
+}
+
+
+export interface DlpdMapPointsResponse {
+    total: number;
+    location_matched: number;
+    mapped: number;
+    unmapped: number;
+    points: DlpdMapPoint[];
+}
+
+
+/* ==========================================================
+ * QUERY FILTERS
+ * ========================================================== */
+
+
+export interface DlpdQueryFilters {
+    unitupi?: string;
+
+    unitap?: string;
+
+    unitup?: string;
+
+    tariff?: string;
+
+    /*
+     * STATUS HASIL PEMERIKSAAN
+     *
+     * NORMAL
+     * TEMUAN
+     */
+    status?: string;
+
+    /*
+     * STATUS PEMERIKSAAN
+     *
+     * SUDAH PERIKSA
+     * BELUM PERIKSA
+     *
+     * INI BERBEDA DENGAN `status`.
+     */
+    inspection_status?: string;
+
+    dlpd_repeat?: string;
+
+    /*
+     * KENDALA
+     *
+     * Prabayar:
+     *   menggunakan nilai KETERANGAN.
+     *
+     * Pascabayar:
+     *   menggunakan nilai DLPD.
+     *
+     * Contoh:
+     *   KWH < 40 JAM
+     *   KWH NOL
+     */
+    kendala?: string;
+
+    search_idpel?: string;
+
+    search_nama?: string;
+}
+
+
+/* ==========================================================
+ * PARAMETER BUILDER
+ * ========================================================== */
+
+
+function buildDlpdParams(
+    customerType: CustomerType,
+    month?: string,
+    filters?: DlpdQueryFilters,
+) {
+    return {
+        customer_type:
+            customerType,
+
+        ...(month
+            ? {
+                  month,
+              }
+            : {}),
+
+        ...(filters?.unitupi
+            ? {
+                  unitupi:
+                      filters.unitupi,
+              }
+            : {}),
+
+        ...(filters?.unitap
+            ? {
+                  unitap:
+                      filters.unitap,
+              }
+            : {}),
+
+        ...(filters?.unitup
+            ? {
+                  unitup:
+                      filters.unitup,
+              }
+            : {}),
+
+        ...(filters?.tariff
+            ? {
+                  tariff:
+                      filters.tariff,
+              }
+            : {}),
+
+        /*
+         * STATUS HASIL
+         *
+         * NORMAL / TEMUAN
+         */
+        ...(filters?.status
+            ? {
+                  status:
+                      filters.status,
+              }
+            : {}),
+
+        /*
+         * STATUS PEMERIKSAAN
+         *
+         * SUDAH PERIKSA / BELUM PERIKSA
+         */
+        ...(filters?.inspection_status
+            ? {
+                  inspection_status:
+                      filters.inspection_status,
+              }
+            : {}),
+
+        ...(filters?.dlpd_repeat
+            ? {
+                  dlpd_repeat:
+                      filters.dlpd_repeat,
+              }
+            : {}),
+
+        /*
+         * KENDALA
+         *
+         * Dikirim sebagai parameter:
+         *
+         * kendala=<value>
+         *
+         * Prabayar:
+         * kendala=<nilai KETERANGAN>
+         *
+         * Pascabayar:
+         * kendala=KWH < 40 JAM
+         *
+         * atau:
+         * kendala=KWH NOL
+         */
+        ...(filters?.kendala
+            ? {
+                  kendala:
+                      filters.kendala,
+              }
+            : {}),
+
+        ...(filters?.search_idpel
+            ? {
+                  search_idpel:
+                      filters.search_idpel,
+              }
+            : {}),
+
+        ...(filters?.search_nama
+            ? {
+                  search_nama:
+                      filters.search_nama,
+              }
+            : {}),
+    };
+}
+
+
+/* ==========================================================
+ * DASHBOARD
+ * ========================================================== */
+
+
+export async function getDlpdDashboard(
+    customerType: CustomerType,
+    month?: string,
+    filters?: DlpdQueryFilters,
+): Promise<DlpdDashboard> {
+    const { data } =
+        await api.get<DlpdDashboard>(
+            "/dlpd/dashboard",
+            {
+                params:
+                    buildDlpdParams(
+                        customerType,
+                        month,
+                        filters,
+                    ),
+            },
+        );
+
+    return data;
+}
+
+
+/* ==========================================================
+ * DASHBOARD ULP
+ * ========================================================== */
+
+
+export async function getDlpdDashboardUlp(
+    customerType: CustomerType,
+    month?: string,
+    filters?: DlpdQueryFilters,
+): Promise<DlpdDashboardUlp[]> {
+    const { data } =
+        await api.get<
+            DlpdDashboardUlp[]
+        >(
+            "/dlpd/dashboard-ulp",
+            {
+                params:
+                    buildDlpdParams(
+                        customerType,
+                        month,
+                        filters,
+                    ),
+            },
+        );
+
+    return data;
+}
+
+
+/* ==========================================================
+ * FILTER OPTIONS
+ * ========================================================== */
+
+
+export async function getDlpdFilters(
+    customerType: CustomerType,
+    month?: string,
+): Promise<DlpdFilters> {
+    const { data } =
+        await api.get<DlpdFilters>(
+            "/dlpd/filters",
+            {
+                params: {
+                    customer_type:
+                        customerType,
+
+                    ...(month
+                        ? {
+                              month,
+                          }
+                        : {}),
+                },
+            },
+        );
+
+    return data;
+}
+
+
+/* ==========================================================
+ * MONTH
+ * ========================================================== */
+
+
+export async function getDlpdMonths(
+    customerType: CustomerType,
+): Promise<MonthOption[]> {
+    const { data } =
+        await api.get<
+            MonthOption[]
+        >(
+            "/dlpd/months",
+            {
+                params: {
+                    customer_type:
+                        customerType,
+                },
+            },
+        );
+
+    return data;
+}
+
+
+/* ==========================================================
+ * CUSTOMER
+ * ========================================================== */
+
+
+export async function getDlpdCustomers(
+    params: Record<
+        string,
+        unknown
+    >,
+): Promise<DlpdCustomerList> {
+    const { data } =
+        await api.get<DlpdCustomerList>(
+            "/dlpd/customers",
+            {
+                params,
+            },
+        );
+
+    return data;
+}
+
+
+/* ==========================================================
+ * DETAIL
+ * ========================================================== */
+
+
+export async function getDlpdCustomerDetail(
+    idpel: string,
+    customerType: CustomerType,
+    month?: string,
+): Promise<DlpdCustomerDetail> {
+    const { data } =
+        await api.get<
+            DlpdCustomerDetail
+        >(
+            `/dlpd/customers/${idpel}`,
+            {
+                params: {
+                    customer_type:
+                        customerType,
+
+                    ...(month
+                        ? {
+                              month,
+                          }
+                        : {}),
+                },
+            },
+        );
+
+    return data;
+}
+
+
+/* ==========================================================
+ * EXPORT
+ * ========================================================== */
+
+
+export async function exportDlpd(
+    format:
+        | "csv"
+        | "xlsx",
+    params: Record<
+        string,
+        unknown
+    >,
+) {
+    const response =
+        await api.get(
+            `/dlpd/customers/export/${format}`,
+            {
+                params,
+
+                responseType:
+                    "blob",
+            },
+        );
+
+    return response.data;
+}
+/* ==========================================================
+ * MAP POINTS
+ * ========================================================== */
+
+export async function getDlpdMapPoints(
+    customerType: CustomerType,
+    month?: string,
+    filters?: DlpdQueryFilters,
+    limit: number = 100_000,
+): Promise<DlpdMapPointsResponse> {
+
+    const { data } =
+        await api.get<DlpdMapPointsResponse>(
+            "/dlpd/map",
+            {
+                params: {
+                    ...buildDlpdParams(
+                        customerType,
+                        month,
+                        filters,
+                    ),
+                    limit,
+                },
+            },
+        );
+
+    return data;
+}
+
+============================================================
+FILE: .\src\pages\DlpdPage.tsx
+============================================================
+import "./DlpdPage.css";
+
+import {
+    useEffect,
+    useMemo,
+    useState,
+} from "react";
+
+import {
+    getDlpdDashboard,
+    getDlpdFilters,
+    getDlpdMapPoints,
+    getDlpdMonths,
+} from "../api/dlpd";
+
+import type {
+    CustomerType,
+    DlpdDashboard,
+    DlpdFilters,
+    DlpdMapPoint,
+    MonthOption,
+} from "../api/dlpd";
+
+import DlpdUnitTable from "../components/dlpd/DlpdUnitTable";
+import DlpdDetail from "../components/dlpd/DlpdDetail";
+import DlpdCustomerTable from "../components/dlpd/DlpdCustomerTable";
+import DlpdMap from "../components/dlpd/DlpdMap";
+
+
+/* ==========================================================
+ * DEFAULT DATA
+ * ========================================================== */
+
+const EMPTY_DASHBOARD: DlpdDashboard = {
+    total_target: 0,
+    normal: 0,
+    temuan: 0,
+    belum_periksa: 0,
+    sudah_periksa: 0,
+    progress_pct: 0,
+};
+
+
+const EMPTY_FILTERS: DlpdFilters = {
+    months: [],
+    unitupi: [],
+    unitap: [],
+    unitup: [],
+    tariff: [],
+    status: [],
+    inspection_status: [],
+    dlpd_repeat: [],
+    kendala: [],
+};
+
+
+/* ==========================================================
+ * HELPERS
+ * ========================================================== */
+
+function isValidMonthKey(
+    value: unknown,
+): value is string {
+    if (
+        typeof value !== "string"
+    ) {
+        return false;
+    }
+
+    return /^\d{6}$/.test(
+        value,
+    );
+}
+
+
+function normalizeMonths(
+    result:
+        | MonthOption[]
+        | undefined
+        | null,
+): MonthOption[] {
+    if (
+        !Array.isArray(result)
+    ) {
+        return [];
+    }
+
+    const unique =
+        new Map<
+            string,
+            MonthOption
+        >();
+
+    for (
+        const item of result
+    ) {
+        if (
+            !item ||
+            !isValidMonthKey(
+                item.month_key,
+            )
+        ) {
+            continue;
+        }
+
+        unique.set(
+            item.month_key,
+            {
+                month_key:
+                    item.month_key,
+                label:
+                    item.label ||
+                    item.month_key,
+            },
+        );
+    }
+
+    return Array.from(
+        unique.values(),
+    ).sort(
+        (a, b) =>
+            a.month_key.localeCompare(
+                b.month_key,
+            ),
+    );
+}
+
+
+function normalizeOptions(
+    values:
+        | string[]
+        | undefined
+        | null,
+): string[] {
+    if (
+        !Array.isArray(values)
+    ) {
+        return [];
+    }
+
+    return Array.from(
+        new Set(
+            values
+                .filter(
+                    (
+                        value,
+                    ) =>
+                        typeof value ===
+                            "string" &&
+                        value.trim() !== "",
+                )
+                .map(
+                    (
+                        value,
+                    ) =>
+                        value.trim(),
+                ),
+        ),
+    );
+}
+
+
+/* ==========================================================
+ * MAP DATA
+ * ========================================================== */
+
+interface DlpdMapStats {
+    total: number;
+    location_matched: number;
+    mapped: number;
+    unmapped: number;
+}
+
+
+const EMPTY_MAP_STATS: DlpdMapStats = {
+    total: 0,
+    location_matched: 0,
+    mapped: 0,
+    unmapped: 0,
+};
+
+
+/* ==========================================================
+ * PAGE
+ * ========================================================== */
+
+export default function DlpdPage() {
+
+    /* ======================================================
+     * CUSTOMER TYPE
+     * ====================================================== */
+
+    const [
+        customerType,
+        setCustomerType,
+    ] = useState<CustomerType>(
+        "prabayar",
+    );
+
+
+    /* ======================================================
+     * MONTH
+     * ====================================================== */
+
+    const [
+        monthCache,
+        setMonthCache,
+    ] = useState<
+        Record<
+            CustomerType,
+            MonthOption[]
+        >
+    >({
+        prabayar: [],
+        pascabayar: [],
+    });
+
+
+    const [
+        month,
+        setMonth,
+    ] = useState<
+        string | undefined
+    >(undefined);
+
+
+    const [
+        monthLoading,
+        setMonthLoading,
+    ] = useState(true);
+
+
+    /* ======================================================
+     * FILTER OPTIONS
+     * ====================================================== */
+
+    const [
+        filters,
+        setFilters,
+    ] = useState<DlpdFilters>(
+        EMPTY_FILTERS,
+    );
+
+
+    /* ======================================================
+     * SELECTED FILTERS
+     * ====================================================== */
+
+    const [
+        selectedUnit,
+        setSelectedUnit,
+    ] = useState<
+        string | undefined
+    >(undefined);
+
+
+    const [
+        selectedStatus,
+        setSelectedStatus,
+    ] = useState<
+        string | undefined
+    >(undefined);
+
+
+    const [
+        selectedInspectionStatus,
+        setSelectedInspectionStatus,
+    ] = useState<
+        string | undefined
+    >(undefined);
+
+
+    const [
+        selectedKendala,
+        setSelectedKendala,
+    ] = useState<
+        string | undefined
+    >(undefined);
+
+
+    /* ======================================================
+     * CUSTOMER DETAIL
+     * ====================================================== */
+
+    const [
+        selectedIdpel,
+        setSelectedIdpel,
+    ] = useState<
+        string | undefined
+    >(undefined);
+
+
+    /* ======================================================
+     * DASHBOARD
+     * ====================================================== */
+
+    const [
+        dashboard,
+        setDashboard,
+    ] = useState<DlpdDashboard>(
+        EMPTY_DASHBOARD,
+    );
+
+
+    const [
+        loading,
+        setLoading,
+    ] = useState(true);
+
+
+    const [
+        filterLoading,
+        setFilterLoading,
+    ] = useState(false);
+
+
+    /* ======================================================
+     * MAP
+     * ====================================================== */
+
+    const [
+        mapPoints,
+        setMapPoints,
+    ] = useState<DlpdMapPoint[]>(
+        [],
+    );
+
+
+    const [
+        mapStats,
+        setMapStats,
+    ] = useState<DlpdMapStats>(
+        EMPTY_MAP_STATS,
+    );
+
+
+    const [
+        mapLoading,
+        setMapLoading,
+    ] = useState(false);
+
+
+    const [
+        mapError,
+        setMapError,
+    ] = useState<string | undefined>(
+        undefined,
+    );
+
+
+    /* ======================================================
+     * CURRENT MONTHS
+     * ====================================================== */
+
+    const currentMonths =
+        useMemo(
+            () =>
+                monthCache[
+                    customerType
+                ] ?? [],
+            [
+                monthCache,
+                customerType,
+            ],
+        );
+
+
+    /* ======================================================
+     * CURRENT KENDALA OPTIONS
+     * ====================================================== */
+
+    const currentKendalaOptions =
+        useMemo(() => {
+
+            return normalizeOptions(
+                filters.kendala,
+            ).map(
+                (
+                    value,
+                ) => ({
+                    value,
+                    label: value,
+                }),
+            );
+
+        }, [
+            filters.kendala,
+        ]);
+
+
+    /* ======================================================
+     * LOAD MONTHS
+     * ====================================================== */
+
+    useEffect(() => {
+
+        let cancelled = false;
+
+        const loadMonths =
+            async () => {
+
+                const cached =
+                    monthCache[
+                        customerType
+                    ] ?? [];
+
+
+                if (
+                    cached.length > 0
+                ) {
+
+                    const validCached =
+                        normalizeMonths(
+                            cached,
+                        );
+
+
+                    if (
+                        validCached.length >
+                        0
+                    ) {
+
+                        if (
+                            !cancelled
+                        ) {
+
+                            const currentStillExists =
+                                validCached.some(
+                                    (
+                                        item,
+                                    ) =>
+                                        item.month_key ===
+                                        month,
+                                );
+
+
+                            if (
+                                !currentStillExists
+                            ) {
+
+                                setMonth(
+                                    validCached[
+                                        validCached.length -
+                                            1
+                                    ].month_key,
+                                );
+                            }
+
+
+                            setMonthLoading(
+                                false,
+                            );
+                        }
+
+
+                        return;
+                    }
+                }
+
+
+                try {
+
+                    setMonthLoading(
+                        true,
+                    );
+
+
+                    const result =
+                        await getDlpdMonths(
+                            customerType,
+                        );
+
+
+                    if (
+                        cancelled
+                    ) {
+                        return;
+                    }
+
+
+                    const normalized =
+                        normalizeMonths(
+                            result,
+                        );
+
+
+                    setMonthCache(
+                        (
+                            previous,
+                        ) => ({
+                            ...previous,
+
+                            [customerType]:
+                                normalized,
+                        }),
+                    );
+
+
+                    if (
+                        normalized.length >
+                        0
+                    ) {
+
+                        setMonth(
+                            normalized[
+                                normalized.length -
+                                    1
+                            ].month_key,
+                        );
+
+                    } else {
+
+                        setMonth(
+                            undefined,
+                        );
+                    }
+
+                } catch (err) {
+
+                    console.error(
+                        "Failed to load DLPD months:",
+                        err,
+                    );
+
+
+                    if (
+                        !cancelled
+                    ) {
+
+                        setMonth(
+                            undefined,
+                        );
+                    }
+
+                } finally {
+
+                    if (
+                        !cancelled
+                    ) {
+
+                        setMonthLoading(
+                            false,
+                        );
+                    }
+                }
+            };
+
+
+        loadMonths();
+
+
+        return () => {
+            cancelled = true;
+        };
+
+    }, [
+        customerType,
+    ]);
+
+
+    /* ======================================================
+     * VALID MONTH
+     * ====================================================== */
+
+    const validMonth =
+        isValidMonthKey(month)
+            ? month
+            : undefined;
+
+
+    /* ======================================================
+     * LOAD FILTER OPTIONS
+     * ====================================================== */
+
+    useEffect(() => {
+
+        if (
+            !validMonth
+        ) {
+
+            setFilters(
+                EMPTY_FILTERS,
+            );
+
+            setFilterLoading(
+                false,
+            );
+
+            return;
+        }
+
+
+        let cancelled = false;
+
+
+        const loadFilters =
+            async () => {
+
+                try {
+
+                    setFilterLoading(
+                        true,
+                    );
+
+
+                    const result =
+                        await getDlpdFilters(
+                            customerType,
+                            validMonth,
+                        );
+
+
+                    if (
+                        cancelled
+                    ) {
+                        return;
+                    }
+
+
+                    setFilters({
+
+                        months:
+                            normalizeOptions(
+                                result?.months,
+                            ),
+
+                        unitupi:
+                            normalizeOptions(
+                                result?.unitupi,
+                            ),
+
+                        unitap:
+                            normalizeOptions(
+                                result?.unitap,
+                            ),
+
+                        unitup:
+                            normalizeOptions(
+                                result?.unitup,
+                            ),
+
+                        tariff:
+                            normalizeOptions(
+                                result?.tariff,
+                            ),
+
+                        status:
+                            normalizeOptions(
+                                result?.status,
+                            ),
+
+                        inspection_status:
+                            normalizeOptions(
+                                result?.inspection_status,
+                            ),
+
+                        dlpd_repeat:
+                            normalizeOptions(
+                                result?.dlpd_repeat,
+                            ),
+
+                        kendala:
+                            normalizeOptions(
+                                result?.kendala,
+                            ),
+                    });
+
+                } catch (err) {
+
+                    console.error(
+                        "Failed to load DLPD filters:",
+                        err,
+                    );
+
+
+                    if (
+                        !cancelled
+                    ) {
+
+                        setFilters(
+                            EMPTY_FILTERS,
+                        );
+                    }
+
+                } finally {
+
+                    if (
+                        !cancelled
+                    ) {
+
+                        setFilterLoading(
+                            false,
+                        );
+                    }
+                }
+            };
+
+
+        loadFilters();
+
+
+        return () => {
+            cancelled = true;
+        };
+
+    }, [
+        customerType,
+        validMonth,
+    ]);
+
+
+    /* ======================================================
+     * RESET INVALID UNIT
+     * ====================================================== */
+
+    useEffect(() => {
+
+        if (
+            !selectedUnit
+        ) {
+            return;
+        }
+
+
+        if (
+            !filters.unitup.includes(
+                selectedUnit,
+            )
+        ) {
+
+            setSelectedUnit(
+                undefined,
+            );
+        }
+
+    }, [
+        filters.unitup,
+        selectedUnit,
+    ]);
+
+
+    /* ======================================================
+     * RESET INVALID STATUS
+     * ====================================================== */
+
+    useEffect(() => {
+
+        if (
+            !selectedStatus
+        ) {
+            return;
+        }
+
+
+        if (
+            !filters.status.includes(
+                selectedStatus,
+            )
+        ) {
+
+            setSelectedStatus(
+                undefined,
+            );
+        }
+
+    }, [
+        filters.status,
+        selectedStatus,
+    ]);
+
+
+    /* ======================================================
+     * RESET INVALID INSPECTION STATUS
+     * ====================================================== */
+
+    useEffect(() => {
+
+        if (
+            !selectedInspectionStatus
+        ) {
+            return;
+        }
+
+
+        if (
+            !filters.inspection_status.includes(
+                selectedInspectionStatus,
+            )
+        ) {
+
+            setSelectedInspectionStatus(
+                undefined,
+            );
+        }
+
+    }, [
+        filters.inspection_status,
+        selectedInspectionStatus,
+    ]);
+
+
+    /* ======================================================
+     * RESET INVALID KENDALA
+     * ====================================================== */
+
+    useEffect(() => {
+
+        if (
+            !selectedKendala
+        ) {
+            return;
+        }
+
+
+        if (
+            !filters.kendala.includes(
+                selectedKendala,
+            )
+        ) {
+
+            setSelectedKendala(
+                undefined,
+            );
+        }
+
+    }, [
+        filters.kendala,
+        selectedKendala,
+    ]);
+
+
+    /* ======================================================
+     * LOAD DASHBOARD KPI
+     * ====================================================== */
+
+    useEffect(() => {
+
+        if (
+            !validMonth
+        ) {
+
+            setDashboard(
+                EMPTY_DASHBOARD,
+            );
+
+            setLoading(
+                false,
+            );
+
+            return;
+        }
+
+
+        let cancelled = false;
+
+
+        const loadDashboard =
+            async () => {
+
+                try {
+
+                    setLoading(
+                        true,
+                    );
+
+
+                    const result =
+                        await getDlpdDashboard(
+                            customerType,
+                            validMonth,
+                            {
+                                unitup:
+                                    selectedUnit,
+
+                                status:
+                                    selectedStatus,
+
+                                inspection_status:
+                                    selectedInspectionStatus,
+
+                                kendala:
+                                    selectedKendala,
+                            },
+                        );
+
+
+                    if (
+                        !cancelled
+                    ) {
+
+                        setDashboard(
+                            result ??
+                                EMPTY_DASHBOARD,
+                        );
+                    }
+
+                } catch (err) {
+
+                    console.error(
+                        "Failed to load DLPD dashboard:",
+                        err,
+                    );
+
+
+                    if (
+                        !cancelled
+                    ) {
+
+                        setDashboard(
+                            EMPTY_DASHBOARD,
+                        );
+                    }
+
+                } finally {
+
+                    if (
+                        !cancelled
+                    ) {
+
+                        setLoading(
+                            false,
+                        );
+                    }
+                }
+            };
+
+
+        loadDashboard();
+
+
+        return () => {
+            cancelled = true;
+        };
+
+    }, [
+        customerType,
+        validMonth,
+        selectedUnit,
+        selectedStatus,
+        selectedInspectionStatus,
+        selectedKendala,
+    ]);
+
+
+    /* ======================================================
+     * LOAD MAP
+     * ====================================================== */
+
+    useEffect(() => {
+
+        if (
+            !validMonth
+        ) {
+
+            setMapPoints(
+                [],
+            );
+
+            setMapStats(
+                EMPTY_MAP_STATS,
+            );
+
+            setMapError(
+                undefined,
+            );
+
+            setMapLoading(
+                false,
+            );
+
+            return;
+        }
+
+
+        let cancelled = false;
+
+
+        const loadMap =
+            async () => {
+
+                try {
+
+                    setMapLoading(
+                        true,
+                    );
+
+                    setMapError(
+                        undefined,
+                    );
+
+
+                    const result =
+                        await getDlpdMapPoints(
+                            customerType,
+                            validMonth,
+                            {
+                                unitup:
+                                    selectedUnit,
+
+                                status:
+                                    selectedStatus,
+
+                                inspection_status:
+                                    selectedInspectionStatus,
+
+                                kendala:
+                                    selectedKendala,
+                            },
+                            100_000,
+                        );
+
+
+                    if (
+                        cancelled
+                    ) {
+                        return;
+                    }
+
+
+                    const validPoints =
+                        Array.isArray(
+                            result?.points,
+                        )
+                            ? result.points.filter(
+                                (
+                                    point,
+                                ) =>
+                                    Number.isFinite(
+                                        Number(
+                                            point.latitude,
+                                        ),
+                                    ) &&
+                                    Number.isFinite(
+                                        Number(
+                                            point.longitude,
+                                        ),
+                                    ),
+                            )
+                            : [];
+
+
+                    setMapPoints(
+                        validPoints,
+                    );
+
+
+                    setMapStats({
+                        total:
+                            Number(
+                                result?.total ??
+                                    0,
+                            ),
+
+                        location_matched:
+                            Number(
+                                result?.location_matched ??
+                                    0,
+                            ),
+
+                        mapped:
+                            Number(
+                                result?.mapped ??
+                                    0,
+                            ),
+
+                        unmapped:
+                            Number(
+                                result?.unmapped ??
+                                    0,
+                            ),
+                    });
+
+                } catch (err) {
+
+                    console.error(
+                        "Failed to load DLPD map:",
+                        err,
+                    );
+
+
+                    if (
+                        !cancelled
+                    ) {
+
+                        setMapPoints(
+                            [],
+                        );
+
+                        setMapStats(
+                            EMPTY_MAP_STATS,
+                        );
+
+                        setMapError(
+                            "Gagal memuat data peta.",
+                        );
+                    }
+
+                } finally {
+
+                    if (
+                        !cancelled
+                    ) {
+
+                        setMapLoading(
+                            false,
+                        );
+                    }
+                }
+            };
+
+
+        loadMap();
+
+
+        return () => {
+            cancelled = true;
+        };
+
+    }, [
+        customerType,
+        validMonth,
+        selectedUnit,
+        selectedStatus,
+        selectedInspectionStatus,
+        selectedKendala,
+    ]);
+
+
+    /* ======================================================
+     * CUSTOMER TYPE CHANGE
+     * ====================================================== */
+
+    const handleCustomerTypeChange =
+        (
+            type: CustomerType,
+        ) => {
+
+            if (
+                type ===
+                customerType
+            ) {
+                return;
+            }
+
+
+            setSelectedUnit(
+                undefined,
+            );
+
+            setSelectedStatus(
+                undefined,
+            );
+
+            setSelectedInspectionStatus(
+                undefined,
+            );
+
+            setSelectedKendala(
+                undefined,
+            );
+
+            setSelectedIdpel(
+                undefined,
+            );
+
+            setMapPoints(
+                [],
+            );
+
+            setMapStats(
+                EMPTY_MAP_STATS,
+            );
+
+            setMapError(
+                undefined,
+            );
+
+            setFilters(
+                EMPTY_FILTERS,
+            );
+
+            setDashboard(
+                EMPTY_DASHBOARD,
+            );
+
+            setMonth(
+                undefined,
+            );
+
+            setMonthLoading(
+                true,
+            );
+
+            setCustomerType(
+                type,
+            );
+        };
+
+
+    /* ======================================================
+     * MONTH CHANGE
+     * ====================================================== */
+
+    const handleMonthChange =
+        (
+            value: string,
+        ) => {
+
+            if (
+                !isValidMonthKey(
+                    value,
+                )
+            ) {
+                return;
+            }
+
+
+            const exists =
+                currentMonths.some(
+                    (
+                        item,
+                    ) =>
+                        item.month_key ===
+                        value,
+                );
+
+
+            if (
+                !exists
+            ) {
+                return;
+            }
+
+
+            if (
+                value === month
+            ) {
+                return;
+            }
+
+
+            setSelectedUnit(
+                undefined,
+            );
+
+            setSelectedStatus(
+                undefined,
+            );
+
+            setSelectedInspectionStatus(
+                undefined,
+            );
+
+            setSelectedKendala(
+                undefined,
+            );
+
+            setSelectedIdpel(
+                undefined,
+            );
+
+            setMapPoints(
+                [],
+            );
+
+            setMapStats(
+                EMPTY_MAP_STATS,
+            );
+
+            setMapError(
+                undefined,
+            );
+
+            setDashboard(
+                EMPTY_DASHBOARD,
+            );
+
+            setMonth(
+                value,
+            );
+        };
+
+
+    /* ======================================================
+     * UNIT CHANGE
+     * ====================================================== */
+
+    const handleUnitChange =
+        (
+            value: string,
+        ) => {
+
+            setSelectedUnit(
+                value ||
+                    undefined,
+            );
+
+            setSelectedIdpel(
+                undefined,
+            );
+        };
+
+
+    /* ======================================================
+     * STATUS CHANGE
+     * ====================================================== */
+
+    const handleStatusChange =
+        (
+            value: string,
+        ) => {
+
+            setSelectedStatus(
+                value ||
+                    undefined,
+            );
+
+            setSelectedIdpel(
+                undefined,
+            );
+        };
+
+
+    /* ======================================================
+     * INSPECTION STATUS CHANGE
+     * ====================================================== */
+
+    const handleInspectionStatusChange =
+        (
+            value: string,
+        ) => {
+
+            setSelectedInspectionStatus(
+                value ||
+                    undefined,
+            );
+
+            setSelectedIdpel(
+                undefined,
+            );
+        };
+
+
+    /* ======================================================
+     * KENDALA CHANGE
+     * ====================================================== */
+
+    const handleKendalaChange =
+        (
+            value: string,
+        ) => {
+
+            setSelectedKendala(
+                value ||
+                    undefined,
+            );
+
+            setSelectedIdpel(
+                undefined,
+            );
+        };
+
+
+    /* ======================================================
+     * RENDER
+     * ====================================================== */
+
+    return (
+        <div className="dlpd-page">
+
+            {/* ==================================================
+             * HEADER
+             * ================================================== */}
+
+            <div className="page-header">
+
+                <div>
+
+                    <h1>
+                        DLPD Monitoring
+                    </h1>
+
+                    <p>
+                        Monitoring pelanggan
+                        DLPD Prabayar &
+                        Pascabayar
+                    </p>
+
+                </div>
+
+            </div>
+
+
+            {/* ==================================================
+             * CUSTOMER TYPE + MONTH
+             * ================================================== */}
+
+            <div className="toolbar">
+
+                <div className="radio-group">
+
+                    <label>
+
+                        <input
+                            type="radio"
+                            name="customer-type"
+                            checked={
+                                customerType ===
+                                "prabayar"
+                            }
+                            onChange={() =>
+                                handleCustomerTypeChange(
+                                    "prabayar",
+                                )
+                            }
+                        />
+
+                        Prabayar
+
+                    </label>
+
+
+                    <label>
+
+                        <input
+                            type="radio"
+                            name="customer-type"
+                            checked={
+                                customerType ===
+                                "pascabayar"
+                            }
+                            onChange={() =>
+                                handleCustomerTypeChange(
+                                    "pascabayar",
+                                )
+                            }
+                        />
+
+                        Pascabayar
+
+                    </label>
+
+                </div>
+
+
+                <select
+                    className="month-select"
+                    value={
+                        validMonth ??
+                        ""
+                    }
+                    disabled={
+                        monthLoading
+                    }
+                    onChange={(e) =>
+                        handleMonthChange(
+                            e.target.value,
+                        )
+                    }
+                >
+
+                    {monthLoading && (
+                        <option value="">
+                            Memuat bulan...
+                        </option>
+                    )}
+
+
+                    {!monthLoading &&
+                        currentMonths.length ===
+                            0 && (
+                            <option value="">
+                                Tidak ada bulan
+                            </option>
+                        )}
+
+
+                    {!monthLoading &&
+                        currentMonths.map(
+                            (
+                                item,
+                            ) => (
+                                <option
+                                    key={
+                                        item.month_key
+                                    }
+                                    value={
+                                        item.month_key
+                                    }
+                                >
+                                    {
+                                        item.label
+                                    }
+                                </option>
+                            ),
+                        )}
+
+                </select>
+
+            </div>
+
+
+            {/* ==================================================
+             * KPI
+             * ================================================== */}
+
+            <div className="kpi-grid">
+
+                <div className="kpi-card">
+
+                    <span>
+                        Total Target
+                    </span>
+
+                    <h2>
+                        {loading
+                            ? "-"
+                            : dashboard.total_target.toLocaleString()}
+                    </h2>
+
+                </div>
+
+
+                <div className="kpi-card">
+
+                    <span>
+                        Normal
+                    </span>
+
+                    <h2>
+                        {loading
+                            ? "-"
+                            : dashboard.normal.toLocaleString()}
+                    </h2>
+
+                </div>
+
+
+                <div className="kpi-card">
+
+                    <span>
+                        Temuan
+                    </span>
+
+                    <h2>
+                        {loading
+                            ? "-"
+                            : dashboard.temuan.toLocaleString()}
+                    </h2>
+
+                </div>
+
+
+                <div className="kpi-card">
+
+                    <span>
+                        Belum Periksa
+                    </span>
+
+                    <h2>
+                        {loading
+                            ? "-"
+                            : dashboard.belum_periksa.toLocaleString()}
+                    </h2>
+
+                </div>
+
+            </div>
+
+
+            {/* ==================================================
+             * FILTER
+             * ================================================== */}
+
+            <div className="filter-bar">
+
+                <select
+                    value={
+                        selectedUnit ??
+                        ""
+                    }
+                    disabled={
+                        filterLoading ||
+                        !validMonth
+                    }
+                    onChange={(e) =>
+                        handleUnitChange(
+                            e.target.value,
+                        )
+                    }
+                >
+
+                    <option value="">
+                        Semua Unit
+                    </option>
+
+                    {filters.unitup.map(
+                        (
+                            unit,
+                        ) => (
+                            <option
+                                key={unit}
+                                value={unit}
+                            >
+                                {unit}
+                            </option>
+                        ),
+                    )}
+
+                </select>
+
+
+                <select
+                    value={
+                        selectedStatus ??
+                        ""
+                    }
+                    disabled={
+                        filterLoading ||
+                        !validMonth
+                    }
+                    onChange={(e) =>
+                        handleStatusChange(
+                            e.target.value,
+                        )
+                    }
+                >
+
+                    <option value="">
+                        Semua Status
+                    </option>
+
+                    {filters.status.map(
+                        (
+                            status,
+                        ) => (
+                            <option
+                                key={status}
+                                value={status}
+                            >
+                                {status}
+                            </option>
+                        ),
+                    )}
+
+                </select>
+
+
+                <select
+                    value={
+                        selectedInspectionStatus ??
+                        ""
+                    }
+                    disabled={
+                        filterLoading ||
+                        !validMonth
+                    }
+                    onChange={(e) =>
+                        handleInspectionStatusChange(
+                            e.target.value,
+                        )
+                    }
+                >
+
+                    <option value="">
+                        Semua Status Pemeriksaan
+                    </option>
+
+                    {filters.inspection_status.map(
+                        (
+                            inspectionStatus,
+                        ) => (
+                            <option
+                                key={
+                                    inspectionStatus
+                                }
+                                value={
+                                    inspectionStatus
+                                }
+                            >
+                                {
+                                    inspectionStatus
+                                }
+                            </option>
+                        ),
+                    )}
+
+                </select>
+
+
+                <select
+                    value={
+                        selectedKendala ??
+                        ""
+                    }
+                    disabled={
+                        filterLoading ||
+                        !validMonth
+                    }
+                    onChange={(e) =>
+                        handleKendalaChange(
+                            e.target.value,
+                        )
+                    }
+                >
+
+                    <option value="">
+                        Semua Kendala
+                    </option>
+
+                    {currentKendalaOptions.map(
+                        (
+                            option,
+                        ) => (
+                            <option
+                                key={
+                                    option.value
+                                }
+                                value={
+                                    option.value
+                                }
+                            >
+                                {
+                                    option.label
+                                }
+                            </option>
+                        ),
+                    )}
+
+                </select>
+
+            </div>
+
+
+            {/* ==================================================
+             * MAP
+             * ================================================== */}
+
+            <section className="panel">
+
+                <div className="panel-header">
+                    Peta Lokasi Pelanggan
+                </div>
+
+                <div
+                    className="panel-body"
+                    style={{
+                        padding: 0,
+                    }}
+                >
+
+                    <div
+                        style={{
+                            display: "grid",
+                            gridTemplateColumns:
+                                "repeat(4, minmax(0, 1fr))",
+                            gap: 12,
+                            padding: "16px 20px",
+                            borderBottom:
+                                "1px solid #334155",
+                        }}
+                    >
+
+                        <div>
+                            <span
+                                style={{
+                                    display: "block",
+                                    fontSize: 12,
+                                    color: "#94a3b8",
+                                }}
+                            >
+                                Total
+                            </span>
+
+                            <strong
+                                style={{
+                                    fontSize: 20,
+                                    color: "#f8fafc",
+                                }}
+                            >
+                                {mapLoading
+                                    ? "-"
+                                    : mapStats.total.toLocaleString()}
+                            </strong>
+                        </div>
+
+
+                        <div>
+                            <span
+                                style={{
+                                    display: "block",
+                                    fontSize: 12,
+                                    color: "#94a3b8",
+                                }}
+                            >
+                                Location Matched
+                            </span>
+
+                            <strong
+                                style={{
+                                    fontSize: 20,
+                                    color: "#f8fafc",
+                                }}
+                            >
+                                {mapLoading
+                                    ? "-"
+                                    : mapStats.location_matched.toLocaleString()}
+                            </strong>
+                        </div>
+
+
+                        <div>
+                            <span
+                                style={{
+                                    display: "block",
+                                    fontSize: 12,
+                                    color: "#94a3b8",
+                                }}
+                            >
+                                Mapped
+                            </span>
+
+                            <strong
+                                style={{
+                                    fontSize: 20,
+                                    color: "#22c55e",
+                                }}
+                            >
+                                {mapLoading
+                                    ? "-"
+                                    : mapStats.mapped.toLocaleString()}
+                            </strong>
+                        </div>
+
+
+                        <div>
+                            <span
+                                style={{
+                                    display: "block",
+                                    fontSize: 12,
+                                    color: "#94a3b8",
+                                }}
+                            >
+                                Unmapped
+                            </span>
+
+                            <strong
+                                style={{
+                                    fontSize: 20,
+                                    color: "#f97316",
+                                }}
+                            >
+                                {mapLoading
+                                    ? "-"
+                                    : mapStats.unmapped.toLocaleString()}
+                            </strong>
+                        </div>
+
+                    </div>
+
+
+                    {mapError ? (
+
+                        <div
+                            style={{
+                                padding: 40,
+                                textAlign: "center",
+                                color: "#f87171",
+                            }}
+                        >
+                            {mapError}
+                        </div>
+
+                    ) : mapLoading ? (
+
+                        <div
+                            style={{
+                                padding: 40,
+                                textAlign: "center",
+                                color: "#94a3b8",
+                            }}
+                        >
+                            Memuat peta...
+                        </div>
+
+                    ) : mapPoints.length === 0 ? (
+
+                        <div
+                            style={{
+                                padding: 40,
+                                textAlign: "center",
+                                color: "#94a3b8",
+                            }}
+                        >
+                            Tidak ada pelanggan dengan
+                            koordinat yang dapat
+                            ditampilkan pada peta.
+                        </div>
+
+                    ) : (
+
+                        <DlpdMap
+                            points={
+                                mapPoints
+                            }
+                            height={520}
+                        />
+
+                    )}
+
+                </div>
+
+            </section>
+
+
+            {/* ==================================================
+             * DASHBOARD + DETAIL
+             * ================================================== */}
+
+            <div className="content-grid">
+
+                <section className="panel">
+
+                    <div className="panel-header">
+                        Dashboard ULP
+                    </div>
+
+                    <div className="panel-body">
+
+                        <DlpdUnitTable
+                            customerType={
+                                customerType
+                            }
+                            month={
+                                validMonth
+                            }
+                            filters={{
+                                unitup:
+                                    selectedUnit,
+
+                                status:
+                                    selectedStatus,
+
+                                inspection_status:
+                                    selectedInspectionStatus,
+
+                                kendala:
+                                    selectedKendala,
+                            }}
+                            onSelect={
+                                handleUnitChange
+                            }
+                        />
+
+                    </div>
+
+                </section>
+
+
+                <section className="panel">
+
+                    <div className="panel-header">
+                        Detail Pelanggan
+                    </div>
+
+                    <div className="panel-body">
+
+                        <DlpdDetail
+                            idpel={
+                                selectedIdpel
+                            }
+                            customerType={
+                                customerType
+                            }
+                            month={
+                                validMonth
+                            }
+                        />
+
+                    </div>
+
+                </section>
+
+            </div>
+
+
+            {/* ==================================================
+             * CUSTOMER
+             * ================================================== */}
+
+            <section className="panel">
+
+                <div className="panel-header">
+                    Daftar Pelanggan
+                </div>
+
+                <div className="panel-body">
+
+                    <DlpdCustomerTable
+                        customerType={
+                            customerType
+                        }
+                        month={
+                            validMonth
+                        }
+                        unitup={
+                            selectedUnit
+                        }
+                        onSelect={
+                            setSelectedIdpel
+                        }
+                    />
+
+                </div>
+
+            </section>
+
+        </div>
+    );
+}
+
+============================================================
+FILE: .\src\components\dlpd\DlpdCustomerTable.tsx
+============================================================
+import "./DlpdCustomerTable.css";
+
+import {
+    useEffect,
+    useMemo,
+    useState,
+} from "react";
+
+import {
+    getDlpdCustomers,
+} from "../../api/dlpd";
+
+
+/* ==========================================================
+ * TYPES
+ * ========================================================== */
+
+type CustomerRow = {
+    idpel: string;
+
+    nama: string | null;
+
+    unitupi: string | null;
+
+    unitap: string | null;
+
+    unitup: string | null;
+
+    tariff:
+        | string
+        | number
+        | null;
+
+    daya:
+        | string
+        | number
+        | null;
+
+    alamat: string | null;
+
+    status: string | null;
+
+    dlpd_repeat:
+        | string
+        | number
+        | null;
+
+    kategori: string | null;
+
+    keterangan: string | null;
+
+    alasan: string | null;
+
+    catatan: string | null;
+
+    petugas: string | null;
+
+    regu: string | null;
+
+    waktu_periksa: string | null;
+};
+
+
+/* ==========================================================
+ * FILTERS
+ * ========================================================== */
+
+type CustomerFilters = {
+
+    /*
+     * UNIT
+     */
+    unitup?: string;
+
+    /*
+     * STATUS HASIL
+     *
+     * NORMAL
+     * TEMUAN
+     */
+    status?: string;
+
+    /*
+     * STATUS PEMERIKSAAN
+     *
+     * SUDAH PERIKSA
+     * BELUM PERIKSA
+     */
+    inspection_status?: string;
+
+    /*
+     * KENDALA
+     */
+    kendala?: string;
+};
+
+
+/* ==========================================================
+ * API RESPONSE
+ * ========================================================== */
+
+type CustomerPage = {
+    items: CustomerRow[];
+
+    total_rows: number;
+
+    page: number;
+
+    page_size: number;
+
+    total_pages?: number;
+};
+
+
+/* ==========================================================
+ * PROPS
+ * ========================================================== */
+
+type Props = {
+    customerType:
+        | "prabayar"
+        | "pascabayar";
+
+    month?: string;
+
+    filters?: CustomerFilters;
+
+    /*
+     * Backward compatibility.
+     *
+     * Tetap diterima kalau parent masih
+     * mengirim unitup langsung.
+     */
+    unitup?: string;
+
+    onSelect: (
+        idpel: string,
+    ) => void;
+};
+
+
+/* ==========================================================
+ * CONSTANTS
+ * ========================================================== */
+
+const PAGE_SIZE = 100;
+
+
+/* ==========================================================
+ * HELPERS
+ * ========================================================== */
+
+function formatValue(
+    value: unknown,
+): string {
+
+    if (
+        value === null ||
+        value === undefined ||
+        String(value).trim() === ""
+    ) {
+        return "-";
+    }
+
+    return String(value);
+}
+
+
+function formatNumber(
+    value: unknown,
+): string {
+
+    if (
+        value === null ||
+        value === undefined ||
+        String(value).trim() === ""
+    ) {
+        return "-";
+    }
+
+
+    const numeric =
+        Number(value);
+
+
+    if (
+        !Number.isFinite(
+            numeric,
+        )
+    ) {
+        return String(value);
+    }
+
+
+    return numeric.toLocaleString(
+        "id-ID",
+    );
+}
+
+
+function statusClass(
+    status: string | null,
+): string {
+
+    const normalized =
+        String(
+            status ?? "",
+        )
+            .trim()
+            .toLowerCase();
+
+
+    if (
+        normalized === "normal"
+    ) {
+        return "status-badge status-normal";
+    }
+
+
+    if (
+        normalized === "temuan"
+    ) {
+        return "status-badge status-temuan";
+    }
+
+
+    return "status-badge status-belum";
+}
+
+
+/* ==========================================================
+ * COMPONENT
+ * ========================================================== */
+
+export default function DlpdCustomerTable({
+    customerType,
+    month,
+    filters,
+    unitup,
+    onSelect,
+}: Props) {
+
+    /* ======================================================
+     * EFFECTIVE FILTERS
+     * ====================================================== */
+
+    const effectiveFilters =
+        useMemo(
+            () => ({
+
+                /*
+                 * UNIT
+                 */
+                unitup:
+                    filters?.unitup ??
+                    unitup,
+
+                /*
+                 * STATUS HASIL
+                 */
+                status:
+                    filters?.status,
+
+                /*
+                 * STATUS PEMERIKSAAN
+                 */
+                inspection_status:
+                    filters?.inspection_status,
+
+                /*
+                 * KENDALA
+                 */
+                kendala:
+                    filters?.kendala,
+
+            }),
+            [
+                filters?.unitup,
+                filters?.status,
+                filters?.inspection_status,
+                filters?.kendala,
+                unitup,
+            ],
+        );
+
+
+    /* ======================================================
+     * STATE
+     * ====================================================== */
+
+    const [
+        rows,
+        setRows,
+    ] = useState<
+        CustomerRow[]
+    >([]);
+
+
+    const [
+        page,
+        setPage,
+    ] = useState(1);
+
+
+    const [
+        totalRows,
+        setTotalRows,
+    ] = useState(0);
+
+
+    const [
+        loading,
+        setLoading,
+    ] = useState(false);
+
+
+    const [
+        error,
+        setError,
+    ] = useState<
+        string | null
+    >(null);
+
+
+    /* ======================================================
+     * TOTAL PAGES
+     * ====================================================== */
+
+    const totalPages =
+        Math.max(
+            1,
+            Math.ceil(
+                totalRows /
+                    PAGE_SIZE,
+            ),
+        );
+
+
+    /* ======================================================
+     * RESET WHEN FILTER CHANGES
+     * ====================================================== */
+
+    useEffect(() => {
+
+        setPage(1);
+
+        setRows([]);
+
+        setTotalRows(0);
+
+        onSelect("");
+
+    }, [
+        customerType,
+        month,
+        effectiveFilters.unitup,
+        effectiveFilters.status,
+        effectiveFilters.inspection_status,
+        effectiveFilters.kendala,
+    ]);
+
+
+    /* ======================================================
+     * LOAD CUSTOMERS
+     * ====================================================== */
+
+    useEffect(() => {
+
+        if (!month) {
+
+            setRows([]);
+
+            setTotalRows(0);
+
+            setLoading(false);
+
+            setError(null);
+
+            return;
+        }
+
+
+        let cancelled =
+            false;
+
+
+        const load =
+            async () => {
+
+                try {
+
+                    setLoading(
+                        true,
+                    );
+
+                    setError(
+                        null,
+                    );
+
+
+                    const result =
+                        await getDlpdCustomers(
+                            {
+                                customerType,
+
+                                month,
+
+                                page,
+
+                                pageSize:
+                                    PAGE_SIZE,
+
+                                /*
+                                 * UNIT
+                                 */
+                                unitup:
+                                    effectiveFilters.unitup,
+
+                                /*
+                                 * STATUS HASIL
+                                 */
+                                status:
+                                    effectiveFilters.status,
+
+                                /*
+                                 * STATUS PEMERIKSAAN
+                                 */
+                                inspection_status:
+                                    effectiveFilters.inspection_status,
+
+                                /*
+                                 * KENDALA
+                                 */
+                                kendala:
+                                    effectiveFilters.kendala,
+                            },
+                        ) as CustomerPage;
+
+
+                    if (
+                        cancelled
+                    ) {
+                        return;
+                    }
+
+
+                    setRows(
+                        Array.isArray(
+                            result?.items,
+                        )
+                            ? result.items
+                            : [],
+                    );
+
+
+                    setTotalRows(
+                        Number(
+                            result?.total_rows ??
+                                0,
+                        ),
+                    );
+
+                } catch (
+                    err
+                ) {
+
+                    console.error(
+                        "Failed to load DLPD customers:",
+                        err,
+                    );
+
+
+                    if (
+                        !cancelled
+                    ) {
+
+                        setRows(
+                            [],
+                        );
+
+                        setTotalRows(
+                            0,
+                        );
+
+                        setError(
+                            "Gagal memuat daftar pelanggan.",
+                        );
+                    }
+
+                } finally {
+
+                    if (
+                        !cancelled
+                    ) {
+
+                        setLoading(
+                            false,
+                        );
+                    }
+                }
+            };
+
+
+        load();
+
+
+        return () => {
+            cancelled = true;
+        };
+
+    }, [
+        customerType,
+        month,
+        page,
+        effectiveFilters.unitup,
+        effectiveFilters.status,
+        effectiveFilters.inspection_status,
+        effectiveFilters.kendala,
+    ]);
+
+
+    /* ======================================================
+     * PAGINATION
+     * ====================================================== */
+
+    const goToPage = (
+        nextPage: number,
+    ) => {
+
+        if (
+            nextPage < 1 ||
+            nextPage > totalPages ||
+            nextPage === page
+        ) {
+            return;
+        }
+
+
+        onSelect("");
+
+        setPage(
+            nextPage,
+        );
+    };
+
+
+    const startRow =
+        totalRows === 0
+            ? 0
+            : (
+                  page - 1
+              ) *
+                  PAGE_SIZE +
+              1;
+
+
+    const endRow =
+        Math.min(
+            page *
+                PAGE_SIZE,
+            totalRows,
+        );
+
+
+    /* ======================================================
+     * RENDER
+     * ====================================================== */
+
+    return (
+        <div className="dlpd-customer-table">
+
+            {/* ==================================================
+             * TOOLBAR
+             * ================================================== */}
+
+            <div className="customer-table-toolbar">
+
+                <div className="customer-table-summary">
+
+                    {loading
+                        ? "Memuat pelanggan..."
+                        : `${startRow.toLocaleString(
+                              "id-ID",
+                          )}â€“${endRow.toLocaleString(
+                              "id-ID",
+                          )} dari ${totalRows.toLocaleString(
+                              "id-ID",
+                          )} pelanggan`}
+
+                </div>
+
+
+                {error && (
+
+                    <div className="customer-table-error">
+
+                        {error}
+
+                    </div>
+
+                )}
+
+            </div>
+
+
+            {/* ==================================================
+             * TABLE
+             * ================================================== */}
+
+            <div className="customer-table-scroll">
+
+                <table className="customer-table">
+
+                    <thead>
+
+                        <tr>
+
+                            <th>
+                                IDPEL
+                            </th>
+
+                            <th>
+                                Nama
+                            </th>
+
+                            <th>
+                                ULP
+                            </th>
+
+                            <th>
+                                Tarif
+                            </th>
+
+                            <th>
+                                Daya
+                            </th>
+
+                            <th>
+                                Status
+                            </th>
+
+                            <th>
+                                Repeat
+                            </th>
+
+                            <th>
+                                Kategori
+                            </th>
+
+                            <th>
+                                Petugas
+                            </th>
+
+                            <th>
+                                Regu
+                            </th>
+
+                            <th>
+                                Waktu Periksa
+                            </th>
+
+                        </tr>
+
+                    </thead>
+
+
+                    <tbody>
+
+                        {/* ==========================================
+                         * LOADING
+                         * ========================================== */}
+
+                        {loading && (
+
+                            <tr>
+
+                                <td
+                                    colSpan={
+                                        11
+                                    }
+                                    className="customer-table-empty"
+                                >
+                                    Memuat data pelanggan...
+                                </td>
+
+                            </tr>
+
+                        )}
+
+
+                        {/* ==========================================
+                         * EMPTY
+                         * ========================================== */}
+
+                        {!loading &&
+                            rows.length ===
+                                0 && (
+
+                                <tr>
+
+                                    <td
+                                        colSpan={
+                                            11
+                                        }
+                                        className="customer-table-empty"
+                                    >
+                                        Tidak ada pelanggan
+                                        yang sesuai dengan filter.
+                                    </td>
+
+                                </tr>
+
+                            )}
+
+
+                        {/* ==========================================
+                         * ROWS
+                         * ========================================== */}
+
+                        {!loading &&
+                            rows.map(
+                                (
+                                    row,
+                                ) => (
+
+                                    <tr
+                                        key={
+                                            row.idpel
+                                        }
+                                        className="customer-table-row"
+                                        onClick={() =>
+                                            onSelect(
+                                                row.idpel,
+                                            )
+                                        }
+                                    >
+
+                                        <td className="idpel-cell">
+
+                                            {formatValue(
+                                                row.idpel,
+                                            )}
+
+                                        </td>
+
+
+                                        <td
+                                            className="name-cell"
+                                            title={formatValue(
+                                                row.nama,
+                                            )}
+                                        >
+
+                                            {formatValue(
+                                                row.nama,
+                                            )}
+
+                                        </td>
+
+
+                                        <td>
+
+                                            {formatValue(
+                                                row.unitup,
+                                            )}
+
+                                        </td>
+
+
+                                        <td>
+
+                                            {formatValue(
+                                                row.tariff,
+                                            )}
+
+                                        </td>
+
+
+                                        <td>
+
+                                            {formatNumber(
+                                                row.daya,
+                                            )}
+
+                                        </td>
+
+
+                                        <td>
+
+                                            <span
+                                                className={statusClass(
+                                                    row.status,
+                                                )}
+                                            >
+
+                                                {formatValue(
+                                                    row.status,
+                                                )}
+
+                                            </span>
+
+                                        </td>
+
+
+                                        <td className="numeric-cell">
+
+                                            {formatValue(
+                                                row.dlpd_repeat,
+                                            )}
+
+                                        </td>
+
+
+                                        <td
+                                            className="category-cell"
+                                            title={formatValue(
+                                                row.kategori,
+                                            )}
+                                        >
+
+                                            {formatValue(
+                                                row.kategori,
+                                            )}
+
+                                        </td>
+
+
+                                        <td
+                                            title={formatValue(
+                                                row.petugas,
+                                            )}
+                                        >
+
+                                            {formatValue(
+                                                row.petugas,
+                                            )}
+
+                                        </td>
+
+
+                                        <td>
+
+                                            {formatValue(
+                                                row.regu,
+                                            )}
+
+                                        </td>
+
+
+                                        <td>
+
+                                            {formatValue(
+                                                row.waktu_periksa,
+                                            )}
+
+                                        </td>
+
+                                    </tr>
+
+                                ),
+                            )}
+
+                    </tbody>
+
+                </table>
+
+            </div>
+
+
+            {/* ==================================================
+             * PAGINATION
+             * ================================================== */}
+
+            <div className="customer-table-pagination">
+
+                <button
+                    type="button"
+                    className="pagination-button"
+                    disabled={
+                        loading ||
+                        page <= 1
+                    }
+                    onClick={() =>
+                        goToPage(
+                            page - 1,
+                        )
+                    }
+                >
+                    Sebelumnya
+                </button>
+
+
+                <div className="pagination-pages">
+
+                    <span>
+                        Halaman{" "}
+                        {page} dari{" "}
+                        {totalPages}
+                    </span>
+
+                </div>
+
+
+                <button
+                    type="button"
+                    className="pagination-button"
+                    disabled={
+                        loading ||
+                        page >=
+                            totalPages
+                    }
+                    onClick={() =>
+                        goToPage(
+                            page + 1,
+                        )
+                    }
+                >
+                    Berikutnya
+                </button>
+
+            </div>
+
+        </div>
+    );
+}
+
+============================================================
+FILE: .\src\components\dlpd\DlpdDetail.tsx
+============================================================
+import "./DlpdDetail.css";
+
+import {
+    useEffect,
+    useState,
+} from "react";
+
+import {
+    getDlpdCustomerDetail,
+} from "../../api/dlpd";
+
+import type {
+    CustomerType,
+    DlpdCustomerDetail,
+} from "../../api/dlpd";
+
+interface Props {
+    idpel?: string;
+    customerType: CustomerType;
+    month?: string;
+}
+
+export default function DlpdDetail({
+    idpel,
+    customerType,
+    month,
+}: Props) {
+    const [
+        data,
+        setData,
+    ] = useState<
+        DlpdCustomerDetail | null
+    >(null);
+
+    const [
+        loading,
+        setLoading,
+    ] = useState<boolean>(false);
+
+    useEffect(() => {
+        if (!idpel) {
+            setData(null);
+            setLoading(false);
+            return;
+        }
+
+        let mounted = true;
+
+        const load = async () => {
+            try {
+                setLoading(true);
+                setData(null);
+
+                const result =
+                    await getDlpdCustomerDetail(
+                        idpel,
+                        customerType,
+                        month,
+                    );
+
+                if (mounted) {
+                    setData(result);
+                }
+            } catch (err) {
+                console.error(
+                    "Failed to load DLPD customer detail:",
+                    err,
+                );
+
+                if (mounted) {
+                    setData(null);
+                }
+            } finally {
+                if (mounted) {
+                    setLoading(false);
+                }
+            }
+        };
+
+        load();
+
+        return () => {
+            mounted = false;
+        };
+    }, [
+        idpel,
+        customerType,
+        month,
+    ]);
+
+    if (!idpel) {
+        return (
+            <div className="detail-empty">
+                <h3>
+                    Belum ada pelanggan dipilih
+                </h3>
+
+                <p>
+                    Pilih pelanggan pada tabel
+                    untuk melihat detail.
+                </p>
+            </div>
+        );
+    }
+
+    if (loading) {
+        return (
+            <div className="detail-empty">
+                <h3>
+                    Loading...
+                </h3>
+            </div>
+        );
+    }
+
+    if (!data?.customer) {
+        return (
+            <div className="detail-empty">
+                <h3>
+                    Data tidak ditemukan
+                </h3>
+
+                <p>
+                    Detail pelanggan tidak
+                    tersedia untuk data yang
+                    dipilih.
+                </p>
+            </div>
+        );
+    }
+
+    const customer =
+        data.customer;
+
+    return (
+        <div className="detail-grid">
+
+            <div>
+                <span>IDPEL</span>
+
+                <strong>
+                    {customer.idpel ?? "-"}
+                </strong>
+            </div>
+
+            <div>
+                <span>Nama</span>
+
+                <strong>
+                    {customer.nama ?? "-"}
+                </strong>
+            </div>
+
+            <div>
+                <span>UNITUP</span>
+
+                <strong>
+                    {customer.unitup ?? "-"}
+                </strong>
+            </div>
+
+            <div>
+                <span>Status</span>
+
+                <strong>
+                    {customer.status ?? "-"}
+                </strong>
+            </div>
+
+            <div>
+                <span>Tarif</span>
+
+                <strong>
+                    {customer.tariff ?? "-"}
+                </strong>
+            </div>
+
+            <div>
+                <span>Daya</span>
+
+                <strong>
+                    {customer.daya != null
+                        ? customer.daya.toLocaleString()
+                        : "-"}
+                </strong>
+            </div>
+
+            <div>
+                <span>Alamat</span>
+
+                <strong>
+                    {customer.alamat ?? "-"}
+                </strong>
+            </div>
+
+            <div>
+                <span>Petugas</span>
+
+                <strong>
+                    {customer.petugas ?? "-"}
+                </strong>
+            </div>
+
+            <div>
+                <span>Regu</span>
+
+                <strong>
+                    {customer.regu ?? "-"}
+                </strong>
+            </div>
+
+            <div>
+                <span>Catatan</span>
+
+                <strong>
+                    {customer.catatan ?? "-"}
+                </strong>
+            </div>
+
+        </div>
+    );
+}
+
+============================================================
+FILE: .\src\components\dlpd\DlpdMap.tsx
+============================================================
+import {
+    useEffect,
+    useMemo,
+} from "react";
+
+import {
+    CircleMarker,
+    MapContainer,
+    Popup,
+    TileLayer,
+    useMap,
+} from "react-leaflet";
+
+import "leaflet/dist/leaflet.css";
+
+import type {
+    DlpdMapPoint,
+} from "../../api/dlpd";
+
+
+interface DlpdMapProps {
+    points: DlpdMapPoint[];
+    height?: number;
+}
+
+
+/* ==========================================================
+ * DEFAULT CENTER
+ * ========================================================== */
+
+const DEFAULT_CENTER: [number, number] = [
+    -5.3971,
+    105.2668,
+];
+
+
+/* ==========================================================
+ * MAP FITTER
+ * ========================================================== */
+
+function MapFitter({
+    points,
+}: {
+    points: DlpdMapPoint[];
+}) {
+    const map = useMap();
+
+    const bounds = useMemo(
+        () => {
+            if (points.length === 0) {
+                return null;
+            }
+
+            return points.map(
+                (point) =>
+                    [
+                        point.latitude,
+                        point.longitude,
+                    ] as [number, number],
+            );
+        },
+        [points],
+    );
+
+    useEffect(
+        () => {
+            if (!bounds || bounds.length === 0) {
+                map.setView(
+                    DEFAULT_CENTER,
+                    11,
+                );
+
+                return;
+            }
+
+            map.fitBounds(
+                bounds,
+                {
+                    padding: [40, 40],
+                    maxZoom: 15,
+                },
+            );
+        },
+        [map, bounds],
+    );
+
+    return null;
+}
+
+
+/* ==========================================================
+ * STATUS COLOR
+ * ========================================================== */
+
+function getPointColor(
+    point: DlpdMapPoint,
+): string {
+    const status =
+        String(
+            point.status ?? "",
+        ).toUpperCase();
+
+    if (
+        status.includes("TEMUAN")
+    ) {
+        return "#ef4444";
+    }
+
+    if (
+        status.includes("NORMAL")
+    ) {
+        return "#22c55e";
+    }
+
+    return "#3b82f6";
+}
+
+
+/* ==========================================================
+ * COMPONENT
+ * ========================================================== */
+
+export default function DlpdMap({
+    points,
+    height = 520,
+}: DlpdMapProps) {
+    return (
+        <div
+            style={{
+                width: "100%",
+                height,
+                borderRadius: 10,
+                overflow: "hidden",
+            }}
+        >
+            <MapContainer
+                center={DEFAULT_CENTER}
+                zoom={11}
+                scrollWheelZoom
+                style={{
+                    width: "100%",
+                    height: "100%",
+                }}
+            >
+                <TileLayer
+                    attribution='&copy; OpenStreetMap contributors'
+                    url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                />
+
+                <MapFitter
+                    points={points}
+                />
+
+                {points.map(
+                    (
+                        point,
+                        index,
+                    ) => (
+                        <CircleMarker
+                            key={`${point.idpel}-${index}`}
+                            center={[
+                                point.latitude,
+                                point.longitude,
+                            ]}
+                            radius={6}
+                            pathOptions={{
+                                color:
+                                    getPointColor(
+                                        point,
+                                    ),
+                                fillColor:
+                                    getPointColor(
+                                        point,
+                                    ),
+                                fillOpacity: 0.8,
+                                weight: 1,
+                            }}
+                        >
+                            <Popup>
+                                <div
+                                    style={{
+                                        minWidth: 220,
+                                    }}
+                                >
+                                    <strong>
+                                        {
+                                            point.nama ||
+                                            point.idpel
+                                        }
+                                    </strong>
+
+                                    <div>
+                                        IDPEL:{" "}
+                                        {
+                                            point.idpel
+                                        }
+                                    </div>
+
+                                    <div>
+                                        UNITUP:{" "}
+                                        {
+                                            point.unitup ??
+                                            "-"
+                                        }
+                                    </div>
+
+                                    <div>
+                                        Tarif:{" "}
+                                        {
+                                            point.tariff ??
+                                            "-"
+                                        }
+                                    </div>
+
+                                    <div>
+                                        Daya:{" "}
+                                        {
+                                            point.daya ??
+                                            "-"
+                                        }
+                                    </div>
+
+                                    <div>
+                                        DLPD:{" "}
+                                        {
+                                            point.dlpd ??
+                                            "-"
+                                        }
+                                    </div>
+
+                                    <div>
+                                        Status:{" "}
+                                        {
+                                            point.status ??
+                                            "-"
+                                        }
+                                    </div>
+
+                                    <div>
+                                        Koordinat:{" "}
+                                        {
+                                            point.latitude
+                                        }
+                                        ,{" "}
+                                        {
+                                            point.longitude
+                                        }
+                                    </div>
+                                </div>
+                            </Popup>
+                        </CircleMarker>
+                    ),
+                )}
+            </MapContainer>
+        </div>
+    );
+}
+
+============================================================
+FILE: .\src\pages\DlpdPage.css
+============================================================
+.dlpd-page{
+
+    display:flex;
+
+    flex-direction:column;
+
+    gap:24px;
+
+}
+
+.page-header{
+
+    display:flex;
+
+    justify-content:space-between;
+
+    align-items:center;
+
+}
+
+.page-header h1{
+
+    margin:0;
+
+    font-size:28px;
+
+    font-weight:700;
+
+    color:#f8fafc;
+
+}
+
+.page-header p{
+
+    margin-top:6px;
+
+    color:#94a3b8;
+
+    font-size:14px;
+
+}
+
+.toolbar{
+
+    display:flex;
+
+    justify-content:space-between;
+
+    align-items:center;
+
+}
+
+.radio-group{
+
+    display:flex;
+
+    gap:24px;
+
+}
+
+.radio-group label{
+
+    display:flex;
+
+    align-items:center;
+
+    gap:8px;
+
+    color:#cbd5e1;
+
+    font-size:14px;
+
+}
+
+.kpi-grid{
+
+    display:grid;
+
+    grid-template-columns:repeat(4,1fr);
+
+    gap:18px;
+
+}
+
+.kpi-card{
+
+    background:#1e293b;
+
+    border:1px solid #334155;
+
+    border-radius:10px;
+
+    padding:18px;
+
+}
+
+.kpi-card span{
+
+    font-size:13px;
+
+    color:#94a3b8;
+
+}
+
+.kpi-card h2{
+
+    margin-top:10px;
+
+    margin-bottom:0;
+
+    font-size:30px;
+
+    color:white;
+
+}
+
+.filter-bar{
+
+    display:flex;
+
+    gap:16px;
+
+}
+
+.filter-bar select{
+
+    width:240px;
+
+    background:#1e293b;
+
+    color:white;
+
+    border:1px solid #334155;
+
+    border-radius:8px;
+
+    padding:10px 14px;
+
+}
+
+.content-grid{
+
+    display:grid;
+
+    grid-template-columns:1.2fr 1fr;
+
+    gap:18px;
+
+}
+
+.panel{
+
+    background:#1e293b;
+
+    border:1px solid #334155;
+
+    border-radius:10px;
+
+    overflow:hidden;
+
+}
+
+.panel-header{
+
+    padding:14px 18px;
+
+    border-bottom:1px solid #334155;
+
+    font-weight:600;
+
+    color:white;
+
+}
+
+.panel-body{
+
+    padding:20px;
+
+    min-height:240px;
+
+    color:#94a3b8;
+
+}
+

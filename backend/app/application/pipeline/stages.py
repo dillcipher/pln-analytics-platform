@@ -1,0 +1,20 @@
+from enum import Enum
+
+
+class PipelineStage(str, Enum):
+
+    UPLOAD = "UPLOAD"
+
+    DETECTION = "DETECTION"
+
+    VALIDATION = "VALIDATION"
+
+    GROUPING = "GROUPING"
+
+    MERGING = "MERGING"
+
+    TRANSFORMING = "TRANSFORMING"
+
+    EXPORTING = "EXPORTING"
+
+    COMPLETED = "COMPLETED"

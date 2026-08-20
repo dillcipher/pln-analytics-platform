@@ -1,0 +1,2678 @@
+import {
+    useEffect,
+    useMemo,
+    useState,
+} from "react";
+
+import api from "../api/api";
+
+import SuspectMap from "../components/suspect/SuspectMap";
+
+import {
+    getSuspectAnalytics,
+    getSuspectMap,
+    getSuspectMonths,
+    type SuspectAnalyticsData,
+    type SuspectDetailResponse,
+    type SuspectMapPoint,
+    type SuspectMonth,
+} from "../api/suspect";
+
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+function formatNumber(
+    value: number | null | undefined,
+): string {
+    return Number(value ?? 0).toLocaleString(
+        "id-ID",
+    );
+}
+
+
+function normalizeValue(
+    value: unknown,
+): string {
+    if (
+        value === null ||
+        value === undefined
+    ) {
+        return "-";
+    }
+
+    return String(value);
+}
+
+
+const ALL_MONTHS_KEY = "__ALL__";
+
+function getMonthLabel(
+    months: SuspectMonth[],
+    monthKey: string,
+): string {
+    if (monthKey === ALL_MONTHS_KEY) {
+        return "Semua Bulan";
+    }
+
+    return (
+        months.find(
+            (item) =>
+                item.month_key === monthKey,
+        )?.label ??
+        monthKey
+    );
+}
+
+/**
+ * Merge the month-scoped ANEV analytics without changing the
+ * backend contract.  Repeat analytics are intentionally taken
+ * from the latest available month because the backend's
+ * pasca_repeat block represents the cross-period repeat analysis.
+ */
+function mergeSuspectAnalytics(
+    results: SuspectAnalyticsData[],
+): SuspectAnalyticsData | null {
+    if (results.length === 0) {
+        return null;
+    }
+
+    const latest = results[results.length - 1];
+    const unitMap = new Map<string, any>();
+    const classificationMap = new Map<string, any>();
+
+    let totalLocations = 0;
+    let totalClassifications = 0;
+
+    for (const result of results) {
+        const anev = result?.anev as any;
+
+        totalLocations += Number(
+            anev?.total_locations ?? 0,
+        );
+
+        totalClassifications += Number(
+            anev?.total_classifications ?? 0,
+        );
+
+        for (const item of (anev?.unitap ?? [])) {
+            const key = String(
+                item?.unitap ?? "",
+            );
+
+            if (!key) {
+                continue;
+            }
+
+            const current =
+                unitMap.get(key) ?? {
+                    ...item,
+                    unitap: key,
+                    locations: 0,
+                    total: 0,
+                };
+
+            const numericKeys = [
+                "locations",
+                "total",
+                "customers",
+                "count",
+                "pelanggan",
+            ];
+
+            for (const field of numericKeys) {
+                if (
+                    field in item &&
+                    typeof item[field] === "number"
+                ) {
+                    current[field] =
+                        Number(current[field] ?? 0) +
+                        Number(item[field] ?? 0);
+                }
+            }
+
+            unitMap.set(key, current);
+        }
+
+        for (const item of (
+            (result as any)?.classification ?? []
+        )) {
+            const key = String(
+                item?.classification ??
+                item?.suspect_name ??
+                item?.SUSPECT_NAME ??
+                "",
+            );
+
+            if (!key) {
+                continue;
+            }
+
+            const current =
+                classificationMap.get(key) ?? {
+                    ...item,
+                    classification: key,
+                };
+
+            for (const [field, value] of Object.entries(item ?? {})) {
+                if (
+                    field !== "classification" &&
+                    typeof value === "number"
+                ) {
+                    current[field] =
+                        Number(current[field] ?? 0) +
+                        Number(value);
+                }
+            }
+
+            classificationMap.set(key, current);
+        }
+    }
+
+    return {
+        ...latest,
+        anev: {
+            ...(latest as any).anev,
+            total_locations: totalLocations,
+            total_classifications: totalClassifications,
+            unitap: Array.from(unitMap.values()),
+        },
+        classification:
+            Array.from(
+                classificationMap.values(),
+            ),
+    } as SuspectAnalyticsData;
+}
+
+
+function getRepeatLabel(
+    value: number,
+): string {
+    return `${value}x`;
+}
+
+
+function getFrequencyLocations(
+    analytics: SuspectAnalyticsData | null,
+    repeat: string,
+): number {
+    if (!repeat) {
+        return Number(
+            analytics?.pasca_repeat?.total_customers ?? 0,
+        );
+    }
+
+    const repeatCount = Number(repeat);
+
+    return Number(
+        analytics?.pasca_repeat?.frequency?.find(
+            (item) =>
+                Number(item.repeat_count) === repeatCount,
+        )?.locations ?? 0,
+    );
+}
+
+function getSelectedRepeatLabel(
+    repeat: string,
+): string {
+    return repeat
+        ? `${repeat}x`
+        : "Semua Perulangan";
+}
+
+type InspectionStatus =
+    | ""
+    | "SUDAH_PERIKSA"
+    | "BELUM_PERIKSA";
+
+
+function getInspectionLabel(
+    status: InspectionStatus,
+): string {
+    if (status === "SUDAH_PERIKSA") {
+        return "Sudah Periksa";
+    }
+
+    if (status === "BELUM_PERIKSA") {
+        return "Belum Periksa";
+    }
+
+    return "Semua Status Pemeriksaan";
+}
+
+
+// ============================================================
+// DETAIL COLUMN ORDER
+//
+// Kita prioritaskan kolom yang memang diminta.
+// Kolom lain dari backend tetap ditampilkan setelahnya.
+// ============================================================
+
+const DETAIL_COLUMN_ORDER = [
+    "LOCATION_CODE",
+    "LOCATION_NAME",
+    "UNITUPI",
+    "UNITAP",
+    "UNITUP",
+    "TARIFF",
+    "POWER",
+
+    "ASYMMETRIC POWER BY INSTANT",
+    "INCORRECT PHASE BY INSTANT",
+    "OVER CURRENT BY INSTANT",
+    "OVER VOLTAGE BY INSTANT",
+    "REVERSAL BY INSTANT",
+    "TIME DIFFERENCE - INSTANT",
+    "UNBALANCE CURRENT BY INSTANT",
+    "UNDER VOLTAGE BY INSTANT",
+    "VOLTAGE DIP - INSTANT",
+
+    "VOLTAGE_L1",
+    "VOLTAGE_L2",
+    "VOLTAGE_L3",
+
+    "VOLTAGE_ANGLE_CONV_L1",
+    "VOLTAGE_ANGLE_CONV_L2",
+    "VOLTAGE_ANGLE_CONV_L3",
+
+    "CURRENT_L1",
+    "CURRENT_L2",
+    "CURRENT_L3",
+    "CURRENT_N",
+];
+
+
+// ============================================================
+// DETAIL REQUEST
+// ============================================================
+
+async function fetchSuspectDetail(
+    params: {
+        month: string;
+        unitap?: string;
+        suspect_name?: string;
+        repeat_count?: number;
+        inspection_status?: "SUDAH_PERIKSA" | "BELUM_PERIKSA";
+        page?: number;
+        page_size?: number;
+    },
+): Promise<SuspectDetailResponse> {
+    const response = await api.get(
+        "/suspect/detail",
+        {
+            params,
+        },
+    );
+
+    return (
+        response.data?.data ??
+        response.data
+    ) as SuspectDetailResponse;
+}
+
+
+// ============================================================
+// PAGE
+// ============================================================
+
+export default function SuspectPage() {
+    // --------------------------------------------------------
+    // MONTH
+    // --------------------------------------------------------
+
+    const [months, setMonths] =
+        useState<SuspectMonth[]>([]);
+
+    const [selectedMonth, setSelectedMonth] =
+        useState("");
+
+
+    // --------------------------------------------------------
+    // FILTER
+    // --------------------------------------------------------
+
+    const [selectedUnit, setSelectedUnit] =
+        useState("");
+
+    const [selectedRepeat, setSelectedRepeat] =
+        useState("");
+
+    const [
+        selectedInspectionStatus,
+        setSelectedInspectionStatus,
+    ] = useState<InspectionStatus>("");
+
+
+    // --------------------------------------------------------
+    // ANALYTICS
+    // --------------------------------------------------------
+
+    const [analytics, setAnalytics] =
+        useState<SuspectAnalyticsData | null>(
+            null,
+        );
+
+
+    // --------------------------------------------------------
+    // DETAIL
+    // --------------------------------------------------------
+
+    const [
+        selectedClassification,
+        setSelectedClassification,
+    ] = useState<string | null>(null);
+
+    const [detail, setDetail] =
+        useState<SuspectDetailResponse | null>(
+            null,
+        );
+
+    const [detailPage, setDetailPage] =
+        useState(1);
+
+
+    // --------------------------------------------------------
+    // LOADING
+    // --------------------------------------------------------
+
+    const [loadingMonths, setLoadingMonths] =
+        useState(true);
+
+    const [loadingAnalytics, setLoadingAnalytics] =
+        useState(false);
+
+    const [loadingDetail, setLoadingDetail] =
+        useState(false);
+
+
+    // --------------------------------------------------------
+    // ERROR
+    // --------------------------------------------------------
+
+    const [error, setError] =
+        useState("");
+
+    // --------------------------------------------------------
+    // MAP
+    // --------------------------------------------------------
+
+    const [mapPoints, setMapPoints] =
+        useState<SuspectMapPoint[]>([]);
+
+    const [mapTotal, setMapTotal] =
+        useState(0);
+
+    const [mapMapped, setMapMapped] =
+        useState(0);
+
+    const [mapMatchedIdpel, setMapMatchedIdpel] =
+        useState(0);
+
+    const [mapLoading, setMapLoading] =
+        useState(false);
+
+    const [mapError, setMapError] =
+        useState("");
+
+
+    // ========================================================
+    // LOAD MONTHS
+    // ========================================================
+
+    useEffect(() => {
+        let cancelled = false;
+
+        async function loadMonths() {
+            setLoadingMonths(true);
+            setError("");
+
+            try {
+                const result =
+                    await getSuspectMonths();
+
+                if (cancelled) {
+                    return;
+                }
+
+                const availableMonths =
+                    result.length > 0
+                        ? result
+                        : [
+                              {
+                                  month_key: "202601",
+                                  label: "Januari 2026",
+                              },
+                              {
+                                  month_key: "202602",
+                                  label: "Februari 2026",
+                              },
+                              {
+                                  month_key: "202603",
+                                  label: "Maret 2026",
+                              },
+                              {
+                                  month_key: "202604",
+                                  label: "April 2026",
+                              },
+                              {
+                                  month_key: "202605",
+                                  label: "Mei 2026",
+                              },
+                              {
+                                  month_key: "202606",
+                                  label: "Juni 2026",
+                              },
+                          ];
+
+                setMonths(availableMonths);
+
+                if (availableMonths.length > 0) {
+                    // Backend sudah dinormalisasi oleh suspect.ts.
+                    // Pilih bulan terbaru yang benar-benar tersedia.
+                    setSelectedMonth(
+                        availableMonths[
+                            availableMonths.length - 1
+                        ].month_key,
+                    );
+                } else {
+                    // Jangan biarkan seluruh halaman kosong apabila endpoint
+                    // months belum mengembalikan data. 202606 sudah terbukti
+                    // tersedia pada endpoint analytics/map.
+                    setSelectedMonth("202606");
+                    setError("");
+                }
+            } catch (err) {
+                console.error(err);
+
+                if (!cancelled) {
+                    setError(
+                        "Gagal memuat periode Suspect Analytics.",
+                    );
+                }
+            } finally {
+                if (!cancelled) {
+                    setLoadingMonths(false);
+                }
+            }
+        }
+
+        loadMonths();
+
+        return () => {
+            cancelled = true;
+        };
+    }, []);
+
+
+    // ========================================================
+    // LOAD ANALYTICS
+    // ========================================================
+
+    useEffect(() => {
+        if (!selectedMonth || months.length === 0) {
+            return;
+        }
+
+        let cancelled = false;
+
+        async function loadAnalytics() {
+            setLoadingAnalytics(true);
+            setError("");
+
+            setSelectedClassification(null);
+            setDetail(null);
+            setDetailPage(1);
+
+            try {
+                const monthKeys =
+                    selectedMonth === ALL_MONTHS_KEY
+                        ? months.map(
+                              (month) =>
+                                  month.month_key,
+                          )
+                        : [selectedMonth];
+
+                const results =
+                    await Promise.all(
+                        monthKeys.map(
+                            async (monthKey) => {
+                                const result =
+                                    await getSuspectAnalytics(
+                                        monthKey,
+                                        selectedUnit
+                                            ? {
+                                                  unitap:
+                                                      selectedUnit,
+                                              }
+                                            : undefined,
+                                    );
+
+                                return result.data;
+                            },
+                        ),
+                    );
+
+                if (cancelled) {
+                    return;
+                }
+
+                setAnalytics(
+                    selectedMonth === ALL_MONTHS_KEY
+                        ? mergeSuspectAnalytics(results)
+                        : results[0] ?? null,
+                );
+                setError("");
+            } catch (err) {
+                console.error(err);
+
+                if (!cancelled) {
+                    setAnalytics(null);
+                    setError(
+                        "Gagal memuat data Suspect Analytics.",
+                    );
+                }
+            } finally {
+                if (!cancelled) {
+                    setLoadingAnalytics(false);
+                }
+            }
+        }
+
+        loadAnalytics();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [
+        selectedMonth,
+        selectedUnit,
+        months,
+    ]);
+
+
+    // ========================================================
+    // UNIT OPTIONS
+    // ========================================================
+
+    const unitOptions = useMemo(() => {
+        const values =
+            analytics?.anev?.unitap ??
+            [];
+
+        return values
+            .map(
+                (item) =>
+                    String(
+                        item.unitap,
+                    ),
+            )
+            .filter(Boolean)
+            .sort(
+                (a, b) =>
+                    a.localeCompare(
+                        b,
+                        undefined,
+                        {
+                            numeric: true,
+                        },
+                    ),
+            );
+    }, [analytics]);
+
+
+    // ========================================================
+    // REPEAT OPTIONS
+    //
+    // Backend analytics sudah mempunyai frequency:
+    //
+    // [
+    //   {
+    //      repeat_count: 1,
+    //      locations: ...
+    //   },
+    //   ...
+    // ]
+    //
+    // Jadi dropdown tidak mengarang angka.
+    // ========================================================
+
+    const repeatOptions =
+        useMemo(() => {
+            const frequency =
+                analytics
+                    ?.pasca_repeat
+                    ?.frequency ??
+                [];
+
+            return frequency
+                .map(
+                    (item) =>
+                        Number(
+                            item.repeat_count,
+                        ),
+                )
+                .filter(
+                    (value) =>
+                        Number.isFinite(
+                            value,
+                        ) &&
+                        value >= 1,
+                )
+                .sort(
+                    (a, b) =>
+                        a - b,
+                );
+        }, [analytics]);
+
+
+    // ========================================================
+    // CLASSIFICATION
+    //
+    // Untuk daftar utama kita gunakan data
+    // repeat berdasarkan suspect classification.
+    // ========================================================
+
+    const classifications =
+        useMemo(() => {
+            const rows =
+                analytics
+                    ?.pasca_repeat
+                    ?.by_suspect ??
+                [];
+
+            return [...rows].sort(
+                (
+                    a,
+                    b,
+                ) =>
+                    Number(
+                        b.repeat_customers,
+                    ) -
+                        Number(
+                            a.repeat_customers,
+                        ) ||
+                    Number(
+                        b.total_customers,
+                    ) -
+                        Number(
+                            a.total_customers,
+                        ),
+            );
+        }, [analytics]);
+
+
+    // ========================================================
+    // SELECT CLASSIFICATION
+    // ========================================================
+
+    async function handleSelectClassification(
+        classification: string,
+    ) {
+        if (!selectedMonth) {
+            return;
+        }
+
+        if (selectedMonth === ALL_MONTHS_KEY) {
+            setError(
+                "Pilih bulan tertentu untuk membuka detail classification.",
+            );
+            return;
+        }
+
+        setSelectedClassification(
+            classification,
+        );
+
+        setDetail(null);
+        setDetailPage(1);
+        setLoadingDetail(true);
+        setError("");
+
+        try {
+            const result =
+                await fetchSuspectDetail({
+                    month:
+                        selectedMonth,
+
+                    unitap:
+                        selectedUnit ||
+                        undefined,
+
+                    suspect_name:
+                        classification,
+
+                    repeat_count:
+                        selectedRepeat
+                            ? Number(selectedRepeat)
+                            : undefined,
+
+                    inspection_status:
+                        selectedInspectionStatus ||
+                        undefined,
+
+                    page: 1,
+
+                    page_size: 50,
+                });
+
+            if (
+                result.total_rows === 0 &&
+                selectedRepeat
+            ) {
+                const fallback =
+                    await fetchSuspectDetail({
+                        month: selectedMonth,
+                        unitap:
+                            selectedUnit ||
+                            undefined,
+                        suspect_name:
+                            classification,
+                        inspection_status:
+                            selectedInspectionStatus ||
+                            undefined,
+                        page: 1,
+                        page_size: 50,
+                    });
+
+                setDetail(fallback);
+            } else {
+                setDetail(result);
+            }
+        } catch (err) {
+            console.error(err);
+
+            setError(
+                "Gagal memuat detail classification.",
+            );
+        } finally {
+            setLoadingDetail(false);
+        }
+    }
+
+
+    // ========================================================
+    // LOAD DETAIL PAGE
+    // ========================================================
+
+    useEffect(() => {
+        if (
+            !selectedMonth ||
+            !selectedClassification ||
+            detailPage === 1
+        ) {
+            return;
+        }
+
+        let cancelled = false;
+
+        async function loadDetailPage() {
+            const classification =
+                selectedClassification;
+
+            if (!classification) {
+                return;
+            }
+
+            setLoadingDetail(true);
+
+            try {
+                const result =
+                    await fetchSuspectDetail({
+                        month:
+                            selectedMonth,
+
+                        unitap:
+                            selectedUnit ||
+                            undefined,
+
+                        suspect_name:
+                            classification,
+
+                        repeat_count:
+                            selectedRepeat
+                                ? Number(selectedRepeat)
+                                : undefined,
+
+                        inspection_status:
+                            selectedInspectionStatus ||
+                            undefined,
+
+                        page:
+                            detailPage,
+
+                        page_size: 50,
+                    });
+
+                if (!cancelled) {
+                    setDetail(result);
+                }
+            } catch (err) {
+                console.error(err);
+
+                if (!cancelled) {
+                    setError(
+                        "Gagal memuat halaman detail.",
+                    );
+                }
+            } finally {
+                if (!cancelled) {
+                    setLoadingDetail(false);
+                }
+            }
+        }
+
+        loadDetailPage();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [
+        detailPage,
+        selectedMonth,
+        selectedUnit,
+        selectedClassification,
+        selectedRepeat,
+        selectedInspectionStatus,
+    ]);
+
+
+    // ========================================================
+    // LOAD MAP
+    // ========================================================
+
+    useEffect(() => {
+        if (!selectedMonth || months.length === 0) {
+            return;
+        }
+
+        let cancelled = false;
+
+        async function loadMap() {
+            setMapLoading(true);
+            setMapError("");
+
+            try {
+                /*
+                 * MAP PERFORMANCE
+                 *
+                 * Jangan request semua bulan sekaligus. Endpoint map
+                 * mengembalikan ribuan titik sehingga mode "Semua Bulan"
+                 * sebelumnya membuat browser menunggu banyak request besar
+                 * sekaligus.
+                 *
+                 * Untuk "Semua Bulan", peta memakai bulan terbaru.
+                 * Analytics tetap mengikuti mode Semua Bulan.
+                 */
+                const mapMonth =
+                    selectedMonth === ALL_MONTHS_KEY
+                        ? months[
+                              months.length - 1
+                          ]?.month_key
+                        : selectedMonth;
+
+                if (!mapMonth) {
+                    setMapPoints([]);
+                    setMapTotal(0);
+                    setMapMapped(0);
+                    setMapMatchedIdpel(0);
+                    return;
+                }
+
+                const result =
+                    await getSuspectMap(
+                        mapMonth,
+                        {
+                            unitap:
+                                selectedUnit ||
+                                undefined,
+                            suspect_name:
+                                selectedClassification ||
+                                undefined,
+                            repeat_count:
+                                selectedRepeat
+                                    ? Number(
+                                          selectedRepeat,
+                                      )
+                                    : undefined,
+                            inspection_status:
+                                selectedInspectionStatus ||
+                                undefined,
+                        },
+                        25_000,
+                    );
+
+                if (cancelled) {
+                    return;
+                }
+
+                const pointMap =
+                    new Map<string, SuspectMapPoint>();
+
+                let totalLocations = 0;
+                let matchedIdpel = 0;
+                let mappedLocations = 0;
+
+                totalLocations = Number(
+                    result.data?.total_locations ?? 0,
+                );
+
+                matchedIdpel = Number(
+                    result.data?.matched_idpel ?? 0,
+                );
+
+                mappedLocations = Number(
+                    result.data?.mapped_locations ?? 0,
+                );
+
+                for (const point of (
+                    result.data?.points ?? []
+                )) {
+                        const latitude = Number(
+                            point.latitude,
+                        );
+                        const longitude = Number(
+                            point.longitude,
+                        );
+
+                        if (
+                            !Number.isFinite(
+                                latitude,
+                            ) ||
+                            !Number.isFinite(
+                                longitude,
+                            )
+                        ) {
+                            continue;
+                        }
+
+                        const idpel = String(
+                            point.idpel ??
+                                `${latitude}:${longitude}:${point.location_code ?? ""}`,
+                        );
+
+                        if (!pointMap.has(idpel)) {
+                            pointMap.set(
+                                idpel,
+                                {
+                                    ...point,
+                                    latitude,
+                                    longitude,
+                                },
+                            );
+                        }
+                    }
+
+                const validPoints =
+                    Array.from(
+                        pointMap.values(),
+                    );
+
+                setMapPoints(validPoints);
+                const inspectionFiltered =
+                    selectedInspectionStatus !== "";
+
+                setMapTotal(
+                    inspectionFiltered ||
+                        selectedClassification ||
+                        selectedRepeat
+                        ? validPoints.length
+                        : totalLocations,
+                );
+                setMapMapped(
+                    inspectionFiltered ||
+                        selectedClassification ||
+                        selectedRepeat
+                        ? validPoints.length
+                        : mappedLocations,
+                );
+                setMapMatchedIdpel(
+                    inspectionFiltered ||
+                        selectedClassification ||
+                        selectedRepeat
+                        ? validPoints.length
+                        : matchedIdpel,
+                );
+            } catch (err) {
+                console.error(err);
+
+                if (!cancelled) {
+                    setMapPoints([]);
+                    setMapTotal(0);
+                    setMapMapped(0);
+                    setMapMatchedIdpel(0);
+                    setMapError(
+                        "Gagal memuat koordinat lokasi suspect.",
+                    );
+                }
+            } finally {
+                if (!cancelled) {
+                    setMapLoading(false);
+                }
+            }
+        }
+
+        loadMap();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [
+        selectedMonth,
+        selectedUnit,
+        selectedRepeat,
+        selectedInspectionStatus,
+        selectedClassification,
+        months,
+    ]);
+
+
+    // ========================================================
+    // RESET
+    // ========================================================
+
+    function handleReset() {
+        setSelectedUnit("");
+        setSelectedRepeat("");
+        setSelectedInspectionStatus("");
+        setSelectedClassification(
+            null,
+        );
+        setDetail(null);
+        setDetailPage(1);
+    }
+
+
+    // ========================================================
+    // DETAIL COLUMNS
+    //
+    // Ambil key dari data backend.
+    // Key yang diminta diprioritaskan.
+    // ========================================================
+
+    const detailColumns =
+        useMemo(() => {
+            const items =
+                detail?.items ?? [];
+
+            if (
+                items.length === 0
+            ) {
+                return DETAIL_COLUMN_ORDER;
+            }
+
+            const keys = new Set<string>();
+
+            items.forEach(
+                (item) => {
+                    Object.keys(
+                        item,
+                    ).forEach(
+                        (key) =>
+                            keys.add(
+                                key,
+                            ),
+                    );
+                },
+            );
+
+            const ordered =
+                DETAIL_COLUMN_ORDER.filter(
+                    (key) =>
+                        keys.has(key),
+                );
+
+            const remaining =
+                Array.from(
+                    keys,
+                ).filter(
+                    (key) =>
+                        !DETAIL_COLUMN_ORDER.includes(
+                            key,
+                        ) &&
+                        key !==
+                            "MONTH_KEY" &&
+                        key !==
+                            "READ_DATE",
+                );
+
+            return [
+                ...ordered,
+                ...remaining,
+            ];
+        }, [detail]);
+
+
+    // ========================================================
+    // LOADING MONTH
+    // ========================================================
+
+    if (
+        loadingMonths &&
+        months.length === 0 &&
+        !selectedMonth
+    ) {
+        return (
+            <div style={styles.page}>
+                <div style={styles.loadingBox}>
+                    Memuat Suspect Analytics...
+                </div>
+            </div>
+        );
+    }
+
+
+    // ========================================================
+    // RENDER
+    // ========================================================
+
+    return (
+        <div style={styles.page}>
+
+            {/* ==================================================
+                HEADER
+            ================================================== */}
+
+            <div style={styles.header}>
+                <div>
+                    <h1
+                        style={
+                            styles.title
+                        }
+                    >
+                        Suspect Analytics
+                    </h1>
+
+                    <p
+                        style={
+                            styles.subtitle
+                        }
+                    >
+                        Analisis ANEV
+                        berdasarkan lokasi
+                        dan klasifikasi
+                        suspect.
+                    </p>
+                </div>
+
+                <div
+                    style={
+                        styles.periodWrapper
+                    }
+                >
+                    <span
+                        style={
+                            styles.periodLabel
+                        }
+                    >
+                        Periode
+                    </span>
+
+                    <select
+                        disabled={
+                            loadingMonths &&
+                            months.length === 0
+                        }
+                        value={
+                            selectedMonth
+                        }
+                        onChange={(
+                            event,
+                        ) =>
+                            setSelectedMonth(
+                                event
+                                    .target
+                                    .value,
+                            )
+                        }
+                        style={
+                            styles.select
+                        }
+                    >
+                        <option
+                            value={ALL_MONTHS_KEY}
+                        >
+                            Semua Bulan
+                        </option>
+
+                        {months.map(
+                            (
+                                month,
+                            ) => (
+                                <option
+                                    key={
+                                        month.month_key
+                                    }
+                                    value={
+                                        month.month_key
+                                    }
+                                >
+                                    {
+                                        month.label
+                                    }
+                                </option>
+                            ),
+                        )}
+                    </select>
+                </div>
+            </div>
+
+
+            {/* ==================================================
+                ERROR
+            ================================================== */}
+
+            {error && (
+                <div
+                    style={
+                        styles.errorBox
+                    }
+                >
+                    {error}
+                </div>
+            )}
+
+
+            {/* ==================================================
+                FILTER
+            ================================================== */}
+
+            <section
+                style={
+                    styles.filterCard
+                }
+            >
+                <div
+                    style={
+                        styles.filterHeader
+                    }
+                >
+                    <div>
+                        <div
+                            style={
+                                styles.filterTitle
+                            }
+                        >
+                            Filter
+                        </div>
+
+                        <div
+                            style={
+                                styles.filterSubtitle
+                            }
+                        >
+                            {getMonthLabel(
+                                months,
+                                selectedMonth,
+                            )}
+                            {" • "}
+                            {getSelectedRepeatLabel(
+                                selectedRepeat,
+                            )}
+                            {" • "}
+                            {getInspectionLabel(
+                                selectedInspectionStatus,
+                            )}
+                        </div>
+                    </div>
+
+                    <button
+                        type="button"
+                        onClick={
+                            handleReset
+                        }
+                        style={
+                            styles.resetButton
+                        }
+                    >
+                        Reset Filter
+                    </button>
+                </div>
+
+
+                <div
+                    style={
+                        styles.filterGrid
+                    }
+                >
+
+                    {/* UNIT */}
+
+                    <div>
+                        <label
+                            style={
+                                styles.fieldLabel
+                            }
+                        >
+                            Unit
+                        </label>
+
+                        <select
+                            value={
+                                selectedUnit
+                            }
+                            onChange={(
+                                event,
+                            ) => {
+                                setSelectedUnit(
+                                    event
+                                        .target
+                                        .value,
+                                );
+
+                                setSelectedRepeat(
+                                    "",
+                                );
+                            }}
+                            style={
+                                styles.field
+                            }
+                        >
+                            <option value="">
+                                Semua Unit
+                            </option>
+
+                            {unitOptions.map(
+                                (
+                                    unit,
+                                ) => (
+                                    <option
+                                        key={
+                                            unit
+                                        }
+                                        value={
+                                            unit
+                                        }
+                                    >
+                                        {
+                                            unit
+                                        }
+                                    </option>
+                                ),
+                            )}
+                        </select>
+                    </div>
+
+
+                    {/* REPEAT */}
+
+                    <div>
+                        <label
+                            style={
+                                styles.fieldLabel
+                            }
+                        >
+                            Perulangan
+                        </label>
+
+                        <select
+                            value={
+                                selectedRepeat
+                            }
+                            onChange={(
+                                event,
+                            ) =>
+                                setSelectedRepeat(
+                                    event
+                                        .target
+                                        .value,
+                                )
+                            }
+                            style={
+                                styles.field
+                            }
+                        >
+                            <option value="">
+                                Semua Perulangan
+                            </option>
+
+                            {repeatOptions.map(
+                                (
+                                    value,
+                                ) => (
+                                    <option
+                                        key={
+                                            value
+                                        }
+                                        value={
+                                            value
+                                        }
+                                    >
+                                        {getRepeatLabel(
+                                            value,
+                                        )}
+                                    </option>
+                                ),
+                            )}
+                        </select>
+                    </div>
+
+                    {/* STATUS PEMERIKSAAN */}
+
+                    <div>
+                        <label
+                            style={
+                                styles.fieldLabel
+                            }
+                        >
+                            Status Pemeriksaan
+                        </label>
+
+                        <select
+                            value={
+                                selectedInspectionStatus
+                            }
+                            onChange={(
+                                event,
+                            ) => {
+                                const value =
+                                    event.target
+                                        .value as
+                                        | ""
+                                        | "SUDAH_PERIKSA"
+                                        | "BELUM_PERIKSA";
+
+                                setSelectedInspectionStatus(
+                                    value,
+                                );
+                                setSelectedClassification(
+                                    null,
+                                );
+                                setDetail(null);
+                                setDetailPage(1);
+                            }}
+                            style={
+                                styles.field
+                            }
+                        >
+                            <option value="">
+                                Semua Status Pemeriksaan
+                            </option>
+                            <option value="SUDAH_PERIKSA">
+                                Sudah Periksa
+                            </option>
+                            <option value="BELUM_PERIKSA">
+                                Belum Periksa
+                            </option>
+                        </select>
+                    </div>
+
+                </div>
+            </section>
+
+
+            {/* ==================================================
+                KPI
+            ================================================== */}
+
+            <div
+                style={
+                    styles.kpiGrid
+                }
+            >
+                <KpiCard
+                    title="Total Location"
+                    value={formatNumber(
+                        analytics
+                            ?.anev
+                            ?.total_locations,
+                    )}
+                />
+
+                <KpiCard
+                    title="Klasifikasi"
+                    value={formatNumber(
+                        analytics
+                            ?.anev
+                            ?.total_classifications,
+                    )}
+                />
+
+                <KpiCard
+                    title="Perulangan Aktif"
+                    value={getSelectedRepeatLabel(
+                        selectedRepeat,
+                    )}
+                    isText
+                />
+
+                <KpiCard
+                    title={
+                        selectedRepeat
+                            ? `Lokasi ${selectedRepeat}x`
+                            : "Total Customer"
+                    }
+                    value={formatNumber(
+                        getFrequencyLocations(
+                            analytics,
+                            selectedRepeat,
+                        ),
+                    )}
+                />
+            </div>
+
+
+            {/* ==================================================
+                LOCATION MAP
+            ================================================== */}
+
+            <section
+                style={styles.card}
+            >
+                <div
+                    style={styles.cardHeader}
+                >
+                    <div>
+                        <h2
+                            style={styles.cardTitle}
+                        >
+                            Peta Lokasi Suspect
+                        </h2>
+
+                        <p
+                            style={styles.cardSubtitle}
+                        >
+                            Koordinat dicocokkan berdasarkan IDPEL. Master lokasi menjadi sumber utama dan data pengecekan menjadi fallback. Titik hijau = sudah periksa, titik merah = belum periksa. Untuk "Semua Bulan", peta menggunakan bulan terbaru agar halaman tetap cepat.
+                        </p>
+                    </div>
+
+                    <div
+                        style={styles.mapStats}
+                    >
+                        <span style={styles.mapProvider}>
+                            Peta interaktif + Google Maps per titik
+                        </span>
+                        <span>
+                            {formatNumber(mapMapped)} terpetakan
+                        </span>
+                        <span>
+                            {formatNumber(mapMatchedIdpel)} IDPEL cocok
+                        </span>
+                        <span>
+                            {formatNumber(Math.max(mapTotal - mapMapped, 0))} tanpa koordinat
+                        </span>
+                    </div>
+                </div>
+
+                {mapError && (
+                    <div
+                        style={styles.mapError}
+                    >
+                        {mapError}
+                    </div>
+                )}
+
+                {mapLoading ? (
+                    <div
+                        style={styles.mapLoading}
+                    >
+                        Mencocokkan koordinat lokasi suspect...
+                    </div>
+                ) : mapPoints.length === 0 ? (
+                    <div
+                        style={styles.empty}
+                    >
+                        Tidak ada lokasi suspect dengan koordinat valid untuk filter ini.
+                    </div>
+                ) : (
+                    <SuspectMap
+                        points={mapPoints}
+                        height={560}
+                    />
+                )}
+            </section>
+
+
+            {/* ==================================================
+                LOADING ANALYTICS
+            ================================================== */}
+
+            {loadingAnalytics ? (
+                <div
+                    style={
+                        styles.loadingCard
+                    }
+                >
+                    Memuat data analytics...
+                </div>
+            ) : (
+                <>
+
+                    {/* ==========================================
+                        FREKUENSI PERULANGAN
+                    ========================================== */}
+
+                    <section
+                        style={
+                            styles.card
+                        }
+                    >
+                        <div
+                            style={
+                                styles.cardHeader
+                            }
+                        >
+                            <div>
+                                <h2
+                                    style={
+                                        styles.cardTitle
+                                    }
+                                >
+                                    Frekuensi Perulangan
+                                </h2>
+                                <p
+                                    style={
+                                        styles.cardSubtitle
+                                    }
+                                >
+                                    Distribusi lokasi berdasarkan jumlah
+                                    kemunculan lintas periode.
+                                </p>
+                            </div>
+
+                            <div
+                                style={
+                                    styles.recordBadge
+                                }
+                            >
+                                {selectedRepeat
+                                    ? `Filter ${selectedRepeat}x aktif`
+                                    : "Semua perulangan"}
+                            </div>
+                        </div>
+
+                        <div
+                            style={
+                                styles.frequencyGrid
+                            }
+                        >
+                            {(analytics?.pasca_repeat?.frequency ?? []).map(
+                                (item) => {
+                                    const repeatCount =
+                                        Number(item.repeat_count);
+                                    const active =
+                                        selectedRepeat !== "" &&
+                                        Number(selectedRepeat) ===
+                                            repeatCount;
+
+                                    return (
+                                        <button
+                                            key={repeatCount}
+                                            type="button"
+                                            onClick={() =>
+                                                setSelectedRepeat(
+                                                    active
+                                                        ? ""
+                                                        : String(
+                                                              repeatCount,
+                                                          ),
+                                                )
+                                            }
+                                            style={{
+                                                ...styles.frequencyItem,
+                                                ...(active
+                                                    ? styles.frequencyItemActive
+                                                    : {}),
+                                            }}
+                                        >
+                                            <span
+                                                style={
+                                                    styles.frequencyLabel
+                                                }
+                                            >
+                                                {getRepeatLabel(
+                                                    repeatCount,
+                                                )}
+                                            </span>
+
+                                            <span
+                                                style={
+                                                    styles.frequencyValue
+                                                }
+                                            >
+                                                {formatNumber(
+                                                    item.locations,
+                                                )}
+                                            </span>
+
+                                            <span
+                                                style={
+                                                    styles.frequencyCaption
+                                                }
+                                            >
+                                                lokasi
+                                            </span>
+                                        </button>
+                                    );
+                                },
+                            )}
+
+                            {(analytics?.pasca_repeat?.frequency ?? []).length ===
+                                0 && (
+                                <div
+                                    style={
+                                        styles.empty
+                                    }
+                                >
+                                    Tidak ada data perulangan.
+                                </div>
+                            )}
+                        </div>
+                    </section>
+
+
+                    {/* ==========================================
+                        REPEAT CLASSIFICATION
+                    ========================================== */}
+
+                    <section
+                        style={
+                            styles.card
+                        }
+                    >
+                        <div
+                            style={
+                                styles.cardHeader
+                            }
+                        >
+                            <div>
+                                <h2
+                                    style={
+                                        styles.cardTitle
+                                    }
+                                >
+                                    Repeat
+                                    berdasarkan
+                                    Classification
+                                </h2>
+
+                                <p
+                                    style={
+                                        styles.cardSubtitle
+                                    }
+                                >
+                                    Klik classification untuk melihat detail.
+                                    {selectedRepeat
+                                        ? ` Filter ${selectedRepeat}x sedang dipilih.`
+                                        : ""}
+                                    {selectedMonth === ALL_MONTHS_KEY
+                                        ? " Detail dibuka setelah memilih bulan tertentu."
+                                        : ""}
+                                </p>
+                            </div>
+
+                            <div
+                                style={
+                                    styles.recordBadge
+                                }
+                            >
+                                {
+                                    classifications.length
+                                }{" "}
+                                classification
+                            </div>
+                        </div>
+
+
+                        {classifications.length ===
+                        0 ? (
+                            <div
+                                style={
+                                    styles.empty
+                                }
+                            >
+                                Tidak ada data
+                                classification.
+                            </div>
+                        ) : (
+                            <div>
+                                {classifications.map(
+                                    (
+                                        item,
+                                        index,
+                                    ) => {
+                                        const active =
+                                            selectedClassification ===
+                                            item.classification;
+
+                                        return (
+                                            <button
+                                                key={
+                                                    item.classification
+                                                }
+                                                type="button"
+                                                onClick={() =>
+                                                    handleSelectClassification(
+                                                        item.classification,
+                                                    )
+                                                }
+                                                style={{
+                                                    ...styles.classificationRow,
+                                                    ...(active
+                                                        ? styles.classificationActive
+                                                        : {}),
+                                                    borderBottom:
+                                                        index ===
+                                                        classifications.length -
+                                                            1
+                                                            ? "none"
+                                                            : "1px solid #2c3b52",
+                                                }}
+                                            >
+                                                <div
+                                                    style={
+                                                        styles.classificationLeft
+                                                    }
+                                                >
+                                                    <span
+                                                        style={
+                                                            styles.classificationRank
+                                                        }
+                                                    >
+                                                        {index +
+                                                            1}
+                                                    </span>
+
+                                                    <span>
+                                                        {
+                                                            item.classification
+                                                        }
+                                                    </span>
+                                                </div>
+
+                                                <div
+                                                    style={
+                                                        styles.classificationStats
+                                                    }
+                                                >
+                                                    <span
+                                                        style={
+                                                            styles.repeatNumber
+                                                        }
+                                                    >
+                                                        {formatNumber(
+                                                            item.repeat_customers,
+                                                        )}
+                                                    </span>
+
+                                                    <span
+                                                        style={
+                                                            styles.repeatText
+                                                        }
+                                                    >
+                                                        repeat
+                                                    </span>
+                                                </div>
+                                            </button>
+                                        );
+                                    },
+                                )}
+                            </div>
+                        )}
+                    </section>
+
+
+                    {/* ==========================================
+                        DETAIL
+                    ========================================== */}
+
+                    {selectedClassification && (
+                        <section
+                            style={
+                                styles.card
+                            }
+                        >
+                            <div
+                                style={
+                                    styles.cardHeader
+                                }
+                            >
+                                <div>
+                                    <h2
+                                        style={
+                                            styles.cardTitle
+                                        }
+                                    >
+                                        Detail{" "}
+                                        {
+                                            selectedClassification
+                                        }
+                                    </h2>
+
+                                    <p
+                                        style={
+                                            styles.cardSubtitle
+                                        }
+                                    >
+                                        Detail
+                                        lokasi
+                                        dan
+                                        parameter
+                                        pengukuran
+                                        untuk
+                                        classification
+                                        yang
+                                        dipilih.
+                                    </p>
+                                </div>
+
+                                <div
+                                    style={
+                                        styles.recordBadge
+                                    }
+                                >
+                                    {formatNumber(
+                                        detail?.total_rows,
+                                    )}{" "}
+                                    records
+                                </div>
+                            </div>
+
+
+                            {loadingDetail ? (
+                                <div
+                                    style={
+                                        styles.empty
+                                    }
+                                >
+                                    Memuat
+                                    detail...
+                                </div>
+                            ) : !detail ||
+                              detail.items
+                                  .length ===
+                                  0 ? (
+                                <div
+                                    style={
+                                        styles.empty
+                                    }
+                                >
+                                    Tidak ada
+                                    detail
+                                    untuk
+                                    classification
+                                    ini.
+                                </div>
+                            ) : (
+                                <>
+                                    <div
+                                        style={
+                                            styles.tableWrapper
+                                        }
+                                    >
+                                        <table
+                                            style={
+                                                styles.table
+                                            }
+                                        >
+                                            <thead>
+                                                <tr>
+                                                    {detailColumns.map(
+                                                        (
+                                                            column,
+                                                        ) => (
+                                                            <th
+                                                                key={
+                                                                    column
+                                                                }
+                                                                style={
+                                                                    styles.th
+                                                                }
+                                                            >
+                                                                {
+                                                                    column
+                                                                }
+                                                            </th>
+                                                        ),
+                                                    )}
+                                                </tr>
+                                            </thead>
+
+                                            <tbody>
+                                                {detail.items.map(
+                                                    (
+                                                        row,
+                                                        rowIndex,
+                                                    ) => (
+                                                        <tr
+                                                            key={
+                                                                `${selectedClassification}-${rowIndex}`
+                                                            }
+                                                            style={
+                                                                styles.tr
+                                                            }
+                                                        >
+                                                            {detailColumns.map(
+                                                                (
+                                                                    column,
+                                                                ) => (
+                                                                    <td
+                                                                        key={
+                                                                            column
+                                                                        }
+                                                                        style={
+                                                                            styles.td
+                                                                        }
+                                                                    >
+                                                                        {normalizeValue(
+                                                                            row[
+                                                                                column
+                                                                            ],
+                                                                        )}
+                                                                    </td>
+                                                                ),
+                                                            )}
+                                                        </tr>
+                                                    ),
+                                                )}
+                                            </tbody>
+                                        </table>
+                                    </div>
+
+
+                                    {/* ==================================
+                                        PAGINATION
+                                    ================================== */}
+
+                                    <div
+                                        style={
+                                            styles.pagination
+                                        }
+                                    >
+                                        <button
+                                            type="button"
+                                            disabled={
+                                                detailPage <=
+                                                    1 ||
+                                                loadingDetail
+                                            }
+                                            onClick={() =>
+                                                setDetailPage(
+                                                    (
+                                                        page,
+                                                    ) =>
+                                                        Math.max(
+                                                            1,
+                                                            page -
+                                                                1,
+                                                        ),
+                                                )
+                                            }
+                                            style={
+                                                styles.pageButton
+                                            }
+                                        >
+                                            ←
+                                            Sebelumnya
+                                        </button>
+
+                                        <span
+                                            style={
+                                                styles.pageInfo
+                                            }
+                                        >
+                                            Halaman{" "}
+                                            {
+                                                detailPage
+                                            }{" "}
+                                            dari{" "}
+                                            {
+                                                detail.total_pages
+                                            }
+                                        </span>
+
+                                        <button
+                                            type="button"
+                                            disabled={
+                                                detailPage >=
+                                                    detail.total_pages ||
+                                                loadingDetail
+                                            }
+                                            onClick={() =>
+                                                setDetailPage(
+                                                    (
+                                                        page,
+                                                    ) =>
+                                                        Math.min(
+                                                            detail.total_pages,
+                                                            page +
+                                                                1,
+                                                        ),
+                                                )
+                                            }
+                                            style={
+                                                styles.pageButton
+                                            }
+                                        >
+                                            Berikutnya
+                                            →
+                                        </button>
+                                    </div>
+                                </>
+                            )}
+                        </section>
+                    )}
+
+                </>
+            )}
+        </div>
+    );
+}
+
+
+// ============================================================
+// KPI CARD
+// ============================================================
+
+function KpiCard({
+    title,
+    value,
+    isText = false,
+}: {
+    title: string;
+    value: string;
+    isText?: boolean;
+}) {
+    return (
+        <div
+            style={
+                styles.kpiCard
+            }
+        >
+            <div
+                style={
+                    styles.kpiLabel
+                }
+            >
+                {title}
+            </div>
+
+            <div
+                style={{
+                    ...styles.kpiValue,
+                    ...(isText
+                        ? styles.kpiValueText
+                        : {}),
+                }}
+            >
+                {value}
+            </div>
+        </div>
+    );
+}
+
+
+// ============================================================
+// STYLES
+//
+// Disamakan dengan visual DLPD:
+// dark page,
+// navy cards,
+// border,
+// blue accent,
+// white content.
+// ============================================================
+
+const styles: Record<
+    string,
+    React.CSSProperties
+> = {
+    page: {
+        minHeight: "100vh",
+        padding: "28px 30px 50px",
+        background: "#07111f",
+        color: "#f8fafc",
+        boxSizing: "border-box",
+    },
+
+    header: {
+        display: "flex",
+        alignItems: "flex-start",
+        justifyContent:
+            "space-between",
+        gap: 24,
+        marginBottom: 24,
+    },
+
+    title: {
+        margin: 0,
+        fontSize: 30,
+        lineHeight: 1.15,
+        fontWeight: 700,
+        color: "#f8fafc",
+    },
+
+    subtitle: {
+        margin: "7px 0 0",
+        color: "#7891b3",
+        fontSize: 15,
+    },
+
+    periodWrapper: {
+        display: "flex",
+        alignItems: "center",
+        gap: 14,
+    },
+
+    periodLabel: {
+        color: "#7891b3",
+        fontSize: 14,
+    },
+
+    select: {
+        minWidth: 180,
+        height: 40,
+        padding: "0 12px",
+        borderRadius: 8,
+        border: "1px solid #d4dbe5",
+        background: "#fff",
+        color: "#111827",
+        fontSize: 14,
+        outline: "none",
+    },
+
+    errorBox: {
+        marginBottom: 18,
+        padding: "13px 16px",
+        borderRadius: 8,
+        border: "1px solid #7f1d1d",
+        background: "#35151b",
+        color: "#ff7777",
+        fontSize: 14,
+    },
+
+    filterCard: {
+        background: "#1b273a",
+        color: "#f8fafc",
+        borderRadius: 12,
+        border: "1px solid #2c3b52",
+        padding: 22,
+        marginBottom: 22,
+    },
+
+    filterHeader: {
+        display: "flex",
+        justifyContent:
+            "space-between",
+        alignItems: "center",
+        marginBottom: 18,
+        gap: 16,
+    },
+
+    filterTitle: {
+        fontSize: 15,
+        fontWeight: 600,
+        color: "#f8fafc",
+    },
+
+    filterSubtitle: {
+        marginTop: 5,
+        fontSize: 13,
+        color: "#7891b3",
+    },
+
+    resetButton: {
+        height: 36,
+        padding: "0 15px",
+        borderRadius: 8,
+        border: "1px solid #40526c",
+        background: "#223149",
+        color: "#e5eefb",
+        cursor: "pointer",
+        fontSize: 13,
+    },
+
+    filterGrid: {
+        display: "grid",
+        gridTemplateColumns:
+            "repeat(2, minmax(0, 1fr))",
+        gap: 16,
+    },
+
+    fieldLabel: {
+        display: "block",
+        marginBottom: 7,
+        color: "#8fb0d8",
+        fontSize: 13,
+    },
+
+    field: {
+        width: "100%",
+        height: 40,
+        padding: "0 12px",
+        borderRadius: 8,
+        border: "1px solid #314158",
+        background: "#172337",
+        color: "#f8fafc",
+        fontSize: 14,
+        boxSizing: "border-box",
+        outline: "none",
+    },
+
+    kpiGrid: {
+        display: "grid",
+        gridTemplateColumns:
+            "repeat(4, minmax(0, 1fr))",
+        gap: 16,
+        marginBottom: 22,
+    },
+
+    kpiCard: {
+        minHeight: 118,
+        padding: "20px 22px",
+        borderRadius: 12,
+        border: "1px solid #2b3b52",
+        background: "#1b273a",
+        boxSizing: "border-box",
+    },
+
+    kpiLabel: {
+        color: "#82a0c8",
+        fontSize: 13,
+        marginBottom: 10,
+    },
+
+    kpiValue: {
+        color: "#fff",
+        fontSize: 31,
+        lineHeight: 1,
+        fontWeight: 700,
+    },
+
+    kpiValueText: {
+        fontSize: 24,
+        lineHeight: 1.1,
+    },
+
+    frequencyGrid: {
+        display: "grid",
+        gridTemplateColumns:
+            "repeat(6, minmax(110px, 1fr))",
+        gap: 10,
+        padding: 16,
+        boxSizing: "border-box",
+    },
+
+    frequencyItem: {
+        minHeight: 82,
+        padding: "12px 14px",
+        borderRadius: 9,
+        border: "1px solid #314158",
+        background: "#172337",
+        color: "#dce9f8",
+        cursor: "pointer",
+        textAlign: "left",
+        display: "flex",
+        flexDirection: "column",
+        justifyContent: "center",
+        gap: 3,
+        boxSizing: "border-box",
+    },
+
+    frequencyItemActive: {
+        background: "#123c63",
+        border: "1px solid #1597ff",
+        boxShadow:
+            "inset 0 0 0 1px rgba(21,151,255,0.25)",
+    },
+
+    frequencyLabel: {
+        fontSize: 13,
+        color: "#8fb0d8",
+        fontWeight: 600,
+    },
+
+    frequencyValue: {
+        fontSize: 22,
+        lineHeight: 1.1,
+        color: "#ffffff",
+        fontWeight: 700,
+    },
+
+    frequencyCaption: {
+        fontSize: 11,
+        color: "#7089ad",
+    },
+
+    card: {
+        background: "#1b273a",
+        border: "1px solid #2c3b52",
+        borderRadius: 12,
+        overflow: "hidden",
+        marginBottom: 22,
+    },
+
+    cardHeader: {
+        minHeight: 70,
+        padding: "17px 20px",
+        display: "flex",
+        alignItems: "center",
+        justifyContent:
+            "space-between",
+        gap: 20,
+        borderBottom:
+            "1px solid #2c3b52",
+        boxSizing: "border-box",
+    },
+
+    cardTitle: {
+        margin: 0,
+        fontSize: 17,
+        fontWeight: 600,
+        color: "#f8fafc",
+    },
+
+    cardSubtitle: {
+        margin: "5px 0 0",
+        color: "#7f9ac0",
+        fontSize: 13,
+    },
+
+    recordBadge: {
+        flexShrink: 0,
+        color: "#9ab2d3",
+        fontSize: 13,
+    },
+
+    classificationRow: {
+        width: "100%",
+        minHeight: 64,
+        padding: "0 20px",
+        display: "flex",
+        alignItems: "center",
+        justifyContent:
+            "space-between",
+        gap: 20,
+        background: "transparent",
+        color: "#cfe0f8",
+        border: 0,
+        cursor: "pointer",
+        textAlign: "left",
+        boxSizing: "border-box",
+        fontSize: 14,
+        transition:
+            "background 0.15s ease",
+    },
+
+    classificationActive: {
+        background: "#22344e",
+        color: "#ffffff",
+        boxShadow:
+            "inset 3px 0 0 #1597ff",
+    },
+
+    classificationLeft: {
+        display: "flex",
+        alignItems: "center",
+        gap: 14,
+        minWidth: 0,
+    },
+
+    classificationRank: {
+        width: 28,
+        height: 28,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        borderRadius: 6,
+        background: "#24354c",
+        color: "#8fb1db",
+        fontSize: 12,
+        flexShrink: 0,
+    },
+
+    classificationStats: {
+        display: "flex",
+        alignItems: "baseline",
+        gap: 6,
+        flexShrink: 0,
+    },
+
+    repeatNumber: {
+        color: "#ffffff",
+        fontSize: 15,
+        fontWeight: 700,
+    },
+
+    repeatText: {
+        color: "#7794bb",
+        fontSize: 12,
+    },
+    
+
+    tableWrapper: {
+        width: "100%",
+        overflowX: "auto",
+        overflowY: "hidden",
+        background: "#172337",
+    },
+
+    table: {
+        width: "max-content",
+        minWidth: "100%",
+        borderCollapse:
+            "collapse",
+        fontSize: 12,
+        color: "#c9d8eb",
+    },
+
+    th: {
+        position: "sticky",
+        top: 0,
+        padding: "12px 14px",
+        background: "#101b2d",
+        color: "#8eacd1",
+        borderBottom:
+            "1px solid #33445c",
+        borderRight:
+            "1px solid #26364c",
+        whiteSpace: "nowrap",
+        textAlign: "left",
+        fontWeight: 600,
+    },
+
+    td: {
+        padding: "11px 14px",
+        borderBottom:
+            "1px solid #26364c",
+        borderRight:
+            "1px solid #26364c",
+        whiteSpace: "nowrap",
+        maxWidth: 260,
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+    },
+
+    tr: {
+        background: "#172337",
+    },
+
+    pagination: {
+        display: "flex",
+        justifyContent:
+            "space-between",
+        alignItems: "center",
+        gap: 15,
+        padding: "15px 20px",
+        borderTop:
+            "1px solid #2c3b52",
+    },
+
+    pageButton: {
+        height: 36,
+        padding: "0 14px",
+        borderRadius: 7,
+        border: "1px solid #40526c",
+        background: "#223149",
+        color: "#d9e7f8",
+        cursor: "pointer",
+        fontSize: 13,
+    },
+
+    pageInfo: {
+        color: "#829bbd",
+        fontSize: 13,
+    },
+
+    mapProvider: {
+        color: "#5da9e9",
+        fontSize: 12,
+        fontWeight: 600,
+    },
+
+    mapStats: {
+        display: "flex",
+        alignItems: "center",
+        gap: 12,
+        flexWrap: "wrap",
+        justifyContent: "flex-end",
+        color: "#8fa8c9",
+        fontSize: 12,
+    },
+
+    mapError: {
+        padding: "12px 18px",
+        borderBottom: "1px solid #2c3b52",
+        background: "#281720",
+        color: "#ff8b8b",
+        fontSize: 13,
+    },
+
+    mapLoading: {
+        minHeight: 180,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        background: "#101b2d",
+        color: "#829bbd",
+        fontSize: 14,
+    },
+
+    empty: {
+        minHeight: 150,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        color: "#7891b3",
+        fontSize: 14,
+        padding: 20,
+        boxSizing: "border-box",
+    },
+
+    loadingBox: {
+        padding: 30,
+        color: "#9ab2d3",
+    },
+
+    loadingCard: {
+        minHeight: 180,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        background: "#1b273a",
+        border:
+            "1px solid #2c3b52",
+        borderRadius: 12,
+        color: "#829bbd",
+    },
+};

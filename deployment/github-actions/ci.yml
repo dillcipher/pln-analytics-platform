@@ -1,0 +1,67 @@
+# Copy this file to .github/workflows/ci.yml at the repo root to activate it.
+#
+# Runs on every push: backend unit tests (fake repos — no DuckDB needed),
+# ETL smoke test against generated sample data, and a frontend type-check
+# + build. Keep this green before merging.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install backend dependencies
+        run: pip install -r backend/requirements.txt
+      - name: Run use-case tests (fake repositories)
+        run: python tests/backend/test_use_cases.py
+      - name: Run category sync check
+        run: python tests/backend/test_category_sync.py
+      - name: Run API tests
+        run: pytest tests/backend/test_api.py -v
+
+  etl-smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ETL dependencies
+        run: pip install pandas openpyxl pyarrow numpy
+      - name: Generate sample data
+        run: python -m etl.generate_sample_data --output-dir data/raw --months 202607
+      - name: Run ETL
+        run: python -m etl.run_etl --input-dir data/raw --output-dir data/processed
+      - name: Run DuckDB repository integration tests
+        run: |
+          pip install duckdb
+          python -m tests.backend.test_duckdb_repositories
+
+  frontend-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install dependencies
+        run: npm install
+      - name: Type-check
+        run: npx tsc -b --noEmit
+      - name: Build
+        run: npm run build

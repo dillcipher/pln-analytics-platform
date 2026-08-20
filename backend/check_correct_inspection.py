@@ -1,0 +1,30 @@
+﻿from app.infrastructure.duckdb.connection import get_connection
+
+c = get_connection()
+
+q = """
+SELECT
+    CASE
+        WHEN p.IDPEL IS NOT NULL THEN 'SUDAH_PERIKSA'
+        ELSE 'BELUM_PERIKSA'
+    END AS STATUS,
+    COUNT(DISTINCT a.LOCATION_CODE) AS JUMLAH
+FROM fact_anev a
+LEFT JOIN (
+    SELECT DISTINCT
+        TRIM(CAST(IDPEL AS VARCHAR)) AS IDPEL
+    FROM fact_pengecekan
+    WHERE WAKTU_PERIKSA >= TIMESTAMP '2026-06-01 00:00:00'
+      AND WAKTU_PERIKSA <  TIMESTAMP '2026-07-01 00:00:00'
+      AND IDPEL IS NOT NULL
+) p
+    ON TRIM(CAST(a.LOCATION_CODE AS VARCHAR)) = p.IDPEL
+WHERE CAST(a.MONTH AS VARCHAR) = '202606'
+  AND a.LOCATION_CODE IS NOT NULL
+GROUP BY STATUS
+ORDER BY STATUS
+"""
+
+print(c.execute(q).fetchall())
+
+c.close()

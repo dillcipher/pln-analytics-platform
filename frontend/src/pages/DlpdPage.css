@@ -1,0 +1,187 @@
+.dlpd-page{
+
+    display:flex;
+
+    flex-direction:column;
+
+    gap:24px;
+
+}
+
+.page-header{
+
+    display:flex;
+
+    justify-content:space-between;
+
+    align-items:center;
+
+}
+
+.page-header h1{
+
+    margin:0;
+
+    font-size:28px;
+
+    font-weight:700;
+
+    color:#f8fafc;
+
+}
+
+.page-header p{
+
+    margin-top:6px;
+
+    color:#94a3b8;
+
+    font-size:14px;
+
+}
+
+.toolbar{
+
+    display:flex;
+
+    justify-content:space-between;
+
+    align-items:center;
+
+}
+
+.period-context{color:#94a3b8;font-size:12px}.period-context strong{color:#e2e8f0}.radio-group{
+
+    display:flex;
+
+    gap:24px;
+
+}
+
+.radio-group label{
+
+    display:flex;
+
+    align-items:center;
+
+    gap:8px;
+
+    color:#cbd5e1;
+
+    font-size:14px;
+
+}
+
+.kpi-grid{
+
+    display:grid;
+
+    grid-template-columns:repeat(4,1fr);
+
+    gap:18px;
+
+}
+
+.kpi-card{
+
+    background:#1e293b;
+
+    border:1px solid #334155;
+
+    border-radius:10px;
+
+    padding:18px;
+
+}
+
+.kpi-card span{
+
+    font-size:13px;
+
+    color:#94a3b8;
+
+}
+
+.kpi-card h2{
+
+    margin-top:10px;
+
+    margin-bottom:0;
+
+    font-size:30px;
+
+    color:white;
+
+}
+
+.filter-bar{
+
+    display:flex;
+
+    gap:16px;
+
+}
+
+.filter-bar select{
+
+    width:240px;
+
+    background:#1e293b;
+
+    color:white;
+
+    border:1px solid #334155;
+
+    border-radius:8px;
+
+    padding:10px 14px;
+
+}
+
+.content-grid{
+
+    display:grid;
+
+    grid-template-columns:1.2fr 1fr;
+
+    gap:18px;
+
+}
+
+.panel{
+
+    background:#1e293b;
+
+    border:1px solid #334155;
+
+    border-radius:10px;
+
+    overflow:hidden;
+
+}
+
+.panel-header{
+
+    padding:14px 18px;
+
+    border-bottom:1px solid #334155;
+
+    font-weight:600;
+
+    color:white;
+
+}
+
+.panel-body{
+
+    padding:20px;
+
+    min-height:240px;
+
+    color:#94a3b8;
+
+}
+
+
+
+.filter-bar{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}.filter-bar select{width:100%;min-width:0}.month-filter{font-weight:600}@media(max-width:1200px){.filter-bar{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:700px){.filter-bar{grid-template-columns:1fr}}

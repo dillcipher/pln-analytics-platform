@@ -1,0 +1,630 @@
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
+
+from app.application.dto.executive_dto import MonthOptionResponse
+from app.application.dto.suspect_dto import (
+    SuspectDetailResponse,
+    SuspectDetailTrendResponse,
+    SuspectMainResponse,
+    SuspectSummaryResponse,
+)
+from app.application.use_cases.suspect_use_cases import (
+    GetSuspectAnalytics,
+    GetSuspectDetail,
+    GetSuspectDetailTrend,
+    GetSuspectMain,
+    GetSuspectMonths,
+)
+from app.core.config import get_settings
+from app.core.suspect_categories import SUSPECT_CATEGORIES
+from app.infrastructure.auth.user_store import AuthenticatedUser
+from app.infrastructure.duckdb.suspect_repository import (
+    DuckDbSuspectRepository,
+)
+from app.interface.api.deps import (
+    get_current_user,
+    get_suspect_repository,
+)
+from app.interface.api.export_utils import (
+    build_export_filename,
+    rows_to_csv_bytes,
+    rows_to_xlsx_bytes,
+)
+
+
+router = APIRouter(
+    prefix="/suspect",
+    tags=["suspect-analytics"],
+)
+
+
+# ==========================================================
+# MONTHS
+# ==========================================================
+
+
+@router.get(
+    "/months",
+    response_model=list[MonthOptionResponse],
+)
+def get_months(
+    repo: DuckDbSuspectRepository = Depends(
+        get_suspect_repository,
+    ),
+    _: AuthenticatedUser = Depends(
+        get_current_user,
+    ),
+) -> list[MonthOptionResponse]:
+
+    months = GetSuspectMonths(
+        repo,
+    ).execute()
+
+    return [
+        MonthOptionResponse(
+            month_key=month.month_key,
+            label=month.label,
+        )
+        for month in months
+    ]
+
+
+# ==========================================================
+# MAIN PAGE
+# ==========================================================
+
+
+@router.get(
+    "/main",
+    response_model=SuspectMainResponse,
+)
+def get_main(
+    month: str,
+    search: str | None = None,
+    page: int = Query(
+        1,
+        ge=1,
+    ),
+    page_size: int | None = None,
+    repo: DuckDbSuspectRepository = Depends(
+        get_suspect_repository,
+    ),
+    _: AuthenticatedUser = Depends(
+        get_current_user,
+    ),
+) -> SuspectMainResponse:
+
+    settings = get_settings()
+
+    result = GetSuspectMain(
+        repo,
+    ).execute(
+        month,
+        page,
+        page_size or settings.DEFAULT_PAGE_SIZE,
+        search,
+    )
+
+    return SuspectMainResponse(
+        items=result.items,
+        total_rows=result.total_rows,
+        page=result.page,
+        page_size=result.page_size,
+        total_pages=result.total_pages,
+    )
+
+
+# ==========================================================
+# SUMMARY / ANEV
+# ==========================================================
+
+
+@router.get(
+    "/summary",
+    response_model=SuspectSummaryResponse,
+)
+def get_summary(
+    month: str,
+    unitupi: str | None = None,
+    unitap: str | None = None,
+    unitup: str | None = None,
+    tariff: str | None = None,
+    search_customer: str | None = None,
+    repo: DuckDbSuspectRepository = Depends(
+        get_suspect_repository,
+    ),
+    _: AuthenticatedUser = Depends(
+        get_current_user,
+    ),
+) -> SuspectSummaryResponse:
+    """
+    Return Suspect / ANEV summary.
+
+    IMPORTANT:
+
+    This endpoint now reads directly from fact_anev.
+
+    Business rule:
+
+        PRA / ANEV
+        = selected month only.
+
+    LOCATIONCODE is counted distinctly so multiple
+    raw ANEV measurement rows for the same location
+    do not inflate the location count.
+    """
+
+    filters = {
+        "unitupi": unitupi,
+        "unitap": unitap,
+        "unitup": unitup,
+        "tariff": tariff,
+        "search_customer": search_customer,
+    }
+
+    data = repo.get_anev_summary(
+        month_key=month,
+        filters=filters,
+    )
+
+    # ------------------------------------------------------
+    # SuspectSummaryResponse tetap menggunakan "items".
+    #
+    # Kita isi dengan classification agar frontend lama
+    # tetap bisa menggunakan endpoint /summary.
+    # ------------------------------------------------------
+
+    items = data.get(
+        "classification",
+        [],
+    )
+
+    return SuspectSummaryResponse(
+        items=items,
+        categories=list(
+            SUSPECT_CATEGORIES,
+        ),
+        total_rows=len(items),
+    )
+
+
+# ==========================================================
+# SUMMARY EXPORT
+# ==========================================================
+
+
+@router.get(
+    "/summary/export/{fmt}",
+)
+def export_summary(
+    fmt: str,
+    month: str,
+    unitupi: str | None = None,
+    unitap: str | None = None,
+    unitup: str | None = None,
+    tariff: str | None = None,
+    search_customer: str | None = None,
+    repo: DuckDbSuspectRepository = Depends(
+        get_suspect_repository,
+    ),
+    _: AuthenticatedUser = Depends(
+        get_current_user,
+    ),
+) -> StreamingResponse:
+
+    if fmt not in (
+        "csv",
+        "xlsx",
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="fmt must be 'csv' or 'xlsx'",
+        )
+
+    filters = {
+        "unitupi": unitupi,
+        "unitap": unitap,
+        "unitup": unitup,
+        "tariff": tariff,
+        "search_customer": search_customer,
+    }
+
+    data = repo.get_anev_summary(
+        month_key=month,
+        filters=filters,
+    )
+
+    rows = data.get(
+        "classification",
+        [],
+    )
+
+    filename = build_export_filename(
+        "suspect_summary",
+        month,
+        fmt,
+    )
+
+    if fmt == "csv":
+
+        content = rows_to_csv_bytes(
+            rows,
+        )
+
+        media_type = "text/csv"
+
+    else:
+
+        content = rows_to_xlsx_bytes(
+            rows,
+            "Suspect Summary",
+        )
+
+        media_type = (
+            "application/vnd.openxmlformats-officedocument"
+            ".spreadsheetml.sheet"
+        )
+
+    return StreamingResponse(
+        iter([content]),
+        media_type=media_type,
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{filename}"'
+            ),
+        },
+    )
+
+
+# ==========================================================
+# DETAIL PAGE
+# ==========================================================
+
+
+@router.get(
+    "/detail",
+    response_model=SuspectDetailResponse,
+)
+def get_detail(
+    month: str,
+    unitupi: str | None = None,
+    unitap: str | None = None,
+    unitup: str | None = None,
+    tariff: str | None = None,
+    suspect_name: str | None = None,
+    location_code: str | None = None,
+    search_customer: str | None = None,
+    inspection_status: str | None = Query(
+        None,
+        description="PERIKSA or BELUM",
+    ),
+    page: int = Query(
+        1,
+        ge=1,
+    ),
+    page_size: int | None = None,
+    repo: DuckDbSuspectRepository = Depends(
+        get_suspect_repository,
+    ),
+    _: AuthenticatedUser = Depends(
+        get_current_user,
+    ),
+) -> SuspectDetailResponse:
+
+    settings = get_settings()
+
+    filters = {
+        "unitupi": unitupi,
+        "unitap": unitap,
+        "unitup": unitup,
+        "tariff": tariff,
+        "suspect_name": suspect_name,
+        "location_code": location_code,
+        "search_customer": search_customer,
+        "inspection_status": inspection_status,
+    }
+
+    result = GetSuspectDetail(
+        repo,
+    ).execute(
+        month,
+        filters,
+        page,
+        page_size or settings.DEFAULT_PAGE_SIZE,
+    )
+
+    return SuspectDetailResponse(
+        items=result.items,
+        total_rows=result.total_rows,
+        page=result.page,
+        page_size=result.page_size,
+        total_pages=result.total_pages,
+    )
+
+
+# ==========================================================
+# DETAIL TREND
+# ==========================================================
+
+
+@router.get(
+    "/detail/trend",
+    response_model=SuspectDetailTrendResponse,
+)
+def get_detail_trend(
+    month: str,
+    location_code: str,
+    repo: DuckDbSuspectRepository = Depends(
+        get_suspect_repository,
+    ),
+    _: AuthenticatedUser = Depends(
+        get_current_user,
+    ),
+) -> SuspectDetailTrendResponse:
+
+    data = GetSuspectDetailTrend(
+        repo,
+    ).execute(
+        month,
+        location_code,
+    )
+
+    return SuspectDetailTrendResponse(
+        **data,
+    )
+
+
+# ==========================================================
+# DETAIL EXPORT
+# ==========================================================
+
+
+@router.get(
+    "/detail/export/{fmt}",
+)
+def export_detail(
+    fmt: str,
+    month: str,
+    unitupi: str | None = None,
+    unitap: str | None = None,
+    unitup: str | None = None,
+    tariff: str | None = None,
+    suspect_name: str | None = None,
+    location_code: str | None = None,
+    search_customer: str | None = None,
+    repo: DuckDbSuspectRepository = Depends(
+        get_suspect_repository,
+    ),
+    _: AuthenticatedUser = Depends(
+        get_current_user,
+    ),
+) -> StreamingResponse:
+
+    if fmt not in (
+        "csv",
+        "xlsx",
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="fmt must be 'csv' or 'xlsx'",
+        )
+
+    filters = {
+        "unitupi": unitupi,
+        "unitap": unitap,
+        "unitup": unitup,
+        "tariff": tariff,
+        "suspect_name": suspect_name,
+        "location_code": location_code,
+        "search_customer": search_customer,
+    }
+
+    result = GetSuspectDetail(
+        repo,
+    ).execute(
+        month,
+        filters,
+        page=1,
+        page_size=1_000_000,
+    )
+
+    filename = build_export_filename(
+        "suspect_detail",
+        month,
+        fmt,
+    )
+
+    if fmt == "csv":
+
+        content = rows_to_csv_bytes(
+            result.items,
+        )
+
+        media_type = "text/csv"
+
+    else:
+
+        content = rows_to_xlsx_bytes(
+            result.items,
+            "Suspect Detail",
+        )
+
+        media_type = (
+            "application/vnd.openxmlformats-officedocument"
+            ".spreadsheetml.sheet"
+        )
+
+    return StreamingResponse(
+        iter([content]),
+        media_type=media_type,
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{filename}"'
+            ),
+        },
+    )
+
+
+# ==========================================================
+# SUSPECT MAP
+# ==========================================================
+
+
+@router.get(
+    "/map",
+)
+def get_map(
+    month: str,
+    unitupi: str | None = None,
+    unitap: str | None = None,
+    unitup: str | None = None,
+    tariff: str | None = None,
+    suspect_name: str | None = None,
+    repeat_count: int | None = Query(
+        None,
+        ge=1,
+    ),
+    inspection_status: str | None = Query(
+        None,
+        description="PERIKSA or BELUM",
+    ),
+    search: str | None = None,
+    limit: int = Query(
+        100_000,
+        ge=1,
+        le=100_000,
+    ),
+    repo: DuckDbSuspectRepository = Depends(
+        get_suspect_repository,
+    ),
+    _: AuthenticatedUser = Depends(
+        get_current_user,
+    ),
+) -> dict:
+    """
+    Return Suspect locations with matched coordinates.
+
+    Coordinate source:
+        fact_customer_location
+
+    Match key:
+        IDPEL
+
+    Map filters follow the Suspect Analytics page:
+        month, unit hierarchy, tariff, suspect classification,
+        and repeat count.
+    """
+
+    data = repo.get_map_points(
+        month_key=month,
+        search=search,
+        unitupi=unitupi,
+        unitap=unitap,
+        unitup=unitup,
+        tariff=tariff,
+        suspect_name=suspect_name,
+        repeat_count=repeat_count,
+        inspection_status=inspection_status,
+        limit=limit,
+    )
+
+    return {
+        "success": True,
+        "month": month,
+        "data": data,
+    }
+
+
+# ==========================================================
+# ANALYTICS
+# ==========================================================
+
+
+@router.get(
+    "/analytics",
+)
+def get_analytics(
+    month: str,
+    unitupi: str | None = None,
+    unitap: str | None = None,
+    unitup: str | None = None,
+    tariff: str | None = None,
+    search_customer: str | None = None,
+    repo: DuckDbSuspectRepository = Depends(
+        get_suspect_repository,
+    ),
+    _: AuthenticatedUser = Depends(
+        get_current_user,
+    ),
+) -> dict:
+    """
+    Return complete analytical data for Suspect Analytics.
+
+    PRA / ANEV:
+        selected month only.
+
+    PASCA:
+        repeated LOCATIONCODE across months up to
+        the selected month.
+    """
+
+    filters = {
+        "unitupi": unitupi,
+        "unitap": unitap,
+        "unitup": unitup,
+        "tariff": tariff,
+        "search_customer": search_customer,
+    }
+
+    # ------------------------------------------------------
+    # ANEV / PRA
+    # ------------------------------------------------------
+
+    anev = repo.get_anev_summary(
+        month_key=month,
+        filters=filters,
+    )
+
+    # ------------------------------------------------------
+    # PASCA / REPEAT
+    # ------------------------------------------------------
+
+    repeat = repo.get_repeat_summary(
+        month_key=month,
+    )
+
+    # ------------------------------------------------------
+    # CLASSIFICATION
+    # ------------------------------------------------------
+
+    classification = repo.get_classification_summary(
+        month_key=month,
+        filters=filters,
+    )
+
+    return {
+        "success": True,
+        "month": month,
+        "data": {
+            "anev": anev,
+            "pra_monthly": anev,
+            "classification": classification,
+            "pasca_repeat": repeat,
+            "repeat_cases": [
+                {
+                    "label": str(
+                        item["repeat_customers"]
+                    ),
+                    "value": item[
+                        "repeat_occurrences"
+                    ],
+                }
+                for item in repeat.get(
+                    "by_suspect",
+                    [],
+                )
+            ],
+        },
+    }
