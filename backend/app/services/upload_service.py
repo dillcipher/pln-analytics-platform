@@ -24,33 +24,27 @@ CHUNK_SIZE = 20 * 1024 * 1024
 
 class UploadService:
     """
-    Upload Engine.
+    Upload service.
 
-    Small file:
-        Upload
-            ↓
-        Save
-            ↓
-        Inspect
-            ↓
-        Finalize
+    SMALL FILE
+        upload
+        -> inspect
+        -> manifest
 
-    Large file:
-        Upload Chunk 1..N
-            ↓
-        /complete
-            ↓
-        Create Job
-            ↓
-        Return Immediately
-            ↓
-        Background Assembly
-            ↓
-        Inspect
-            ↓
-        Finalize / manifest.json
-            ↓
-        ETL
+    LARGE FILE
+        chunk 1..N
+        -> /complete
+        -> return immediately
+        -> background assembly
+        -> lightweight filename detection
+        -> manifest
+        -> ETL
+
+    IMPORTANT:
+    Large chunked upload MUST NOT call MonthResolver or
+    DatasetValidator during assembly.
+
+    Those operations may read a 700+ MB Excel file.
     """
 
     COORDINATE_MASTER_FILES = {
@@ -66,11 +60,23 @@ class UploadService:
     def _normalize_filename(
         filename: str,
     ) -> str:
-        name = filename.lower().strip()
-        name = name.replace("-", "_").replace(" ", "_")
+        name = (
+            filename
+            .lower()
+            .strip()
+        )
+
+        name = (
+            name
+            .replace("-", "_")
+            .replace(" ", "_")
+        )
 
         while "__" in name:
-            name = name.replace("__", "_")
+            name = name.replace(
+                "__",
+                "_",
+            )
 
         return name
 
@@ -80,7 +86,9 @@ class UploadService:
         filename: str,
     ) -> bool:
         return (
-            cls._normalize_filename(filename)
+            cls._normalize_filename(
+                filename,
+            )
             in cls.COORDINATE_MASTER_FILES
         )
 
@@ -88,7 +96,10 @@ class UploadService:
     def _safe_filename(
         filename: str | None,
     ) -> str:
-        original = filename or "uploaded_file"
+        original = (
+            filename
+            or "uploaded_file"
+        )
 
         safe = (
             original
@@ -102,7 +113,25 @@ class UploadService:
         return safe
 
     # ==========================================================
-    # INSPECT FILE
+    # JOB ID
+    # ==========================================================
+
+    @staticmethod
+    def _new_job_id() -> str:
+        return (
+            datetime.now().strftime(
+                "JOB_%Y%m%d_%H%M%S",
+            )
+            + "_"
+            + uuid.uuid4().hex[:8]
+        )
+
+    # ==========================================================
+    # NORMAL FILE INSPECTION
+    #
+    # Small files ONLY.
+    #
+    # Large chunked files must NOT use this during assembly.
     # ==========================================================
 
     @classmethod
@@ -127,24 +156,25 @@ class UploadService:
             )
 
             if dataset == FileDetector.UNKNOWN:
-
                 validation = {
                     "status": "FAILED",
                     "missing_columns": [],
                     "error": (
-                        "Unable to detect dataset from filename."
+                        "Unable to detect dataset "
+                        "from filename."
                     ),
                 }
 
             else:
-
                 month = MonthResolver.resolve(
                     destination,
                 )
 
-                validation = DatasetValidator.validate(
-                    destination,
-                    dataset,
+                validation = (
+                    DatasetValidator.validate(
+                        destination,
+                        dataset,
+                    )
                 )
 
             print(
@@ -169,7 +199,6 @@ class UploadService:
                 )
 
         except Exception as exc:
-
             traceback.print_exc()
 
             dataset = None
@@ -188,16 +217,12 @@ class UploadService:
         )
 
         if is_coordinate_master:
-
-            print(
-                "✓ Coordinate Master :",
-                filename,
-            )
-
             month = None
 
             if dataset == FileDetector.UNKNOWN:
-                dataset = FileDetector.CUSTOMER_LOCATION
+                dataset = (
+                    FileDetector.CUSTOMER_LOCATION
+                )
 
         return {
             "filename": filename,
@@ -226,18 +251,13 @@ class UploadService:
     async def save_files(
         cls,
         files: list[UploadFile],
-    ):
+    ) -> dict:
 
         print("=" * 80)
         print("UPLOAD START")
+        print("=" * 80)
 
-        job_id = (
-            datetime.now().strftime(
-                "JOB_%Y%m%d_%H%M%S",
-            )
-            + "_"
-            + uuid.uuid4().hex[:8]
-        )
+        job_id = cls._new_job_id()
 
         job_folder = (
             UPLOAD_FOLDER
@@ -252,12 +272,6 @@ class UploadService:
         uploaded: list[dict] = []
 
         for file in files:
-
-            print()
-            print(
-                f"Processing : {file.filename}"
-            )
-
             original_filename = (
                 file.filename
                 or "uploaded_file"
@@ -274,27 +288,30 @@ class UploadService:
                 / safe_filename
             )
 
+            print(
+                "Processing :",
+                original_filename,
+            )
+
             async with aiofiles.open(
                 destination,
                 "wb",
-            ) as out:
+            ) as output:
 
                 while True:
-
-                    chunk = await file.read(
+                    data = await file.read(
                         1024 * 1024,
                     )
 
-                    if not chunk:
+                    if not data:
                         break
 
-                    await out.write(
-                        chunk,
+                    await output.write(
+                        data,
                     )
 
-            print("✓ Saved")
             print(
-                "✓ File Path :",
+                "✓ Saved :",
                 destination,
             )
 
@@ -304,9 +321,9 @@ class UploadService:
                 content_type=file.content_type,
             )
 
-            metadata["original_filename"] = (
-                original_filename
-            )
+            metadata[
+                "original_filename"
+            ] = original_filename
 
             uploaded.append(
                 metadata,
@@ -344,7 +361,8 @@ class UploadService:
 
         if chunk_number >= total_chunks:
             raise ValueError(
-                "chunk_number must be smaller than total_chunks",
+                "chunk_number must be smaller "
+                "than total_chunks",
             )
 
         safe_filename = cls._safe_filename(
@@ -372,10 +390,9 @@ class UploadService:
         async with aiofiles.open(
             chunk_path,
             "wb",
-        ) as out:
+        ) as output:
 
             while True:
-
                 data = await file.read(
                     1024 * 1024,
                 )
@@ -385,7 +402,7 @@ class UploadService:
 
                 received += len(data)
 
-                await out.write(
+                await output.write(
                     data,
                 )
 
@@ -409,11 +426,17 @@ class UploadService:
         }
 
     # ==========================================================
-    # PREPARE COMPLETE
+    # PREPARE CHUNK UPLOAD
     #
-    # TIDAK assemble di sini.
+    # IMPORTANT:
+    # This is intentionally FAST.
     #
-    # Endpoint /complete harus cepat return.
+    # It ONLY:
+    # - verifies chunks
+    # - creates job folder
+    # - writes chunk_upload.json
+    #
+    # NO ASSEMBLY.
     # ==========================================================
 
     @classmethod
@@ -445,14 +468,11 @@ class UploadService:
                 f"Upload '{upload_id}' not found.",
             )
 
-        # ======================================================
-        # VERIFY CHUNKS
-        # ======================================================
-
         missing_chunks: list[int] = []
 
-        for index in range(total_chunks):
-
+        for index in range(
+            total_chunks,
+        ):
             chunk_path = (
                 chunks_folder
                 / f"{index:08d}.part"
@@ -464,7 +484,6 @@ class UploadService:
                 )
 
         if missing_chunks:
-
             raise ValueError(
                 "Missing chunks: "
                 + ", ".join(
@@ -475,17 +494,7 @@ class UploadService:
                 )
             )
 
-        # ======================================================
-        # CREATE JOB
-        # ======================================================
-
-        job_id = (
-            datetime.now().strftime(
-                "JOB_%Y%m%d_%H%M%S",
-            )
-            + "_"
-            + uuid.uuid4().hex[:8]
-        )
+        job_id = cls._new_job_id()
 
         job_folder = (
             UPLOAD_FOLDER
@@ -497,10 +506,6 @@ class UploadService:
             exist_ok=True,
         )
 
-        # ======================================================
-        # SAVE ASSEMBLY METADATA
-        # ======================================================
-
         upload_metadata = {
             "upload_id": upload_id,
             "filename": safe_filename,
@@ -508,7 +513,9 @@ class UploadService:
             "total_chunks": total_chunks,
             "content_type": content_type,
             "job_id": job_id,
-            "created_at": datetime.now().isoformat(),
+            "created_at": (
+                datetime.now().isoformat()
+            ),
         }
 
         metadata_path = (
@@ -520,9 +527,9 @@ class UploadService:
             metadata_path,
             "w",
             encoding="utf-8",
-        ) as f:
+        ) as output:
 
-            await f.write(
+            await output.write(
                 json.dumps(
                     upload_metadata,
                     indent=4,
@@ -535,20 +542,24 @@ class UploadService:
         print("Job ID       :", job_id)
         print("Filename     :", safe_filename)
         print("Total chunks :", total_chunks)
-        print("Assembly queued")
+        print("Assembly     : QUEUED")
         print("=" * 80)
 
         return {
             "success": True,
             "job_id": job_id,
-            "uploaded_at": datetime.now().isoformat(),
+            "uploaded_at": (
+                datetime.now().isoformat()
+            ),
             "total_files": 1,
             "files": [],
             "status": "ASSEMBLY_QUEUED",
         }
 
     # ==========================================================
-    # COMPLETE CHUNKED UPLOAD
+    # COMPLETE
+    #
+    # Alias retained for compatibility.
     # ==========================================================
 
     @classmethod
@@ -570,15 +581,20 @@ class UploadService:
     # ==========================================================
     # BACKGROUND ASSEMBLY
     #
-    # IMPORTANT:
+    # CRITICAL:
     #
-    # Fungsi ini HARUS return hanya setelah:
+    # DO NOT:
     #
-    # 1. XLSX selesai dirakit
-    # 2. Inspect selesai
-    # 3. manifest.json selesai dibuat
+    # MonthResolver.resolve()
+    # DatasetValidator.validate()
+    # pandas.read_excel()
     #
-    # Setelah itu router baru boleh menjalankan ETL.
+    # here.
+    #
+    # The 746 MB Excel file must ONLY be copied together.
+    # Dataset detection is filename based.
+    #
+    # Manifest is created immediately afterward.
     # ==========================================================
 
     @classmethod
@@ -612,7 +628,6 @@ class UploadService:
         )
 
         try:
-
             print("=" * 80)
             print("BACKGROUND CHUNK ASSEMBLY START")
             print("Upload ID :", upload_id)
@@ -622,12 +637,24 @@ class UploadService:
             print("Target    :", destination)
             print("=" * 80)
 
-            # ==================================================
+            if not chunks_folder.exists():
+                raise FileNotFoundError(
+                    f"Chunk folder not found: "
+                    f"{chunks_folder}",
+                )
+
+            job_folder.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            # --------------------------------------------------
             # VERIFY CHUNKS
-            # ==================================================
+            # --------------------------------------------------
 
-            for index in range(total_chunks):
-
+            for index in range(
+                total_chunks,
+            ):
                 chunk_path = (
                     chunks_folder
                     / f"{index:08d}.part"
@@ -638,17 +665,18 @@ class UploadService:
                         f"Missing chunk {index}",
                     )
 
-            # ==================================================
+            # --------------------------------------------------
             # ASSEMBLE
-            # ==================================================
+            # --------------------------------------------------
 
             async with aiofiles.open(
                 destination,
                 "wb",
             ) as output:
 
-                for index in range(total_chunks):
-
+                for index in range(
+                    total_chunks,
+                ):
                     chunk_path = (
                         chunks_folder
                         / f"{index:08d}.part"
@@ -660,7 +688,6 @@ class UploadService:
                     ) as source:
 
                         while True:
-
                             data = await source.read(
                                 1024 * 1024,
                             )
@@ -680,9 +707,14 @@ class UploadService:
 
                     print(
                         f"✓ Assembled "
-                        f"{index + 1}/{total_chunks} "
+                        f"{index + 1}/"
+                        f"{total_chunks} "
                         f"({progress:.1f}%)"
                     )
+
+            file_size = (
+                destination.stat().st_size
+            )
 
             print(
                 "✓ FINAL FILE:",
@@ -691,58 +723,17 @@ class UploadService:
 
             print(
                 "✓ SIZE:",
-                destination.stat().st_size,
+                file_size,
                 "bytes",
             )
 
-            # ==================================================
-            # LIGHTWEIGHT INSPECTION
-            #
-            # IMPORTANT:
-            # Chunked upload dapat digunakan untuk file Excel
-            # berukuran sangat besar (contoh DLPD >700 MB).
-            #
-            # Jangan memanggil _inspect_file() di sini karena
-            # _inspect_file() menjalankan DatasetValidator.validate()
-            # yang membaca isi Excel dengan pandas.read_excel().
-            #
-            # Assembly harus selesai secepat mungkin:
-            #
-            #   assemble
-            #       ↓
-            #   detect dataset
-            #       ↓
-            #   resolve month
-            #       ↓
-            #   create manifest
-            #       ↓
-            #   ETL melakukan full validation
-            #
-            # Full validation tetap dipertahankan untuk normal
-            # upload melalui save_files().
-            # ==================================================
+            # --------------------------------------------------
+            # LIGHTWEIGHT DETECTION ONLY
+            # --------------------------------------------------
 
             dataset = FileDetector.detect(
                 destination,
             )
-
-            month = None
-
-            if dataset == FileDetector.UNKNOWN:
-                print(
-                    "WARNING: Unable to detect dataset from filename."
-                )
-            else:
-                try:
-                    month = MonthResolver.resolve(
-                        destination,
-                    )
-                except Exception as exc:
-                    print(
-                        "WARNING: Month resolution failed:",
-                        exc,
-                    )
-                    month = None
 
             is_coordinate_master = (
                 cls._is_coordinate_master(
@@ -750,35 +741,22 @@ class UploadService:
                 )
             )
 
-            if is_coordinate_master:
-                print(
-                    "✓ Coordinate Master :",
-                    safe_filename,
+            if (
+                dataset
+                == FileDetector.UNKNOWN
+                and is_coordinate_master
+            ):
+                dataset = (
+                    FileDetector.CUSTOMER_LOCATION
                 )
 
-                # Coordinate masters intentionally have no month.
-                month = None
-
-                if dataset == FileDetector.UNKNOWN:
-                    dataset = FileDetector.CUSTOMER_LOCATION
-
-            metadata = {
-                "filename": safe_filename,
-                "size": destination.stat().st_size,
-                "content_type": content_type,
-                "dataset": dataset,
-                "month": month,
-                "is_coordinate_master": (
-                    is_coordinate_master
-                ),
-
-                # Full validation is intentionally deferred to ETL.
-                "validation": "PENDING",
-                "missing_columns": [],
-                "error": None,
-
-                "original_filename": filename,
-            }
+            # IMPORTANT:
+            # Do NOT resolve month here.
+            #
+            # MonthResolver may read the entire Excel.
+            #
+            # ETL will resolve month later.
+            month = None
 
             print(
                 "✓ Dataset :",
@@ -786,20 +764,27 @@ class UploadService:
             )
 
             print(
-                "✓ Month :",
-                month,
+                "✓ Month : deferred to ETL",
             )
 
-            print(
-                "✓ Validation : PENDING "
-                "(deferred to ETL)",
-            )
+            # --------------------------------------------------
+            # CREATE MANIFEST
+            # --------------------------------------------------
 
-            # ==================================================
-            # FINALIZE
-            #
-            # INI MEMBUAT manifest.json
-            # ==================================================
+            metadata = {
+                "filename": safe_filename,
+                "size": file_size,
+                "content_type": content_type,
+                "dataset": dataset,
+                "month": month,
+                "is_coordinate_master": (
+                    is_coordinate_master
+                ),
+                "validation": "PENDING",
+                "missing_columns": [],
+                "error": None,
+                "original_filename": filename,
+            }
 
             result = await cls._finalize_job(
                 job_id=job_id,
@@ -808,10 +793,6 @@ class UploadService:
                     metadata,
                 ],
             )
-
-            # ==================================================
-            # VERIFY MANIFEST REALLY EXISTS
-            # ==================================================
 
             manifest_path = (
                 job_folder
@@ -829,14 +810,15 @@ class UploadService:
                 manifest_path,
             )
 
-            # ==================================================
+            # --------------------------------------------------
             # DELETE CHUNKS
-            # ==================================================
+            # --------------------------------------------------
 
             try:
-
-                for chunk_path in chunks_folder.glob(
-                    "*.part",
+                for chunk_path in (
+                    chunks_folder.glob(
+                        "*.part",
+                    )
                 ):
                     chunk_path.unlink(
                         missing_ok=True,
@@ -845,17 +827,22 @@ class UploadService:
                 chunks_folder.rmdir()
 
             except Exception:
-
                 traceback.print_exc()
 
             print("=" * 80)
-            print("BACKGROUND CHUNK ASSEMBLY FINISHED")
-            print("JOB ID :", job_id)
-            print("MANIFEST:", manifest_path)
+            print(
+                "BACKGROUND CHUNK ASSEMBLY FINISHED"
+            )
+            print(
+                "JOB ID :",
+                job_id,
+            )
+            print(
+                "MANIFEST:",
+                manifest_path,
+            )
             print("=" * 80)
 
-            # IMPORTANT:
-            # Return hanya setelah manifest tersedia.
             return {
                 **result,
                 "status": "ASSEMBLY_COMPLETED",
@@ -865,34 +852,145 @@ class UploadService:
             }
 
         except Exception as exc:
-
             print("=" * 80)
-            print("BACKGROUND CHUNK ASSEMBLY FAILED")
-            print("JOB ID :", job_id)
-            print("ERROR  :", exc)
+            print(
+                "BACKGROUND CHUNK ASSEMBLY FAILED"
+            )
+            print(
+                "JOB ID :",
+                job_id,
+            )
+            print(
+                "ERROR  :",
+                exc,
+            )
             print("=" * 80)
 
             traceback.print_exc()
 
             try:
-
                 JobManager.update(
                     job_folder=job_folder,
                     status=JobStatus.FAILED,
                     progress=0,
                     step="ASSEMBLY_FAILED",
                 )
-
             except Exception:
-
                 traceback.print_exc()
 
-            # PENTING:
-            # Jangan telan exception.
-            #
-            # Router/background pipeline harus tahu
-            # assembly gagal supaya ETL TIDAK dijalankan.
             raise
+
+    # ==========================================================
+    # RECOVER EXISTING ASSEMBLED FILE
+    #
+    # Useful for the job that already reached:
+    #
+    # FINAL FILE
+    # SIZE
+    #
+    # but never created manifest.json.
+    #
+    # NO Excel inspection.
+    # ==========================================================
+
+    @classmethod
+    async def recover_assembled_job(
+        cls,
+        job_id: str,
+        filename: str,
+        content_type: str | None = None,
+    ) -> dict:
+
+        safe_filename = cls._safe_filename(
+            filename,
+        )
+
+        job_folder = (
+            UPLOAD_FOLDER
+            / job_id
+        )
+
+        if not job_folder.exists():
+            raise FileNotFoundError(
+                f"Job folder not found: "
+                f"{job_folder}",
+            )
+
+        destination = (
+            job_folder
+            / safe_filename
+        )
+
+        if not destination.exists():
+            raise FileNotFoundError(
+                f"Final file not found: "
+                f"{destination}",
+            )
+
+        file_size = (
+            destination.stat().st_size
+        )
+
+        dataset = FileDetector.detect(
+            destination,
+        )
+
+        is_coordinate_master = (
+            cls._is_coordinate_master(
+                safe_filename,
+            )
+        )
+
+        if (
+            dataset
+            == FileDetector.UNKNOWN
+            and is_coordinate_master
+        ):
+            dataset = (
+                FileDetector.CUSTOMER_LOCATION
+            )
+
+        metadata = {
+            "filename": safe_filename,
+            "size": file_size,
+            "content_type": content_type,
+            "dataset": dataset,
+            "month": None,
+            "is_coordinate_master": (
+                is_coordinate_master
+            ),
+            "validation": "PENDING",
+            "missing_columns": [],
+            "error": None,
+            "original_filename": filename,
+        }
+
+        result = await cls._finalize_job(
+            job_id=job_id,
+            job_folder=job_folder,
+            uploaded=[
+                metadata,
+            ],
+        )
+
+        manifest_path = (
+            job_folder
+            / "manifest.json"
+        )
+
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"Manifest was not created: "
+                f"{manifest_path}",
+            )
+
+        return {
+            **result,
+            "status": "ASSEMBLY_COMPLETED",
+            "manifest_path": str(
+                manifest_path,
+            ),
+        }
 
     # ==========================================================
     # FINALIZE JOB
@@ -911,7 +1009,9 @@ class UploadService:
             "status": JobStatus.UPLOADED.value,
             "progress": 0,
             "current_step": "UPLOAD",
-            "uploaded_at": datetime.now().isoformat(),
+            "uploaded_at": (
+                datetime.now().isoformat()
+            ),
             "started_at": None,
             "finished_at": None,
             "total_files": len(uploaded),
@@ -928,9 +1028,9 @@ class UploadService:
             manifest_path,
             "w",
             encoding="utf-8",
-        ) as f:
+        ) as output:
 
-            await f.write(
+            await output.write(
                 json.dumps(
                     manifest,
                     indent=4,
@@ -938,7 +1038,6 @@ class UploadService:
                 )
             )
 
-        # Pastikan file benar-benar ada
         if not manifest_path.exists():
             raise FileNotFoundError(
                 f"Manifest not found after creation: "
@@ -965,14 +1064,18 @@ class UploadService:
             for item in uploaded
             if item.get(
                 "validation",
-            ) != "PASSED"
+            ) not in (
+                "PASSED",
+                "PENDING",
+            )
         ]
 
         print()
-        print("Manifest :")
-        print(manifest_path)
+        print(
+            "Manifest :",
+            manifest_path,
+        )
 
-        print()
         print(
             "Coordinate Masters :",
             coordinate_masters,

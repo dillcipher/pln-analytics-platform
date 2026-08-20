@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 import traceback
 from pathlib import Path
@@ -27,31 +28,22 @@ router = APIRouter(
 
 
 # ==========================================================
-# BACKGROUND ETL
+# ETL
 # ==========================================================
-
 
 def _run_etl(
     job_folder: Path,
 ) -> None:
-    """
-    Run ETL after a job has been completely assembled.
-
-    IMPORTANT:
-    This function is ONLY for ETL.
-
-    Chunk assembly is NOT performed here.
-    """
 
     try:
         print("=" * 80)
         print("BACKGROUND ETL START")
-        print(f"JOB FOLDER : {job_folder}")
+        print("JOB FOLDER :", job_folder)
         print("=" * 80)
 
         if not job_folder.exists():
             raise FileNotFoundError(
-                f"Job folder not found: {job_folder}"
+                f"Job folder not found: {job_folder}",
             )
 
         manifest_path = (
@@ -61,11 +53,12 @@ def _run_etl(
 
         if not manifest_path.exists():
             raise FileNotFoundError(
-                f"Manifest not found: {manifest_path}"
+                f"Manifest not found: {manifest_path}",
             )
 
         print(
-            f"✓ Manifest found: {manifest_path}"
+            "✓ Manifest found:",
+            manifest_path,
         )
 
         ETLOrchestrator.process(
@@ -74,22 +67,114 @@ def _run_etl(
 
         print("=" * 80)
         print("BACKGROUND ETL FINISHED")
-        print(f"JOB FOLDER : {job_folder}")
+        print("JOB FOLDER :", job_folder)
         print("=" * 80)
 
     except Exception:
         print("=" * 80)
         print("BACKGROUND ETL FAILED")
-        print(f"JOB FOLDER : {job_folder}")
+        print("JOB FOLDER :", job_folder)
         print("=" * 80)
 
         traceback.print_exc()
 
 
 # ==========================================================
-# NORMAL SMALL FILE UPLOAD
+# ASSEMBLY + ETL
+#
+# IMPORTANT:
+#
+# This entire heavy operation runs AFTER /complete has
+# already returned.
+#
+# Therefore Cloudflare does NOT wait for 746 MB assembly.
 # ==========================================================
 
+async def _run_assembly_and_etl(
+    upload_id: str,
+    job_id: str,
+    filename: str,
+    total_chunks: int,
+    content_type: str | None,
+) -> None:
+
+    job_folder = (
+        RAW_UPLOAD
+        / job_id
+    )
+
+    try:
+        print("=" * 80)
+        print("BACKGROUND ASSEMBLY + ETL START")
+        print("UPLOAD ID :", upload_id)
+        print("JOB ID    :", job_id)
+        print("FILE      :", filename)
+        print("=" * 80)
+
+        # --------------------------------------------------
+        # ASSEMBLY
+        # --------------------------------------------------
+
+        result = (
+            await UploadService.assemble_chunk_upload(
+                upload_id=upload_id,
+                job_id=job_id,
+                filename=filename,
+                total_chunks=total_chunks,
+                content_type=content_type,
+            )
+        )
+
+        manifest_path = (
+            job_folder
+            / "manifest.json"
+        )
+
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"Manifest not found after assembly: "
+                f"{manifest_path}",
+            )
+
+        print("=" * 80)
+        print("ASSEMBLY COMPLETED")
+        print("JOB ID   :", job_id)
+        print("MANIFEST :", manifest_path)
+        print("=" * 80)
+
+        # --------------------------------------------------
+        # ETL
+        #
+        # ETL starts ONLY after manifest exists.
+        # --------------------------------------------------
+
+        print("=" * 80)
+        print("STARTING ETL")
+        print("JOB ID :", job_id)
+        print("=" * 80)
+
+        await asyncio.to_thread(
+            _run_etl,
+            job_folder,
+        )
+
+        print("=" * 80)
+        print("ASSEMBLY + ETL PIPELINE FINISHED")
+        print("JOB ID :", job_id)
+        print("=" * 80)
+
+    except Exception:
+        print("=" * 80)
+        print("ASSEMBLY + ETL FAILED")
+        print("JOB ID :", job_id)
+        print("=" * 80)
+
+        traceback.print_exc()
+
+
+# ==========================================================
+# NORMAL SMALL UPLOAD
+# ==========================================================
 
 @router.post(
     "/files",
@@ -105,14 +190,8 @@ async def upload_files(
         ),
     ],
 ):
-    start = time.perf_counter()
 
-    print("=" * 80)
-    print("UPLOAD API CALLED")
-    print("UPLOAD MODE : NORMAL")
-    print("TOTAL FILES : 1")
-    print(f"FILE        : {file.filename}")
-    print("=" * 80)
+    start = time.perf_counter()
 
     try:
         result = await UploadService.save_files(
@@ -124,7 +203,6 @@ async def upload_files(
             / result["job_id"]
         )
 
-        # Normal/small uploads can use background ETL.
         background_tasks.add_task(
             _run_etl,
             job_folder,
@@ -135,56 +213,24 @@ async def upload_files(
             - start
         )
 
-        print("=" * 80)
         print(
-            f"UPLOAD FINISHED ({duration:.2f}s)"
+            f"UPLOAD FINISHED ({duration:.2f}s)",
         )
-        print(
-            "ETL RUNNING IN BACKGROUND..."
-        )
-        print(
-            f"JOB ID : {result['job_id']}"
-        )
-        print("=" * 80)
 
         return result
 
-    except Exception as e:
-        duration = (
-            time.perf_counter()
-            - start
-        )
-
-        print("=" * 80)
-        print("UPLOAD FAILED")
-        print(f"ERROR    : {e}")
-        print(f"DURATION : {duration:.2f}s")
-        print("=" * 80)
-
+    except Exception as exc:
         traceback.print_exc()
 
         raise HTTPException(
             status_code=500,
-            detail=str(e),
+            detail=str(exc),
         )
 
 
 # ==========================================================
-# CHUNK UPLOAD
-#
-# One request = one chunk.
-#
-# Example:
-#
-# chunk 0 -> 20 MB
-# chunk 1 -> 20 MB
-# chunk 2 -> 20 MB
-# ...
-#
-# This prevents Cloudflare from receiving the entire
-# 700+ MB Excel file in a single HTTP request.
+# CHUNK
 # ==========================================================
-
 
 @router.post(
     "/chunk",
@@ -228,20 +274,9 @@ async def upload_chunk(
         ),
     ],
 ):
-    start = time.perf_counter()
-
-    print("=" * 80)
-    print("CHUNK UPLOAD")
-    print(f"UPLOAD ID    : {upload_id}")
-    print(f"FILE         : {filename}")
-    print(
-        f"CHUNK        : "
-        f"{chunk_number + 1}/{total_chunks}"
-    )
-    print("=" * 80)
 
     try:
-        result = await UploadService.save_chunk(
+        return await UploadService.save_chunk(
             upload_id=upload_id,
             filename=filename,
             chunk_number=chunk_number,
@@ -249,69 +284,44 @@ async def upload_chunk(
             file=file,
         )
 
-        duration = (
-            time.perf_counter()
-            - start
-        )
-
-        print(
-            f"CHUNK FINISHED ({duration:.2f}s)"
-        )
-
-        return result
-
-    except ValueError as e:
-        traceback.print_exc()
-
+    except ValueError as exc:
         raise HTTPException(
             status_code=400,
-            detail=str(e),
+            detail=str(exc),
         )
 
-    except Exception as e:
+    except Exception as exc:
         traceback.print_exc()
 
         raise HTTPException(
             status_code=500,
-            detail=str(e),
+            detail=str(exc),
         )
 
 
 # ==========================================================
 # COMPLETE CHUNKED UPLOAD
 #
-# IMPORTANT:
+# THIS MUST BE FAST.
 #
-# /complete DOES NOT return immediately anymore.
+# It DOES NOT assemble the 746 MB file.
 #
-# It performs:
+# It only:
 #
-#   1. Verify all chunks
-#   2. Create job
-#   3. Assemble the complete XLSX
-#   4. Detect dataset
-#   5. Resolve month
-#   6. Create manifest.json
-#   7. Verify manifest.json
-#   8. Return job_id
+#   verify chunks
+#   create job
+#   queue background assembly
+#   return job_id
 #
-# ETL IS NOT STARTED HERE.
-#
-# This is intentional.
-#
-# The caller must use:
-#
-#   POST /api/v1/upload/process/{job_id}
-#
-# after /complete returns successfully.
+# Cloudflare therefore does not wait for assembly.
 # ==========================================================
-
 
 @router.post(
     "/complete",
     response_model=UploadResponse,
 )
 async def complete_upload(
+    background_tasks: BackgroundTasks,
     upload_id: Annotated[
         str,
         Form(
@@ -341,94 +351,44 @@ async def complete_upload(
         ),
     ] = None,
 ):
+
     start = time.perf_counter()
 
     print("=" * 80)
     print("COMPLETE CHUNKED UPLOAD")
-    print(f"UPLOAD ID    : {upload_id}")
-    print(f"FILE         : {filename}")
-    print(f"TOTAL CHUNKS : {total_chunks}")
+    print("UPLOAD ID    :", upload_id)
+    print("FILE         :", filename)
+    print("TOTAL CHUNKS :", total_chunks)
     print("=" * 80)
 
     try:
-        # ======================================================
-        # STEP 1
-        # VERIFY CHUNKS + CREATE JOB
-        # ======================================================
+        # --------------------------------------------------
+        # ONLY VERIFY + CREATE JOB
+        # --------------------------------------------------
 
-        prepared = await UploadService.prepare_chunk_upload(
-            upload_id=upload_id,
-            filename=filename,
-            total_chunks=total_chunks,
-            content_type=content_type,
-        )
-
-        job_id = prepared["job_id"]
-
-        job_folder = (
-            RAW_UPLOAD
-            / job_id
-        )
-
-        print("=" * 80)
-        print("CHUNK UPLOAD PREPARED")
-        print(f"UPLOAD ID : {upload_id}")
-        print(f"JOB ID    : {job_id}")
-        print(f"JOB FOLDER: {job_folder}")
-        print("=" * 80)
-
-        # ======================================================
-        # STEP 2
-        # ASSEMBLE SYNCHRONOUSLY
-        #
-        # DO NOT use BackgroundTasks here.
-        #
-        # We must guarantee that when /complete returns 200:
-        #
-        #   final XLSX exists
-        #   manifest.json exists
-        #
-        # This prevents the previous failure where:
-        #
-        # /complete → 200
-        # deployment restart
-        # background assembly/ETL disappears
-        # ======================================================
-
-        result = await UploadService.assemble_chunk_upload(
-            upload_id=upload_id,
-            job_id=job_id,
-            filename=filename,
-            total_chunks=total_chunks,
-            content_type=content_type,
-        )
-
-        # ======================================================
-        # STEP 3
-        # VERIFY FINAL JOB
-        # ======================================================
-
-        final_job_folder = (
-            RAW_UPLOAD
-            / result["job_id"]
-        )
-
-        if not final_job_folder.exists():
-            raise FileNotFoundError(
-                f"Job folder not found after assembly: "
-                f"{final_job_folder}"
+        result = (
+            await UploadService.prepare_chunk_upload(
+                upload_id=upload_id,
+                filename=filename,
+                total_chunks=total_chunks,
+                content_type=content_type,
             )
-
-        manifest_path = (
-            final_job_folder
-            / "manifest.json"
         )
 
-        if not manifest_path.exists():
-            raise FileNotFoundError(
-                f"Manifest not found after assembly: "
-                f"{manifest_path}"
-            )
+        job_id = result["job_id"]
+
+        # --------------------------------------------------
+        # QUEUE HEAVY WORK
+        # --------------------------------------------------
+
+        background_tasks.add_task(
+            _run_assembly_and_etl,
+            upload_id,
+            job_id,
+            filename,
+            total_chunks,
+            content_type,
+        )
 
         duration = (
             time.perf_counter()
@@ -436,70 +396,47 @@ async def complete_upload(
         )
 
         print("=" * 80)
-        print("CHUNKED UPLOAD COMPLETED")
-        print(f"JOB ID       : {result['job_id']}")
-        print(f"MANIFEST     : {manifest_path}")
-        print(f"DURATION     : {duration:.2f}s")
-        print("ASSEMBLY     : COMPLETED")
-        print("MANIFEST     : READY")
-        print("ETL          : NOT STARTED")
+        print("CHUNKED UPLOAD ACCEPTED")
+        print("JOB ID   :", job_id)
+        print(
+            "ASSEMBLY : RUNNING IN BACKGROUND",
+        )
+        print(
+            f"DURATION : {duration:.2f}s",
+        )
         print("=" * 80)
 
-        return result
+        return {
+            **result,
+            "status": "ASSEMBLY_QUEUED",
+        }
 
-    except FileNotFoundError as e:
-        traceback.print_exc()
-
+    except FileNotFoundError as exc:
         raise HTTPException(
             status_code=404,
-            detail=str(e),
+            detail=str(exc),
         )
 
-    except ValueError as e:
-        traceback.print_exc()
-
+    except ValueError as exc:
         raise HTTPException(
             status_code=400,
-            detail=str(e),
+            detail=str(exc),
         )
 
-    except Exception as e:
-        duration = (
-            time.perf_counter()
-            - start
-        )
-
-        print("=" * 80)
-        print("COMPLETE UPLOAD FAILED")
-        print(f"ERROR    : {e}")
-        print(f"DURATION : {duration:.2f}s")
-        print("=" * 80)
-
+    except Exception as exc:
         traceback.print_exc()
 
         raise HTTPException(
             status_code=500,
-            detail=str(e),
+            detail=str(exc),
         )
 
 
 # ==========================================================
 # PROCESS EXISTING JOB
 #
-# Endpoint:
-#
-# POST /api/v1/upload/process/{job_id}
-#
-# This endpoint ONLY starts ETL.
-#
-# It requires:
-#
-#   job folder exists
-#   manifest.json exists
-#
-# Therefore /complete must succeed first.
+# Manual ETL trigger.
 # ==========================================================
-
 
 @router.post(
     "/process/{job_id}",
@@ -508,21 +445,13 @@ async def process_existing_job(
     job_id: str,
     background_tasks: BackgroundTasks,
 ):
-    start = time.perf_counter()
 
-    print("=" * 80)
-    print("PROCESS EXISTING JOB")
-    print(f"JOB ID : {job_id}")
-    print("=" * 80)
+    start = time.perf_counter()
 
     job_folder = (
         RAW_UPLOAD
         / job_id
     )
-
-    # ======================================================
-    # VERIFY JOB
-    # ======================================================
 
     if not job_folder.exists():
         raise HTTPException(
@@ -537,16 +466,13 @@ async def process_existing_job(
 
     if not manifest_path.exists():
         raise HTTPException(
-            status_code=404,
+            status_code=409,
             detail=(
-                f"Manifest not found for job: "
+                f"Assembly still running or "
+                f"manifest not ready for job: "
                 f"{job_id}"
             ),
         )
-
-    # ======================================================
-    # START ETL
-    # ======================================================
 
     background_tasks.add_task(
         _run_etl,
@@ -560,8 +486,10 @@ async def process_existing_job(
 
     print("=" * 80)
     print("ETL SCHEDULED")
-    print(f"JOB ID   : {job_id}")
-    print(f"DURATION : {duration:.2f}s")
+    print("JOB ID   :", job_id)
+    print(
+        f"DURATION : {duration:.2f}s",
+    )
     print("=" * 80)
 
     return {
@@ -569,3 +497,96 @@ async def process_existing_job(
         "job_id": job_id,
         "message": "ETL scheduled",
     }
+
+
+# ==========================================================
+# RECOVER ALREADY-ASSEMBLED JOB
+#
+# This is specifically for the job that already reached:
+#
+# ✓ FINAL FILE
+# ✓ SIZE: 745899997 bytes
+#
+# but never created manifest.json because the old code got
+# stuck in MonthResolver.
+# ==========================================================
+
+@router.post(
+    "/recover/{job_id}",
+)
+async def recover_existing_job(
+    job_id: str,
+    filename: Annotated[
+        str,
+        Form(
+            ...,
+            description="Assembled filename",
+        ),
+    ],
+    content_type: Annotated[
+        str | None,
+        Form(
+            description="Original content type",
+        ),
+    ] = None,
+    background_tasks: BackgroundTasks = None,
+):
+
+    job_folder = (
+        RAW_UPLOAD
+        / job_id
+    )
+
+    if not job_folder.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Job not found: {job_id}",
+        )
+
+    manifest_path = (
+        job_folder
+        / "manifest.json"
+    )
+
+    # Already recovered.
+    if manifest_path.exists():
+        return {
+            "success": True,
+            "job_id": job_id,
+            "message": "Manifest already exists",
+        }
+
+    try:
+        result = (
+            await UploadService.recover_assembled_job(
+                job_id=job_id,
+                filename=filename,
+                content_type=content_type,
+            )
+        )
+
+        # Start ETL only after manifest exists.
+        if background_tasks is not None:
+            background_tasks.add_task(
+                _run_etl,
+                job_folder,
+            )
+
+        return {
+            **result,
+            "message": "Recovered and ETL scheduled",
+        }
+
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=str(exc),
+        )
+
+    except Exception as exc:
+        traceback.print_exc()
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        )
