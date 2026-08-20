@@ -303,10 +303,9 @@ async def complete_upload(
     content_type: Annotated[
         str | None,
         Form(
-            default=None,
             description="Original file content type",
         ),
-    ],
+    ] = None,
 ):
     start = time.perf_counter()
 
