@@ -61,6 +61,11 @@ def _run_etl(
             manifest_path,
         )
 
+        print("=" * 80)
+        print("RUNNING ETL ORCHESTRATOR")
+        print("JOB FOLDER :", job_folder)
+        print("=" * 80)
+
         ETLOrchestrator.process(
             job_folder,
         )
@@ -87,7 +92,7 @@ def _run_etl(
 # This entire heavy operation runs AFTER /complete has
 # already returned.
 #
-# Therefore Cloudflare does NOT wait for 746 MB assembly.
+# Therefore Cloudflare does NOT wait for the large assembly.
 # ==========================================================
 
 async def _run_assembly_and_etl(
@@ -124,6 +129,11 @@ async def _run_assembly_and_etl(
                 content_type=content_type,
             )
         )
+
+        print("=" * 80)
+        print("ASSEMBLY RESULT")
+        print(result)
+        print("=" * 80)
 
         manifest_path = (
             job_folder
@@ -304,14 +314,14 @@ async def upload_chunk(
 #
 # THIS MUST BE FAST.
 #
-# It DOES NOT assemble the 746 MB file.
+# It does NOT assemble the large file inside the request.
 #
 # It only:
 #
-#   verify chunks
-#   create job
-#   queue background assembly
-#   return job_id
+#   1. verify chunks
+#   2. create job
+#   3. queue background assembly
+#   4. return job_id
 #
 # Cloudflare therefore does not wait for assembly.
 # ==========================================================
@@ -398,9 +408,7 @@ async def complete_upload(
         print("=" * 80)
         print("CHUNKED UPLOAD ACCEPTED")
         print("JOB ID   :", job_id)
-        print(
-            "ASSEMBLY : RUNNING IN BACKGROUND",
-        )
+        print("ASSEMBLY : RUNNING IN BACKGROUND")
         print(
             f"DURATION : {duration:.2f}s",
         )
@@ -502,13 +510,20 @@ async def process_existing_job(
 # ==========================================================
 # RECOVER ALREADY-ASSEMBLED JOB
 #
-# This is specifically for the job that already reached:
+# This endpoint is specifically for a job where the
+# assembled file and/or manifest already exist.
 #
-# ✓ FINAL FILE
-# ✓ SIZE: 745899997 bytes
+# IMPORTANT:
 #
-# but never created manifest.json because the old code got
-# stuck in MonthResolver.
+# An existing manifest does NOT mean that ETL finished.
+#
+# Therefore:
+#
+#   manifest exists
+#        ↓
+#   schedule ETL
+#
+# instead of simply returning "Manifest already exists".
 # ==========================================================
 
 @router.post(
@@ -548,15 +563,58 @@ async def recover_existing_job(
         / "manifest.json"
     )
 
-    # Already recovered.
+    # ======================================================
+    # MANIFEST ALREADY EXISTS
+    #
+    # IMPORTANT:
+    #
+    # Manifest existence only proves that assembly metadata
+    # was persisted.
+    #
+    # It does NOT prove that ETL completed successfully.
+    #
+    # Therefore always continue to ETL.
+    # ======================================================
+
     if manifest_path.exists():
+
+        print("=" * 80)
+        print("RECOVER EXISTING JOB")
+        print("JOB ID :", job_id)
+        print("MANIFEST :", manifest_path)
+        print("STATUS : MANIFEST EXISTS")
+        print("ACTION : SCHEDULE ETL")
+        print("=" * 80)
+
+        if background_tasks is not None:
+            background_tasks.add_task(
+                _run_etl,
+                job_folder,
+            )
+
         return {
             "success": True,
             "job_id": job_id,
-            "message": "Manifest already exists",
+            "status": "ETL_QUEUED",
+            "message": (
+                "Manifest exists; ETL scheduled"
+            ),
         }
 
+    # ======================================================
+    # MANIFEST DOES NOT EXIST
+    #
+    # Recover the already-assembled local file first.
+    # ======================================================
+
     try:
+
+        print("=" * 80)
+        print("RECOVER ASSEMBLED JOB")
+        print("JOB ID  :", job_id)
+        print("FILE    :", filename)
+        print("=" * 80)
+
         result = (
             await UploadService.recover_assembled_job(
                 job_id=job_id,
@@ -565,7 +623,27 @@ async def recover_existing_job(
             )
         )
 
-        # Start ETL only after manifest exists.
+        # --------------------------------------------------
+        # VERIFY MANIFEST
+        # --------------------------------------------------
+
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"Manifest was not created during recovery: "
+                f"{manifest_path}",
+            )
+
+        print("=" * 80)
+        print("RECOVERY COMPLETED")
+        print("JOB ID   :", job_id)
+        print("MANIFEST :", manifest_path)
+        print("ACTION   : SCHEDULE ETL")
+        print("=" * 80)
+
+        # --------------------------------------------------
+        # START ETL
+        # --------------------------------------------------
+
         if background_tasks is not None:
             background_tasks.add_task(
                 _run_etl,
@@ -574,16 +652,21 @@ async def recover_existing_job(
 
         return {
             **result,
-            "message": "Recovered and ETL scheduled",
+            "status": "ETL_QUEUED",
+            "message": (
+                "Recovered and ETL scheduled"
+            ),
         }
 
     except FileNotFoundError as exc:
+
         raise HTTPException(
             status_code=404,
             detail=str(exc),
         )
 
     except Exception as exc:
+
         traceback.print_exc()
 
         raise HTTPException(

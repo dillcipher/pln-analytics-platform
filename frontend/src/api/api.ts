@@ -6,15 +6,12 @@ import axios from "axios";
  * ==========================================================
  *
  * Development:
- *   Frontend  -> http://127.0.0.1:8889/api/v1
+ *   Frontend -> http://127.0.0.1:8889/api/v1
  *
  * Production:
  *   Uses VITE_API_URL when provided.
  *   Otherwise falls back to /api/v1.
  *
- * This avoids relying on the Vite proxy during local
- * development when the FastAPI backend is already running
- * directly on port 8889.
  * ==========================================================
  */
 
@@ -28,29 +25,60 @@ const envBackendUrl =
         ? import.meta.env.VITE_BACKEND_URL.trim()
         : "";
 
-const normalizeBaseUrl = (url: string): string => {
+function normalizeBaseUrl(
+    url: string,
+): string {
+
     if (!url) {
         return "";
     }
 
-    return url.replace(/\/+$/, "");
-};
+    return url.replace(
+        /\/+$/,
+        "",
+    );
+}
 
-const explicitApiUrl = normalizeBaseUrl(envApiUrl);
+const explicitApiUrl =
+    normalizeBaseUrl(
+        envApiUrl,
+    );
 
-const backendUrl = normalizeBaseUrl(
-    envBackendUrl || "http://127.0.0.1:8889",
-);
+const backendUrl =
+    normalizeBaseUrl(
+        envBackendUrl ||
+            "http://127.0.0.1:8889",
+    );
 
 const API_BASE_URL =
     explicitApiUrl ||
-    (import.meta.env.DEV
-        ? `${backendUrl}/api/v1`
-        : "/api/v1");
+    (
+        import.meta.env.DEV
+            ? `${backendUrl}/api/v1`
+            : "/api/v1"
+    );
 
 /**
  * ==========================================================
  * AXIOS INSTANCE
+ * ==========================================================
+ *
+ * IMPORTANT:
+ *
+ * JANGAN menetapkan Content-Type secara global.
+ *
+ * Axios harus menentukan Content-Type berdasarkan body.
+ *
+ * Untuk JSON:
+ *   Axios akan menggunakan application/json.
+ *
+ * Untuk FormData:
+ *   Browser/Axios akan menggunakan:
+ *
+ *   multipart/form-data; boundary=...
+ *
+ * Ini WAJIB untuk endpoint upload.
+ *
  * ==========================================================
  */
 
@@ -58,12 +86,13 @@ const api = axios.create({
     baseURL: API_BASE_URL,
 
     timeout: Number(
-        import.meta.env.VITE_API_TIMEOUT || 120000,
+        import.meta.env.VITE_API_TIMEOUT ||
+            120000,
     ),
 
     headers: {
-        Accept: "application/json",
-        "Content-Type": "application/json",
+        Accept:
+            "application/json",
     },
 });
 
@@ -75,21 +104,105 @@ const api = axios.create({
 
 api.interceptors.request.use(
     (config) => {
+
+        /**
+         * ==================================================
+         * AUTH TOKEN
+         * ==================================================
+         */
+
         const token =
-            localStorage.getItem("access_token");
+            localStorage.getItem(
+                "access_token",
+            );
 
         if (token) {
-            config.headers = config.headers ?? {};
+
+            config.headers =
+                config.headers ?? {};
 
             config.headers.Authorization =
                 `Bearer ${token}`;
         }
 
+        /**
+         * ==================================================
+         * FORM DATA FIX
+         * ==================================================
+         *
+         * Ini bagian PALING PENTING.
+         *
+         * Kalau request menggunakan FormData,
+         * hapus Content-Type yang mungkin diwariskan
+         * dari konfigurasi Axios.
+         *
+         * Browser kemudian akan membuat:
+         *
+         * multipart/form-data;
+         * boundary=---------------------------
+         *
+         * sendiri.
+         */
+
+        if (
+            config.data instanceof FormData
+        ) {
+
+            if (
+                config.headers
+            ) {
+
+                delete (
+                    config.headers as any
+                )["Content-Type"];
+
+                delete (
+                    config.headers as any
+                )["content-type"];
+            }
+        }
+
+        /**
+         * ==================================================
+         * DEBUG
+         * ==================================================
+         */
+
+        console.log(
+            "[API REQUEST]",
+            {
+                method:
+                    config.method?.toUpperCase(),
+
+                baseURL:
+                    config.baseURL,
+
+                url:
+                    config.url,
+
+                fullURL:
+                    `${config.baseURL ?? ""}${config.url ?? ""}`,
+
+                isFormData:
+                    config.data instanceof FormData,
+
+                contentType:
+                    config.headers?.[
+                        "Content-Type"
+                    ] ??
+                    config.headers?.[
+                        "content-type"
+                    ],
+            },
+        );
+
         return config;
     },
 
     (error) => {
-        return Promise.reject(error);
+        return Promise.reject(
+            error,
+        );
     },
 );
 
@@ -101,10 +214,12 @@ api.interceptors.request.use(
 
 api.interceptors.response.use(
     (response) => {
+
         return response;
     },
 
     (error) => {
+
         const status =
             error?.response?.status;
 
@@ -118,10 +233,11 @@ api.interceptors.response.use(
             "Request failed";
 
         /**
-         * Make the actual API URL visible in the browser
-         * console. This is useful when debugging a failed
-         * Executive Dashboard request.
+         * ==================================================
+         * API ERROR LOG
+         * ==================================================
          */
+
         console.error(
             "[API ERROR]",
             {
@@ -134,18 +250,55 @@ api.interceptors.response.use(
                 baseURL:
                     error?.config?.baseURL,
 
+                fullURL:
+                    `${error?.config?.baseURL ?? ""}${error?.config?.url ?? ""}`,
+
                 status,
 
                 detail,
+
+                response:
+                    responseData,
             },
         );
 
-        if (status === 401) {
+        /**
+         * ==================================================
+         * 422 VALIDATION ERROR
+         * ==================================================
+         */
+
+        if (
+            status === 422
+        ) {
+
+            console.error(
+                "[API VALIDATION ERROR]",
+                responseData,
+            );
+        }
+
+        /**
+         * ==================================================
+         * 401
+         * ==================================================
+         */
+
+        if (
+            status === 401
+        ) {
+
             console.warn(
                 "API unauthorized:",
                 detail,
             );
         }
+
+        /**
+         * ==================================================
+         * 4XX
+         * ==================================================
+         */
 
         if (
             status !== undefined &&
@@ -153,37 +306,69 @@ api.interceptors.response.use(
             status < 500 &&
             status !== 401
         ) {
+
             console.warn(
                 "API client error:",
                 detail,
             );
         }
 
+        /**
+         * ==================================================
+         * 5XX
+         * ==================================================
+         */
+
         if (
             status !== undefined &&
             status >= 500
         ) {
+
             console.error(
                 "API server error:",
                 detail,
             );
         }
 
-        if (!error?.response) {
+        /**
+         * ==================================================
+         * NETWORK ERROR
+         * ==================================================
+         */
+
+        if (
+            !error?.response
+        ) {
+
             console.error(
                 "[API NETWORK ERROR]",
                 {
                     message:
                         error?.message,
+
                     baseURL:
                         error?.config?.baseURL,
+
                     url:
                         error?.config?.url,
                 },
             );
         }
 
-        return Promise.reject(error);
+        return Promise.reject(
+            error,
+        );
+    },
+);
+
+console.log(
+    "[API CONFIG]",
+    {
+        environment:
+            import.meta.env.MODE,
+
+        baseURL:
+            API_BASE_URL,
     },
 );
 

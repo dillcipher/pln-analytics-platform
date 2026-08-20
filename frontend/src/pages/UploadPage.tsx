@@ -68,10 +68,14 @@ export default function UploadPage() {
             status === "FAILED" ||
             status === "ERROR"
         ) {
-            throw new Error(
-                current.error
+
+            const errorMessage =
+                current.error != null
                     ? String(current.error)
-                    : `ETL gagal dengan status ${status}`,
+                    : `ETL gagal dengan status ${status}`;
+
+            throw new Error(
+                errorMessage,
             );
         }
 
@@ -105,6 +109,15 @@ export default function UploadPage() {
         setUploadResult(null);
         setJob(null);
 
+        if (pollTimer.current !== null) {
+
+            window.clearTimeout(
+                pollTimer.current,
+            );
+
+            pollTimer.current = null;
+        }
+
         try {
 
             console.log(
@@ -130,8 +143,46 @@ export default function UploadPage() {
 
             setUploadResult(result);
 
+            /*
+             * Backend response sekarang:
+             *
+             * {
+             *   success: true,
+             *   total_files: 1,
+             *   files: [...],
+             *   jobs: [
+             *     {
+             *       filename: "...",
+             *       upload_id: "...",
+             *       job_id: "...",
+             *       total_chunks: 143,
+             *       status: "UPLOADED"
+             *     }
+             *   ]
+             * }
+             *
+             * Jadi job_id berada di:
+             *
+             * result.jobs[0].job_id
+             */
+
+            const jobs =
+                Array.isArray(result?.jobs)
+                    ? result.jobs
+                    : [];
+
+            if (jobs.length === 0) {
+
+                throw new Error(
+                    "Upload berhasil tetapi daftar job tidak ditemukan.",
+                );
+            }
+
+            const firstJob =
+                jobs[0];
+
             const jobId =
-                result?.job_id;
+                firstJob?.job_id;
 
             if (!jobId) {
 
@@ -144,6 +195,12 @@ export default function UploadPage() {
                 "ETL JOB:",
                 jobId,
             );
+
+            /*
+             * Backend sudah membuat job.
+             * Sekarang frontend polling status
+             * sampai FINISHED / FAILED.
+             */
 
             const finishedJob =
                 await pollJob(
@@ -168,10 +225,27 @@ export default function UploadPage() {
                 err,
             );
 
-            alert(
-                err?.message ||
-                "Upload atau proses ETL gagal.",
-            );
+            const message =
+                err?.response?.data?.detail != null
+                    ? Array.isArray(
+                        err.response.data.detail,
+                    )
+                        ? err.response.data.detail
+                            .map((item: any) =>
+                                typeof item === "string"
+                                    ? item
+                                    : item?.msg ||
+                                      JSON.stringify(item),
+                            )
+                            .join("\n")
+                        : String(
+                            err.response.data.detail,
+                        )
+                    : err?.message
+                        ? String(err.message)
+                        : "Upload atau proses ETL gagal.";
+
+            alert(message);
 
         }
 
@@ -187,6 +261,17 @@ export default function UploadPage() {
             job?.progress ?? 0,
         );
 
+    const safeProgress =
+        Math.min(
+            Math.max(
+                Number.isFinite(progress)
+                    ? progress
+                    : 0,
+                0,
+            ),
+            100,
+        );
+
     const status =
         String(
             job?.status || "",
@@ -195,9 +280,19 @@ export default function UploadPage() {
     const isFinished =
         status === "FINISHED";
 
+    const isFailed =
+        status === "FAILED" ||
+        status === "ERROR";
+
     const currentStep =
-        job?.current_step ||
-        "Menunggu proses...";
+        job?.current_step != null
+            ? String(job.current_step)
+            : "Menunggu proses...";
+
+    const jobError =
+        job?.error != null
+            ? String(job.error)
+            : "";
 
     return (
 
@@ -257,8 +352,9 @@ export default function UploadPage() {
                     >
                         Status:{" "}
                         <strong>
-                            {job?.status ||
-                                "UPLOADED"}
+                            {job?.status
+                                ? String(job.status)
+                                : "UPLOADED"}
                         </strong>
                     </div>
 
@@ -287,13 +383,7 @@ export default function UploadPage() {
                         <div
                             style={{
                                 width:
-                                    `${Math.min(
-                                        Math.max(
-                                            progress,
-                                            0,
-                                        ),
-                                        100,
-                                    )}%`,
+                                    `${safeProgress}%`,
                                 height: "100%",
                                 background:
                                     "#22c55e",
@@ -309,7 +399,7 @@ export default function UploadPage() {
                             marginTop: 8,
                         }}
                     >
-                        {progress}%
+                        {safeProgress}%
                     </div>
 
                 </div>
@@ -340,12 +430,65 @@ export default function UploadPage() {
                         sudah diperbarui.
                     </p>
 
+                    {job?.job_id && (
+
+                        <p>
+                            Job:{" "}
+                            <strong>
+                                {String(job.job_id)}
+                            </strong>
+                        </p>
+
+                    )}
+
+                </div>
+
+            )}
+
+            {isFailed && (
+
+                <div
+                    style={{
+                        marginTop: 20,
+                        padding: 20,
+                        border:
+                            "1px solid #ef4444",
+                        borderRadius: 10,
+                        background:
+                            "#111827",
+                    }}
+                >
+
+                    <h3>
+                        ETL Gagal
+                    </h3>
+
                     <p>
-                        Job:{" "}
-                        <strong>
-                            {job?.job_id}
-                        </strong>
+                        Proses ETL gagal
+                        dijalankan.
                     </p>
+
+                    {job?.job_id && (
+
+                        <p>
+                            Job:{" "}
+                            <strong>
+                                {String(job.job_id)}
+                            </strong>
+                        </p>
+
+                    )}
+
+                    {jobError && (
+
+                        <p>
+                            Error:{" "}
+                            <strong>
+                                {jobError}
+                            </strong>
+                        </p>
+
+                    )}
 
                 </div>
 
@@ -373,6 +516,8 @@ export default function UploadPage() {
                         style={{
                             whiteSpace:
                                 "pre-wrap",
+                            overflowX:
+                                "auto",
                         }}
                     >
                         {JSON.stringify(
