@@ -139,7 +139,9 @@ class ETLOrchestrator:
         """
 
         return (
-            cls._normalize_filename(filename)
+            cls._normalize_filename(
+                filename,
+            )
             in cls.COORDINATE_MASTER_FILES
         )
 
@@ -151,18 +153,40 @@ class ETLOrchestrator:
         file_record: dict,
     ) -> bool:
         """
-        Check whether a manifest file passed validation.
+        Check whether a manifest file is eligible for ETL.
+
+        Validation states:
+
+            PASSED
+                File was already validated during upload.
+
+            PENDING
+                File came through the large chunked-upload path.
+
+                Large chunked uploads intentionally skip expensive
+                Excel inspection during assembly so that a 700+ MB
+                workbook does not block the HTTP request.
+
+                The actual DLPD month resolution and dataset
+                processing still happen during ETL.
+
+        Therefore PENDING must be accepted here.
         """
 
+        validation = file_record.get(
+            "validation",
+        )
+
+        filename = file_record.get(
+            "filename",
+        )
+
         return (
-            file_record.get(
-                "validation"
-            ) == "PASSED"
-            and bool(
-                file_record.get(
-                    "filename"
-                )
-            )
+            validation in {
+                "PASSED",
+                "PENDING",
+            }
+            and bool(filename)
         )
 
     # ==========================================================
@@ -221,7 +245,7 @@ class ETLOrchestrator:
 
             if valid_files:
                 months.add(
-                    str(month)
+                    str(month),
                 )
 
         return months
@@ -298,7 +322,9 @@ class ETLOrchestrator:
             valid_files = [
                 file_record
                 for file_record in files
-                if cls._is_valid_file(file_record)
+                if cls._is_valid_file(
+                    file_record,
+                )
             ]
 
             paths = cls._build_paths(
@@ -307,15 +333,19 @@ class ETLOrchestrator:
             )
 
             for path in paths:
+
                 if not path.exists():
                     logger.warning(
-                        "DLPD file not found while resolving months: %s",
+                        "DLPD file not found while "
+                        "resolving months: %s",
                         path,
                     )
                     continue
 
-                resolved = MonthResolver.resolve_months(
-                    path,
+                resolved = (
+                    MonthResolver.resolve_months(
+                        path,
+                    )
                 )
 
                 logger.info(
@@ -342,7 +372,13 @@ class ETLOrchestrator:
         cls,
         grouped: dict,
         job_folder: Path,
-    ) -> list[tuple[str, str | None, list[dict]]]:
+    ) -> list[
+        tuple[
+            str,
+            str | None,
+            list[dict],
+        ]
+    ]:
         """
         Expand DLPD groups into one processing group per actual
         business month.
@@ -356,15 +392,20 @@ class ETLOrchestrator:
                 -> 202607
 
         The same source file can therefore be supplied to
-        MonthlyMerger for each target month. MonthlyMerger is
-        responsible for filtering rows to that target MONTH before
-        exporting the parquet.
+        MonthlyMerger for each target month.
+
+        MonthlyMerger is responsible for filtering rows to that
+        target MONTH before exporting the parquet.
 
         Non-DLPD datasets retain the original grouping behavior.
         """
 
         expanded: list[
-            tuple[str, str | None, list[dict]]
+            tuple[
+                str,
+                str | None,
+                list[dict],
+            ]
         ] = []
 
         for (
@@ -375,7 +416,9 @@ class ETLOrchestrator:
             valid_files = [
                 file_record
                 for file_record in files
-                if cls._is_valid_file(file_record)
+                if cls._is_valid_file(
+                    file_record,
+                )
             ]
 
             if not valid_files:
@@ -417,8 +460,10 @@ class ETLOrchestrator:
                     )
                     continue
 
-                months = MonthResolver.resolve_months(
-                    path,
+                months = (
+                    MonthResolver.resolve_months(
+                        path,
+                    )
                 )
 
                 resolved_months.update(
@@ -435,14 +480,18 @@ class ETLOrchestrator:
             # valid month, retain that manifest month.
             # --------------------------------------------------
 
-            if not resolved_months and group_month:
+            if (
+                not resolved_months
+                and group_month
+            ):
                 resolved_months.add(
-                    str(group_month)
+                    str(group_month),
                 )
 
             for month in sorted(
-                resolved_months
+                resolved_months,
             ):
+
                 expanded.append(
                     (
                         dataset,
@@ -499,7 +548,7 @@ class ETLOrchestrator:
                     filename,
                 ):
                     records.append(
-                        file_record
+                        file_record,
                     )
 
         # ------------------------------------------------------
@@ -522,7 +571,7 @@ class ETLOrchestrator:
             seen.add(filename)
 
             unique_records.append(
-                record
+                record,
             )
 
         paths = cls._build_paths(
@@ -559,7 +608,7 @@ class ETLOrchestrator:
 
             raise FileNotFoundError(
                 f"Manifest not found: "
-                f"{manifest_file}"
+                f"{manifest_file}",
             )
 
         logger.info(
@@ -591,14 +640,14 @@ class ETLOrchestrator:
             manifest = json.load(f)
 
         manifest["job_folder"] = str(
-            job_folder
+            job_folder,
         )
 
         if not manifest.get("files"):
 
             raise ValueError(
                 "Manifest does not contain "
-                "uploaded files."
+                "uploaded files.",
             )
 
         outputs: list[dict] = []
@@ -627,7 +676,7 @@ class ETLOrchestrator:
             if not grouped:
 
                 raise ValueError(
-                    "No valid dataset found."
+                    "No valid dataset found.",
                 )
 
             logger.info(
@@ -675,17 +724,19 @@ class ETLOrchestrator:
                 )
             )
 
-            dlpd_months = cls._get_dlpd_months(
-                grouped=grouped,
-                job_folder=job_folder,
+            dlpd_months = (
+                cls._get_dlpd_months(
+                    grouped=grouped,
+                    job_folder=job_folder,
+                )
             )
 
             business_months_set.update(
-                dlpd_months
+                dlpd_months,
             )
 
             business_months = sorted(
-                business_months_set
+                business_months_set,
             )
 
             logger.info(
@@ -711,18 +762,13 @@ class ETLOrchestrator:
             logger.info(
                 "EXISTING CUSTOMER LOCATION MONTHS : %s",
                 sorted(
-                    customer_location_months
+                    customer_location_months,
                 ),
             )
 
             # ==================================================
             # PHASE 1
             # BUILD COORDINATE MASTER FIRST
-            # ==================================================
-            #
-            # THIS IS THE IMPORTANT FIX.
-            #
-            # Customer location must exist before DLPD is merged.
             # ==================================================
 
             logger.info(
@@ -765,7 +811,7 @@ class ETLOrchestrator:
             # Stable chronological processing.
             customer_location_groups.sort(
                 key=lambda item: str(
-                    item[0]
+                    item[0],
                 ),
             )
 
@@ -777,13 +823,15 @@ class ETLOrchestrator:
                 valid_files = [
                     file_record
                     for file_record in files
-                    if cls._is_valid_file(
-                        file_record,
-                    )
-                    and not cls._is_coordinate_master(
-                        file_record[
-                            "filename"
-                        ],
+                    if (
+                        cls._is_valid_file(
+                            file_record,
+                        )
+                        and not cls._is_coordinate_master(
+                            file_record[
+                                "filename"
+                            ],
+                        )
                     )
                 ]
 
@@ -800,7 +848,7 @@ class ETLOrchestrator:
                 paths = list(
                     dict.fromkeys(
                         coordinate_master_paths
-                        + monthly_paths
+                        + monthly_paths,
                     )
                 )
 
@@ -820,14 +868,14 @@ class ETLOrchestrator:
                 logger.info(
                     "TO MASTER FILES : %s",
                     len(
-                        coordinate_master_paths
+                        coordinate_master_paths,
                     ),
                 )
 
                 logger.info(
                     "DIL FILES : %s",
                     len(
-                        monthly_paths
+                        monthly_paths,
                     ),
                 )
 
@@ -849,7 +897,7 @@ class ETLOrchestrator:
                 ] = output
 
                 customer_location_months.add(
-                    str(month)
+                    str(month),
                 )
 
                 logger.info(
@@ -868,7 +916,7 @@ class ETLOrchestrator:
                 for month in business_months:
 
                     month_key = str(
-                        month
+                        month,
                     )
 
                     if (
@@ -894,7 +942,7 @@ class ETLOrchestrator:
                     logger.info(
                         "MASTER FILES : %s",
                         len(
-                            coordinate_master_paths
+                            coordinate_master_paths,
                         ),
                     )
 
@@ -922,7 +970,7 @@ class ETLOrchestrator:
                     ] = output
 
                     customer_location_months.add(
-                        month_key
+                        month_key,
                     )
 
                     logger.info(
@@ -951,7 +999,7 @@ class ETLOrchestrator:
                         "Coordinate master exists, "
                         "but CUSTOMER_LOCATION could "
                         "not be created for months: "
-                        f"{missing_coordinate_months}"
+                        f"{missing_coordinate_months}",
                     )
 
             logger.info(
@@ -965,7 +1013,7 @@ class ETLOrchestrator:
             logger.info(
                 "CUSTOMER LOCATION MONTHS : %s",
                 sorted(
-                    customer_location_months
+                    customer_location_months,
                 ),
             )
 
@@ -975,9 +1023,6 @@ class ETLOrchestrator:
 
             # ==================================================
             # REGISTRY FOR CUSTOMER LOCATION
-            # ==================================================
-            #
-            # Register only real monthly outputs.
             # ==================================================
 
             for (
@@ -999,8 +1044,6 @@ class ETLOrchestrator:
                     month,
                 )
 
-                # Avoid duplicating an output if it was already
-                # generated during this phase.
                 outputs.append(
                     {
                         "dataset": (
@@ -1008,7 +1051,7 @@ class ETLOrchestrator:
                         ),
                         "month": month,
                         "output": str(
-                            output
+                            output,
                         ),
                     }
                 )
@@ -1016,16 +1059,6 @@ class ETLOrchestrator:
             # ==================================================
             # PHASE 2
             # PROCESS ALL OTHER DATASETS
-            # ==================================================
-            #
-            # CUSTOMER_LOCATION groups are skipped here because
-            # they were completely processed in PHASE 1.
-            #
-            # DLPD now has access to:
-            #
-            #     customer_location_<month>.parquet
-            #
-            # before MonthlyMerger tries to enrich it.
             # ==================================================
 
             logger.info(
@@ -1040,9 +1073,11 @@ class ETLOrchestrator:
                 "=" * 80,
             )
 
-            processing_groups = cls._expand_processing_groups(
-                grouped=grouped,
-                job_folder=job_folder,
+            processing_groups = (
+                cls._expand_processing_groups(
+                    grouped=grouped,
+                    job_folder=job_folder,
+                )
             )
 
             non_customer_groups = [
@@ -1056,11 +1091,12 @@ class ETLOrchestrator:
                     month,
                     files,
                 ) in processing_groups
-                if dataset != "CUSTOMER_LOCATION"
+                if dataset
+                != "CUSTOMER_LOCATION"
             ]
 
             total_groups = len(
-                non_customer_groups
+                non_customer_groups,
             )
 
             current_group = 0
@@ -1136,10 +1172,6 @@ class ETLOrchestrator:
                 # --------------------------------------------------
                 # DLPD safety check
                 # --------------------------------------------------
-                #
-                # If TO masters exist and the business month exists,
-                # CUSTOMER_LOCATION must already exist.
-                # --------------------------------------------------
 
                 if (
                     dataset
@@ -1149,7 +1181,7 @@ class ETLOrchestrator:
                 ):
 
                     month_key = str(
-                        month
+                        month,
                     )
 
                     coordinate_master_path = (
@@ -1167,7 +1199,7 @@ class ETLOrchestrator:
                             "Cannot process DLPD because "
                             "the coordinate master was not "
                             "created: "
-                            f"{coordinate_master_path}"
+                            f"{coordinate_master_path}",
                         )
 
                     logger.info(
@@ -1218,7 +1250,7 @@ class ETLOrchestrator:
                         "dataset": dataset,
                         "month": month,
                         "output": str(
-                            output
+                            output,
                         ),
                     }
                 )
@@ -1354,14 +1386,14 @@ class ETLOrchestrator:
             logger.exception(
                 "ETL FAILED FOR JOB %s",
                 manifest.get(
-                    "job_id"
+                    "job_id",
                 ),
             )
 
             return {
                 "success": False,
                 "job_id": manifest.get(
-                    "job_id"
+                    "job_id",
                 ),
                 "status": (
                     JobStatus.FAILED.value
