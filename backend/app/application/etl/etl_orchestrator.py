@@ -350,9 +350,16 @@ class ETLOrchestrator:
                     path.name,
                 )
 
-                resolved = MonthResolver.resolve_months(
-                    path,
-                )
+                try:
+                    resolved = MonthResolver.resolve_months(
+                        path,
+                    )
+                except Exception:
+                    logger.exception(
+                        "DLPD MONTH RESOLUTION FAILED | %s",
+                        path,
+                    )
+                    raise
 
                 normalized = {
                     str(month)
@@ -724,6 +731,13 @@ class ETLOrchestrator:
                 manifest["files"],
             )
 
+            JobManager.update(
+                job_folder,
+                status=JobStatus.MERGING,
+                progress=21,
+                step="GROUPING FILES COMPLETED",
+            )
+
             if not grouped:
 
                 raise ValueError(
@@ -765,6 +779,13 @@ class ETLOrchestrator:
                 )
             )
 
+            JobManager.update(
+                job_folder,
+                status=JobStatus.MERGING,
+                progress=22,
+                step="COLLECTING COORDINATE MASTERS COMPLETED",
+            )
+
             # ==================================================
             # BUSINESS MONTHS
             # ==================================================
@@ -773,6 +794,13 @@ class ETLOrchestrator:
                 cls._get_business_months(
                     grouped,
                 )
+            )
+
+            JobManager.update(
+                job_folder,
+                status=JobStatus.MERGING,
+                progress=23,
+                step="RESOLVING BUSINESS MONTHS",
             )
 
             # --------------------------------------------------
@@ -788,6 +816,11 @@ class ETLOrchestrator:
                 status=JobStatus.MERGING,
                 progress=25,
                 step="RESOLVING DLPD MONTHS",
+            )
+
+            logger.info(
+                "DLPD MONTH RESOLUTION START | JOB=%s",
+                manifest.get("job_id"),
             )
 
             dlpd_month_cache = (
@@ -813,6 +846,13 @@ class ETLOrchestrator:
             logger.info(
                 "DLPD RESOLVED MONTHS : %s",
                 sorted(dlpd_months),
+            )
+
+            JobManager.update(
+                job_folder,
+                status=JobStatus.MERGING,
+                progress=28,
+                step="DLPD MONTHS RESOLVED",
             )
 
             logger.info(
