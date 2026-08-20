@@ -19,59 +19,36 @@ from app.etl.validator.validator import DatasetValidator
 
 UPLOAD_FOLDER = RAW_UPLOAD
 
-# Keep each HTTP request comfortably below Cloudflare's payload limit.
-CHUNK_SIZE = 20 * 1024 * 1024  # 20 MB
+CHUNK_SIZE = 20 * 1024 * 1024
 
 
 class UploadService:
     """
-    Upload Engine
+    Upload Engine.
 
-    Normal upload:
+    Small file:
         Upload
             ↓
-        Save Files
+        Save
             ↓
-        Detect Dataset
+        Inspect
             ↓
-        Resolve Month
-            ↓
-        Validate
-            ↓
-        Create Manifest
-            ↓
-        Register Job
+        Finalize
 
-    Large-file upload:
-        Chunk 1
-        Chunk 2
-        Chunk 3
-           ...
-        Chunk N
+    Large file:
+        Upload Chunk 1..N
             ↓
-        Assemble File
+        /complete
             ↓
-        Detect Dataset
+        Create Job / Return Immediately
             ↓
-        Resolve Month
+        Background Assemble
             ↓
-        Validate
+        Inspect
             ↓
-        Create Manifest
+        Finalize
             ↓
-        Register Job
-
-    Coordinate master handling
-    --------------------------
-    TO_PRABAYAR.xlsx and TO_PASCABAYAR.xlsx are fixed coordinate
-    master files. They intentionally resolve to month=None.
-
-    The monthless state is valid for these files and must NOT be
-    replaced with a month inferred from the JOB folder, upload time,
-    or filesystem timestamp.
-
-    ETLPipeline is responsible for applying the coordinate masters
-    to the business months that are actually processed.
+        ETL
     """
 
     COORDINATE_MASTER_FILES = {
@@ -84,7 +61,9 @@ class UploadService:
     # ==========================================================
 
     @staticmethod
-    def _normalize_filename(filename: str) -> str:
+    def _normalize_filename(
+        filename: str,
+    ) -> str:
         name = filename.lower().strip()
         name = name.replace("-", "_").replace(" ", "_")
 
@@ -121,7 +100,7 @@ class UploadService:
         return safe
 
     # ==========================================================
-    # VALIDATE / BUILD FILE METADATA
+    # INSPECT FILE
     # ==========================================================
 
     @classmethod
@@ -146,6 +125,7 @@ class UploadService:
             )
 
             if dataset == FileDetector.UNKNOWN:
+
                 validation = {
                     "status": "FAILED",
                     "missing_columns": [],
@@ -155,6 +135,7 @@ class UploadService:
                 }
 
             else:
+
                 month = MonthResolver.resolve(
                     destination,
                 )
@@ -186,6 +167,7 @@ class UploadService:
                 )
 
         except Exception as exc:
+
             traceback.print_exc()
 
             dataset = None
@@ -204,12 +186,12 @@ class UploadService:
         )
 
         if is_coordinate_master:
+
             print(
                 "✓ Coordinate Master :",
                 filename,
             )
 
-            # Coordinate masters are deliberately monthless.
             month = None
 
             if dataset == FileDetector.UNKNOWN:
@@ -221,17 +203,21 @@ class UploadService:
             "content_type": content_type,
             "dataset": dataset,
             "month": month,
-            "is_coordinate_master": is_coordinate_master,
+            "is_coordinate_master": (
+                is_coordinate_master
+            ),
             "validation": validation["status"],
             "missing_columns": validation.get(
                 "missing_columns",
                 [],
             ),
-            "error": validation.get("error"),
+            "error": validation.get(
+                "error",
+            ),
         }
 
     # ==========================================================
-    # NORMAL SMALL-FILE UPLOAD
+    # NORMAL SMALL FILE UPLOAD
     # ==========================================================
 
     @classmethod
@@ -239,19 +225,17 @@ class UploadService:
         cls,
         files: list[UploadFile],
     ):
-        """
-        Existing upload endpoint.
-
-        Keep this for small files and backward compatibility.
-        Large files should use chunk upload.
-        """
 
         print("=" * 80)
         print("UPLOAD START")
 
-        job_id = datetime.now().strftime(
-            "JOB_%Y%m%d_%H%M%S"
-        ) + "_" + uuid.uuid4().hex[:8]
+        job_id = (
+            datetime.now().strftime(
+                "JOB_%Y%m%d_%H%M%S",
+            )
+            + "_"
+            + uuid.uuid4().hex[:8]
+        )
 
         job_folder = (
             UPLOAD_FOLDER
@@ -277,8 +261,10 @@ class UploadService:
                 or "uploaded_file"
             )
 
-            safe_filename = cls._safe_filename(
-                original_filename,
+            safe_filename = (
+                cls._safe_filename(
+                    original_filename,
+                )
             )
 
             destination = (
@@ -292,6 +278,7 @@ class UploadService:
             ) as out:
 
                 while True:
+
                     chunk = await file.read(
                         1024 * 1024,
                     )
@@ -299,7 +286,9 @@ class UploadService:
                     if not chunk:
                         break
 
-                    await out.write(chunk)
+                    await out.write(
+                        chunk,
+                    )
 
             print("✓ Saved")
             print(
@@ -340,26 +329,20 @@ class UploadService:
         total_chunks: int,
         file: UploadFile,
     ) -> dict:
-        """
-        Receive ONE chunk only.
-
-        Each request should be approximately 20 MB,
-        avoiding the 711 MB Cloudflare request problem.
-        """
 
         if chunk_number < 0:
             raise ValueError(
-                "chunk_number must be >= 0"
+                "chunk_number must be >= 0",
             )
 
         if total_chunks <= 0:
             raise ValueError(
-                "total_chunks must be > 0"
+                "total_chunks must be > 0",
             )
 
         if chunk_number >= total_chunks:
             raise ValueError(
-                "chunk_number must be smaller than total_chunks"
+                "chunk_number must be smaller than total_chunks",
             )
 
         safe_filename = cls._safe_filename(
@@ -390,6 +373,7 @@ class UploadService:
         ) as out:
 
             while True:
+
                 data = await file.read(
                     1024 * 1024,
                 )
@@ -423,11 +407,17 @@ class UploadService:
         }
 
     # ==========================================================
-    # COMPLETE CHUNK UPLOAD
+    # PREPARE COMPLETE
+    #
+    # IMPORTANT:
+    # JANGAN assemble di sini.
+    #
+    # Endpoint harus cepat return supaya Cloudflare
+    # tidak timeout.
     # ==========================================================
 
     @classmethod
-    async def complete_chunk_upload(
+    async def prepare_chunk_upload(
         cls,
         upload_id: str,
         filename: str,
@@ -437,7 +427,7 @@ class UploadService:
 
         if total_chunks <= 0:
             raise ValueError(
-                "total_chunks must be > 0"
+                "total_chunks must be > 0",
             )
 
         safe_filename = cls._safe_filename(
@@ -452,11 +442,11 @@ class UploadService:
 
         if not chunks_folder.exists():
             raise FileNotFoundError(
-                f"Upload '{upload_id}' not found."
+                f"Upload '{upload_id}' not found.",
             )
 
         # ======================================================
-        # VERIFY ALL CHUNKS EXIST
+        # VERIFY CHUNKS
         # ======================================================
 
         missing_chunks: list[int] = []
@@ -474,6 +464,7 @@ class UploadService:
                 )
 
         if missing_chunks:
+
             raise ValueError(
                 "Missing chunks: "
                 + ", ".join(
@@ -488,9 +479,13 @@ class UploadService:
         # CREATE JOB
         # ======================================================
 
-        job_id = datetime.now().strftime(
-            "JOB_%Y%m%d_%H%M%S"
-        ) + "_" + uuid.uuid4().hex[:8]
+        job_id = (
+            datetime.now().strftime(
+                "JOB_%Y%m%d_%H%M%S",
+            )
+            + "_"
+            + uuid.uuid4().hex[:8]
+        )
 
         job_folder = (
             UPLOAD_FOLDER
@@ -502,27 +497,130 @@ class UploadService:
             exist_ok=True,
         )
 
+        # Metadata disimpan supaya background worker
+        # tidak bergantung pada request HTTP lagi.
+
+        upload_metadata = {
+            "upload_id": upload_id,
+            "filename": safe_filename,
+            "original_filename": filename,
+            "total_chunks": total_chunks,
+            "content_type": content_type,
+            "job_id": job_id,
+            "created_at": datetime.now().isoformat(),
+        }
+
+        metadata_path = (
+            job_folder
+            / "chunk_upload.json"
+        )
+
+        async with aiofiles.open(
+            metadata_path,
+            "w",
+            encoding="utf-8",
+        ) as f:
+
+            await f.write(
+                json.dumps(
+                    upload_metadata,
+                    indent=4,
+                )
+            )
+
+        print("=" * 80)
+        print("CHUNK UPLOAD ACCEPTED")
+        print("Upload ID    :", upload_id)
+        print("Job ID       :", job_id)
+        print("Filename     :", safe_filename)
+        print("Total chunks :", total_chunks)
+        print("Background assembly scheduled")
+        print("=" * 80)
+
+        # Response CEPAT.
+        #
+        # Belum berarti ETL selesai.
+        # Ini hanya berarti semua chunk sudah diterima.
+
+        return {
+            "success": True,
+            "job_id": job_id,
+            "uploaded_at": datetime.now().isoformat(),
+            "total_files": 1,
+            "files": [],
+            "status": "ASSEMBLY_QUEUED",
+        }
+
+    # ==========================================================
+    # COMPLETE CHUNKED UPLOAD
+    #
+    # Hanya melakukan validasi + membuat job.
+    # Assembly tetap dijalankan di background oleh router.
+    # ==========================================================
+
+    @classmethod
+    async def complete_chunk_upload(
+        cls,
+        upload_id: str,
+        filename: str,
+        total_chunks: int,
+        content_type: str | None = None,
+    ) -> dict:
+        return await cls.prepare_chunk_upload(
+            upload_id=upload_id,
+            filename=filename,
+            total_chunks=total_chunks,
+            content_type=content_type,
+        )
+
+    # ==========================================================
+    # BACKGROUND ASSEMBLY
+    # ==========================================================
+
+    @classmethod
+    async def assemble_chunk_upload(
+        cls,
+        upload_id: str,
+        job_id: str,
+        filename: str,
+        total_chunks: int,
+        content_type: str | None = None,
+    ) -> None:
+
+        safe_filename = cls._safe_filename(
+            filename,
+        )
+
+        chunks_folder = (
+            UPLOAD_FOLDER
+            / "_chunks"
+            / upload_id
+        )
+
+        job_folder = (
+            UPLOAD_FOLDER
+            / job_id
+        )
+
         destination = (
             job_folder
             / safe_filename
         )
 
-        print("=" * 80)
-        print("ASSEMBLING CHUNKED UPLOAD")
-        print("Upload ID :", upload_id)
-        print("Filename  :", safe_filename)
-        print("Chunks    :", total_chunks)
-        print("Target    :", destination)
-        print("=" * 80)
+        try:
 
-        # ======================================================
-        # STREAM CHUNKS INTO FINAL FILE
-        # ======================================================
+            print("=" * 80)
+            print("BACKGROUND CHUNK ASSEMBLY START")
+            print("Upload ID :", upload_id)
+            print("Job ID    :", job_id)
+            print("Filename  :", safe_filename)
+            print("Chunks    :", total_chunks)
+            print("Target    :", destination)
+            print("=" * 80)
 
-        async with aiofiles.open(
-            destination,
-            "wb",
-        ) as output:
+            # ==================================================
+            # VERIFY AGAIN
+            # ==================================================
 
             for index in range(total_chunks):
 
@@ -531,68 +629,143 @@ class UploadService:
                     / f"{index:08d}.part"
                 )
 
-                async with aiofiles.open(
-                    chunk_path,
-                    "rb",
-                ) as source:
+                if not chunk_path.exists():
+                    raise FileNotFoundError(
+                        f"Missing chunk {index}",
+                    )
 
-                    while True:
-                        data = await source.read(
-                            1024 * 1024,
-                        )
+            # ==================================================
+            # ASSEMBLE
+            # ==================================================
 
-                        if not data:
-                            break
+            async with aiofiles.open(
+                destination,
+                "wb",
+            ) as output:
 
-                        await output.write(
-                            data,
-                        )
+                for index in range(total_chunks):
 
-                print(
-                    f"✓ Assembled chunk "
-                    f"{index + 1}/{total_chunks}"
-                )
+                    chunk_path = (
+                        chunks_folder
+                        / f"{index:08d}.part"
+                    )
 
-        # ======================================================
-        # INSPECT FINAL FILE
-        # ======================================================
+                    async with aiofiles.open(
+                        chunk_path,
+                        "rb",
+                    ) as source:
 
-        metadata = cls._inspect_file(
-            destination=destination,
-            filename=safe_filename,
-            content_type=content_type,
-        )
+                        while True:
 
-        metadata["original_filename"] = (
-            filename
-        )
+                            data = await source.read(
+                                1024 * 1024,
+                            )
 
-        result = await cls._finalize_job(
-            job_id=job_id,
-            job_folder=job_folder,
-            uploaded=[
-                metadata,
-            ],
-        )
+                            if not data:
+                                break
 
-        # ======================================================
-        # REMOVE TEMPORARY CHUNKS
-        # ======================================================
+                            await output.write(
+                                data,
+                            )
 
-        try:
-            for chunk_path in chunks_folder.glob(
-                "*.part",
-            ):
-                chunk_path.unlink(
-                    missing_ok=True,
-                )
+                    progress = (
+                        (index + 1)
+                        / total_chunks
+                        * 100
+                    )
 
-            chunks_folder.rmdir()
+                    print(
+                        f"✓ Assembled "
+                        f"{index + 1}/{total_chunks} "
+                        f"({progress:.1f}%)"
+                    )
 
-        except Exception:
+            print(
+                "✓ FINAL FILE:",
+                destination,
+            )
+
+            print(
+                "✓ SIZE:",
+                destination.stat().st_size,
+                "bytes",
+            )
+
+            # ==================================================
+            # INSPECT
+            # ==================================================
+
+            metadata = cls._inspect_file(
+                destination=destination,
+                filename=safe_filename,
+                content_type=content_type,
+            )
+
+            metadata["original_filename"] = (
+                filename
+            )
+
+            # ==================================================
+            # FINALIZE
+            # ==================================================
+
+            await cls._finalize_job(
+                job_id=job_id,
+                job_folder=job_folder,
+                uploaded=[
+                    metadata,
+                ],
+            )
+
+            # ==================================================
+            # DELETE CHUNKS
+            # ==================================================
+
+            try:
+
+                for chunk_path in chunks_folder.glob(
+                    "*.part",
+                ):
+
+                    chunk_path.unlink(
+                        missing_ok=True,
+                    )
+
+                chunks_folder.rmdir()
+
+            except Exception:
+                traceback.print_exc()
+
+            print("=" * 80)
+            print("BACKGROUND CHUNK ASSEMBLY FINISHED")
+            print("JOB ID :", job_id)
+            print("=" * 80)
+
+        except Exception as exc:
+
+            print("=" * 80)
+            print("BACKGROUND CHUNK ASSEMBLY FAILED")
+            print("JOB ID :", job_id)
+            print("ERROR  :", exc)
+            print("=" * 80)
+
             traceback.print_exc()
 
-        return result
+            # Jangan hapus chunks kalau gagal.
+            # Jadi upload masih bisa direcovery.
+
+            try:
+
+                JobManager.update(
+                    job_folder=job_folder,
+                    status=JobStatus.FAILED,
+                    progress=0,
+                    step="ASSEMBLY_FAILED",
+                )
+
+            except Exception:
+
+                traceback.print_exc()
 
     # ==========================================================
     # FINALIZE JOB
@@ -649,7 +822,7 @@ class UploadService:
             item["filename"]
             for item in uploaded
             if item.get(
-                "is_coordinate_master"
+                "is_coordinate_master",
             )
         ]
 
@@ -657,7 +830,7 @@ class UploadService:
             item["filename"]
             for item in uploaded
             if item.get(
-                "validation"
+                "validation",
             ) != "PASSED"
         ]
 
