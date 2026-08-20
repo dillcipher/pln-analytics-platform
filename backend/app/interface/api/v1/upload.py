@@ -52,11 +52,11 @@ def _run_etl(
 )
 async def upload_files(
     background_tasks: BackgroundTasks,
-    files: Annotated[
-        list[UploadFile],
+    file: Annotated[
+        UploadFile,
         File(
             ...,
-            description="Excel files to upload",
+            description="Excel file to upload",
         ),
     ],
 ):
@@ -64,16 +64,20 @@ async def upload_files(
 
     print("=" * 80)
     print("UPLOAD API CALLED")
-    print(f"TOTAL FILES : {len(files)}")
+    print("TOTAL FILES : 1")
+    print(f"FILE : {file.filename}")
     print("=" * 80)
 
     try:
         # ==================================================
-        # SAVE FILES
+        # SAVE FILE
+        #
+        # UploadService tetap menggunakan list[UploadFile],
+        # sehingga pipeline existing tidak perlu diubah.
         # ==================================================
 
         result = await UploadService.save_files(
-            files,
+            [file],
         )
 
         # ==================================================
@@ -102,6 +106,9 @@ async def upload_files(
         print(
             "ETL RUNNING IN BACKGROUND..."
         )
+        print(
+            f"JOB ID : {result['job_id']}"
+        )
         print("=" * 80)
 
         return result
@@ -115,6 +122,12 @@ async def upload_files(
         print("=" * 80)
         print(
             f"UPLOAD FAILED ({duration:.2f}s)"
+        )
+        print(
+            f"ERROR : {e}"
+        )
+        print(
+            f"DURATION : {duration:.2f}s"
         )
         print("=" * 80)
 
