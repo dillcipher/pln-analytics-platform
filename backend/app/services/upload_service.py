@@ -696,17 +696,103 @@ class UploadService:
             )
 
             # ==================================================
-            # INSPECT
+            # LIGHTWEIGHT INSPECTION
+            #
+            # IMPORTANT:
+            # Chunked upload dapat digunakan untuk file Excel
+            # berukuran sangat besar (contoh DLPD >700 MB).
+            #
+            # Jangan memanggil _inspect_file() di sini karena
+            # _inspect_file() menjalankan DatasetValidator.validate()
+            # yang membaca isi Excel dengan pandas.read_excel().
+            #
+            # Assembly harus selesai secepat mungkin:
+            #
+            #   assemble
+            #       ↓
+            #   detect dataset
+            #       ↓
+            #   resolve month
+            #       ↓
+            #   create manifest
+            #       ↓
+            #   ETL melakukan full validation
+            #
+            # Full validation tetap dipertahankan untuk normal
+            # upload melalui save_files().
             # ==================================================
 
-            metadata = cls._inspect_file(
-                destination=destination,
-                filename=safe_filename,
-                content_type=content_type,
+            dataset = FileDetector.detect(
+                destination,
             )
 
-            metadata["original_filename"] = (
-                filename
+            month = None
+
+            if dataset == FileDetector.UNKNOWN:
+                print(
+                    "WARNING: Unable to detect dataset from filename."
+                )
+            else:
+                try:
+                    month = MonthResolver.resolve(
+                        destination,
+                    )
+                except Exception as exc:
+                    print(
+                        "WARNING: Month resolution failed:",
+                        exc,
+                    )
+                    month = None
+
+            is_coordinate_master = (
+                cls._is_coordinate_master(
+                    safe_filename,
+                )
+            )
+
+            if is_coordinate_master:
+                print(
+                    "✓ Coordinate Master :",
+                    safe_filename,
+                )
+
+                # Coordinate masters intentionally have no month.
+                month = None
+
+                if dataset == FileDetector.UNKNOWN:
+                    dataset = FileDetector.CUSTOMER_LOCATION
+
+            metadata = {
+                "filename": safe_filename,
+                "size": destination.stat().st_size,
+                "content_type": content_type,
+                "dataset": dataset,
+                "month": month,
+                "is_coordinate_master": (
+                    is_coordinate_master
+                ),
+
+                # Full validation is intentionally deferred to ETL.
+                "validation": "PENDING",
+                "missing_columns": [],
+                "error": None,
+
+                "original_filename": filename,
+            }
+
+            print(
+                "✓ Dataset :",
+                dataset,
+            )
+
+            print(
+                "✓ Month :",
+                month,
+            )
+
+            print(
+                "✓ Validation : PENDING "
+                "(deferred to ETL)",
             )
 
             # ==================================================
