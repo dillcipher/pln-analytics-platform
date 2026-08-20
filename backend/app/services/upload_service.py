@@ -40,13 +40,15 @@ class UploadService:
             ↓
         /complete
             ↓
-        Create Job / Return Immediately
+        Create Job
             ↓
-        Background Assemble
+        Return Immediately
+            ↓
+        Background Assembly
             ↓
         Inspect
             ↓
-        Finalize
+        Finalize / manifest.json
             ↓
         ETL
     """
@@ -409,11 +411,9 @@ class UploadService:
     # ==========================================================
     # PREPARE COMPLETE
     #
-    # IMPORTANT:
-    # JANGAN assemble di sini.
+    # TIDAK assemble di sini.
     #
-    # Endpoint harus cepat return supaya Cloudflare
-    # tidak timeout.
+    # Endpoint /complete harus cepat return.
     # ==========================================================
 
     @classmethod
@@ -497,8 +497,9 @@ class UploadService:
             exist_ok=True,
         )
 
-        # Metadata disimpan supaya background worker
-        # tidak bergantung pada request HTTP lagi.
+        # ======================================================
+        # SAVE ASSEMBLY METADATA
+        # ======================================================
 
         upload_metadata = {
             "upload_id": upload_id,
@@ -534,13 +535,8 @@ class UploadService:
         print("Job ID       :", job_id)
         print("Filename     :", safe_filename)
         print("Total chunks :", total_chunks)
-        print("Background assembly scheduled")
+        print("Assembly queued")
         print("=" * 80)
-
-        # Response CEPAT.
-        #
-        # Belum berarti ETL selesai.
-        # Ini hanya berarti semua chunk sudah diterima.
 
         return {
             "success": True,
@@ -553,9 +549,6 @@ class UploadService:
 
     # ==========================================================
     # COMPLETE CHUNKED UPLOAD
-    #
-    # Hanya melakukan validasi + membuat job.
-    # Assembly tetap dijalankan di background oleh router.
     # ==========================================================
 
     @classmethod
@@ -566,6 +559,7 @@ class UploadService:
         total_chunks: int,
         content_type: str | None = None,
     ) -> dict:
+
         return await cls.prepare_chunk_upload(
             upload_id=upload_id,
             filename=filename,
@@ -575,6 +569,16 @@ class UploadService:
 
     # ==========================================================
     # BACKGROUND ASSEMBLY
+    #
+    # IMPORTANT:
+    #
+    # Fungsi ini HARUS return hanya setelah:
+    #
+    # 1. XLSX selesai dirakit
+    # 2. Inspect selesai
+    # 3. manifest.json selesai dibuat
+    #
+    # Setelah itu router baru boleh menjalankan ETL.
     # ==========================================================
 
     @classmethod
@@ -585,7 +589,7 @@ class UploadService:
         filename: str,
         total_chunks: int,
         content_type: str | None = None,
-    ) -> None:
+    ) -> dict:
 
         safe_filename = cls._safe_filename(
             filename,
@@ -619,7 +623,7 @@ class UploadService:
             print("=" * 80)
 
             # ==================================================
-            # VERIFY AGAIN
+            # VERIFY CHUNKS
             # ==================================================
 
             for index in range(total_chunks):
@@ -707,14 +711,36 @@ class UploadService:
 
             # ==================================================
             # FINALIZE
+            #
+            # INI MEMBUAT manifest.json
             # ==================================================
 
-            await cls._finalize_job(
+            result = await cls._finalize_job(
                 job_id=job_id,
                 job_folder=job_folder,
                 uploaded=[
                     metadata,
                 ],
+            )
+
+            # ==================================================
+            # VERIFY MANIFEST REALLY EXISTS
+            # ==================================================
+
+            manifest_path = (
+                job_folder
+                / "manifest.json"
+            )
+
+            if not manifest_path.exists():
+                raise FileNotFoundError(
+                    f"Manifest was not created: "
+                    f"{manifest_path}",
+                )
+
+            print(
+                "✓ MANIFEST READY:",
+                manifest_path,
             )
 
             # ==================================================
@@ -726,7 +752,6 @@ class UploadService:
                 for chunk_path in chunks_folder.glob(
                     "*.part",
                 ):
-
                     chunk_path.unlink(
                         missing_ok=True,
                     )
@@ -734,12 +759,24 @@ class UploadService:
                 chunks_folder.rmdir()
 
             except Exception:
+
                 traceback.print_exc()
 
             print("=" * 80)
             print("BACKGROUND CHUNK ASSEMBLY FINISHED")
             print("JOB ID :", job_id)
+            print("MANIFEST:", manifest_path)
             print("=" * 80)
+
+            # IMPORTANT:
+            # Return hanya setelah manifest tersedia.
+            return {
+                **result,
+                "status": "ASSEMBLY_COMPLETED",
+                "manifest_path": str(
+                    manifest_path,
+                ),
+            }
 
         except Exception as exc:
 
@@ -750,9 +787,6 @@ class UploadService:
             print("=" * 80)
 
             traceback.print_exc()
-
-            # Jangan hapus chunks kalau gagal.
-            # Jadi upload masih bisa direcovery.
 
             try:
 
@@ -766,6 +800,13 @@ class UploadService:
             except Exception:
 
                 traceback.print_exc()
+
+            # PENTING:
+            # Jangan telan exception.
+            #
+            # Router/background pipeline harus tahu
+            # assembly gagal supaya ETL TIDAK dijalankan.
+            raise
 
     # ==========================================================
     # FINALIZE JOB
@@ -809,6 +850,13 @@ class UploadService:
                     indent=4,
                     default=str,
                 )
+            )
+
+        # Pastikan file benar-benar ada
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"Manifest not found after creation: "
+                f"{manifest_path}",
             )
 
         JobManager.update(
