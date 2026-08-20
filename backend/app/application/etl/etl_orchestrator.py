@@ -287,26 +287,23 @@ class ETLOrchestrator:
     # ==========================================================
 
     @classmethod
-    def _get_dlpd_months(
+    def _resolve_dlpd_month_cache(
         cls,
         grouped: dict,
         job_folder: Path,
-    ) -> set[str]:
+    ) -> dict[str, set[str]]:
         """
-        Resolve all business months contained inside DLPD files.
+        Resolve DLPD business months once per source file.
 
-        A DLPD Excel file may contain multiple business months.
-        Therefore the manifest/group month must NOT be treated as
-        the only month available for DLPD.
+        A single DLPD workbook may contain records for multiple
+        business months. MonthResolver therefore inspects the actual
+        workbook and returns every month represented by its rows.
 
-        MonthResolver reads the actual DLPD detail rows using:
-
-            THBL -> DLPD_TGLBACA -> THBLREK
-
-        and returns all months represented by the file.
+        The result is cached by filename so the same workbook is not
+        read a second time later by ``_expand_processing_groups``.
         """
 
-        months: set[str] = set()
+        month_cache: dict[str, set[str]] = {}
 
         for (
             dataset,
@@ -327,39 +324,77 @@ class ETLOrchestrator:
                 )
             ]
 
-            paths = cls._build_paths(
-                job_folder,
-                valid_files,
-            )
+            for file_record in valid_files:
+                filename = file_record.get("filename")
 
-            for path in paths:
+                if not filename:
+                    continue
+
+                # A filename can appear in more than one manifest group.
+                # Resolve it only once.
+                if filename in month_cache:
+                    continue
+
+                path = job_folder / filename
 
                 if not path.exists():
                     logger.warning(
-                        "DLPD file not found while "
-                        "resolving months: %s",
+                        "DLPD file not found while resolving months: %s",
                         path,
                     )
+                    month_cache[filename] = set()
                     continue
 
-                resolved = (
-                    MonthResolver.resolve_months(
-                        path,
-                    )
-                )
-
                 logger.info(
-                    "DLPD MONTH RESOLUTION | %s | %s -> %s",
-                    dataset,
+                    "RESOLVING DLPD MONTHS | %s",
                     path.name,
-                    resolved,
                 )
 
-                months.update(
+                resolved = MonthResolver.resolve_months(
+                    path,
+                )
+
+                normalized = {
                     str(month)
                     for month in resolved
                     if month
+                }
+
+                month_cache[filename] = normalized
+
+                logger.info(
+                    "DLPD MONTH RESOLUTION | %s -> %s",
+                    path.name,
+                    sorted(normalized),
                 )
+
+        return month_cache
+
+    # ==========================================================
+
+    @classmethod
+    def _get_dlpd_months(
+        cls,
+        grouped: dict,
+        job_folder: Path,
+    ) -> set[str]:
+        """
+        Return the union of all months resolved from DLPD files.
+
+        This compatibility helper delegates to the per-file cache so
+        callers still receive the original ``set[str]`` contract while
+        avoiding duplicate workbook resolution inside a single call.
+        """
+
+        cache = cls._resolve_dlpd_month_cache(
+            grouped=grouped,
+            job_folder=job_folder,
+        )
+
+        months: set[str] = set()
+
+        for resolved in cache.values():
+            months.update(resolved)
 
         return months
 
@@ -372,6 +407,7 @@ class ETLOrchestrator:
         cls,
         grouped: dict,
         job_folder: Path,
+        dlpd_month_cache: dict[str, set[str]] | None = None,
     ) -> list[
         tuple[
             str,
@@ -396,6 +432,10 @@ class ETLOrchestrator:
 
         MonthlyMerger is responsible for filtering rows to that
         target MONTH before exporting the parquet.
+
+        ``dlpd_month_cache`` contains the result of the initial DLPD
+        month-resolution pass. Reusing it is important for large
+        workbooks because MonthResolver reads the Excel file.
 
         Non-DLPD datasets retain the original grouping behavior.
         """
@@ -446,25 +486,36 @@ class ETLOrchestrator:
 
             resolved_months: set[str] = set()
 
+            # Reuse the month-resolution result produced during the
+            # initial DLPD scan. This prevents reading the same large
+            # workbook twice during one ETL job.
             for file_record in valid_files:
 
-                path = (
-                    job_folder
-                    / file_record["filename"]
-                )
+                filename = file_record.get("filename")
 
-                if not path.exists():
-                    logger.warning(
-                        "DLPD source file does not exist: %s",
-                        path,
-                    )
+                if not filename:
                     continue
 
-                months = (
-                    MonthResolver.resolve_months(
+                if dlpd_month_cache is not None:
+                    months = dlpd_month_cache.get(
+                        filename,
+                        set(),
+                    )
+                else:
+                    # Backward-compatible fallback for callers that
+                    # invoke this helper directly without a cache.
+                    path = job_folder / filename
+
+                    if not path.exists():
+                        logger.warning(
+                            "DLPD source file does not exist: %s",
+                            path,
+                        )
+                        continue
+
+                    months = MonthResolver.resolve_months(
                         path,
                     )
-                )
 
                 resolved_months.update(
                     str(month)
@@ -724,12 +775,32 @@ class ETLOrchestrator:
                 )
             )
 
-            dlpd_months = (
-                cls._get_dlpd_months(
+            # --------------------------------------------------
+            # Resolve DLPD months ONCE.
+            #
+            # This is intentionally done before CUSTOMER_LOCATION
+            # is built because DLPD may introduce business months
+            # that are not present in the manifest grouping.
+            # --------------------------------------------------
+
+            JobManager.update(
+                job_folder,
+                status=JobStatus.MERGING,
+                progress=25,
+                step="RESOLVING DLPD MONTHS",
+            )
+
+            dlpd_month_cache = (
+                cls._resolve_dlpd_month_cache(
                     grouped=grouped,
                     job_folder=job_folder,
                 )
             )
+
+            dlpd_months: set[str] = set()
+
+            for resolved in dlpd_month_cache.values():
+                dlpd_months.update(resolved)
 
             business_months_set.update(
                 dlpd_months,
@@ -770,6 +841,13 @@ class ETLOrchestrator:
             # PHASE 1
             # BUILD COORDINATE MASTER FIRST
             # ==================================================
+
+            JobManager.update(
+                job_folder,
+                status=JobStatus.MERGING,
+                progress=30,
+                step="BUILDING CUSTOMER LOCATION",
+            )
 
             logger.info(
                 "=" * 80,
@@ -1077,6 +1155,7 @@ class ETLOrchestrator:
                 cls._expand_processing_groups(
                     grouped=grouped,
                     job_folder=job_folder,
+                    dlpd_month_cache=dlpd_month_cache,
                 )
             )
 
