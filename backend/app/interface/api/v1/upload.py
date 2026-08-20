@@ -35,12 +35,12 @@ def _run_etl(
     job_folder: Path,
 ) -> None:
     """
-    Run ETL for a completed upload.
+    Run ETL after a job has been completely assembled.
 
     IMPORTANT:
-    This function is intentionally isolated from the chunk
-    assembly itself. Assembly must finish first and create
-    manifest.json before ETL starts.
+    This function is ONLY for ETL.
+
+    Chunk assembly is NOT performed here.
     """
 
     try:
@@ -64,6 +64,10 @@ def _run_etl(
                 f"Manifest not found: {manifest_path}"
             )
 
+        print(
+            f"✓ Manifest found: {manifest_path}"
+        )
+
         ETLOrchestrator.process(
             job_folder,
         )
@@ -83,7 +87,7 @@ def _run_etl(
 
 
 # ==========================================================
-# NORMAL UPLOAD
+# NORMAL SMALL FILE UPLOAD
 # ==========================================================
 
 
@@ -120,8 +124,7 @@ async def upload_files(
             / result["job_id"]
         )
 
-        # Normal/small uploads can continue through
-        # the existing background ETL mechanism.
+        # Normal/small uploads can use background ETL.
         background_tasks.add_task(
             _run_etl,
             job_folder,
@@ -168,6 +171,18 @@ async def upload_files(
 
 # ==========================================================
 # CHUNK UPLOAD
+#
+# One request = one chunk.
+#
+# Example:
+#
+# chunk 0 -> 20 MB
+# chunk 1 -> 20 MB
+# chunk 2 -> 20 MB
+# ...
+#
+# This prevents Cloudflare from receiving the entire
+# 700+ MB Excel file in a single HTTP request.
 # ==========================================================
 
 
@@ -267,14 +282,28 @@ async def upload_chunk(
 #
 # IMPORTANT:
 #
-# Chunk assembly is the only operation performed here.
+# /complete DOES NOT return immediately anymore.
 #
-# The completed file and manifest are created first.
-# ETL is NOT started automatically for the large chunked
-# upload, preventing a 700+ MB Excel workload from immediately
-# consuming the API process after assembly.
+# It performs:
 #
-# ETL can then be triggered separately.
+#   1. Verify all chunks
+#   2. Create job
+#   3. Assemble the complete XLSX
+#   4. Detect dataset
+#   5. Resolve month
+#   6. Create manifest.json
+#   7. Verify manifest.json
+#   8. Return job_id
+#
+# ETL IS NOT STARTED HERE.
+#
+# This is intentional.
+#
+# The caller must use:
+#
+#   POST /api/v1/upload/process/{job_id}
+#
+# after /complete returns successfully.
 # ==========================================================
 
 
@@ -322,16 +351,84 @@ async def complete_upload(
     print("=" * 80)
 
     try:
-        # ==================================================
-        # ASSEMBLE ONLY
-        # ==================================================
+        # ======================================================
+        # STEP 1
+        # VERIFY CHUNKS + CREATE JOB
+        # ======================================================
 
-        result = await UploadService.complete_chunk_upload(
+        prepared = await UploadService.prepare_chunk_upload(
             upload_id=upload_id,
             filename=filename,
             total_chunks=total_chunks,
             content_type=content_type,
         )
+
+        job_id = prepared["job_id"]
+
+        job_folder = (
+            RAW_UPLOAD
+            / job_id
+        )
+
+        print("=" * 80)
+        print("CHUNK UPLOAD PREPARED")
+        print(f"UPLOAD ID : {upload_id}")
+        print(f"JOB ID    : {job_id}")
+        print(f"JOB FOLDER: {job_folder}")
+        print("=" * 80)
+
+        # ======================================================
+        # STEP 2
+        # ASSEMBLE SYNCHRONOUSLY
+        #
+        # DO NOT use BackgroundTasks here.
+        #
+        # We must guarantee that when /complete returns 200:
+        #
+        #   final XLSX exists
+        #   manifest.json exists
+        #
+        # This prevents the previous failure where:
+        #
+        # /complete → 200
+        # deployment restart
+        # background assembly/ETL disappears
+        # ======================================================
+
+        result = await UploadService.assemble_chunk_upload(
+            upload_id=upload_id,
+            job_id=job_id,
+            filename=filename,
+            total_chunks=total_chunks,
+            content_type=content_type,
+        )
+
+        # ======================================================
+        # STEP 3
+        # VERIFY FINAL JOB
+        # ======================================================
+
+        final_job_folder = (
+            RAW_UPLOAD
+            / result["job_id"]
+        )
+
+        if not final_job_folder.exists():
+            raise FileNotFoundError(
+                f"Job folder not found after assembly: "
+                f"{final_job_folder}"
+            )
+
+        manifest_path = (
+            final_job_folder
+            / "manifest.json"
+        )
+
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"Manifest not found after assembly: "
+                f"{manifest_path}"
+            )
 
         duration = (
             time.perf_counter()
@@ -340,18 +437,12 @@ async def complete_upload(
 
         print("=" * 80)
         print("CHUNKED UPLOAD COMPLETED")
-        print(
-            f"DURATION : {duration:.2f}s"
-        )
-        print(
-            f"JOB ID   : {result['job_id']}"
-        )
-        print(
-            "ASSEMBLY FINISHED"
-        )
-        print(
-            "ETL NOT STARTED AUTOMATICALLY"
-        )
+        print(f"JOB ID       : {result['job_id']}")
+        print(f"MANIFEST     : {manifest_path}")
+        print(f"DURATION     : {duration:.2f}s")
+        print("ASSEMBLY     : COMPLETED")
+        print("MANIFEST     : READY")
+        print("ETL          : NOT STARTED")
         print("=" * 80)
 
         return result
@@ -381,9 +472,7 @@ async def complete_upload(
         print("=" * 80)
         print("COMPLETE UPLOAD FAILED")
         print(f"ERROR    : {e}")
-        print(
-            f"DURATION : {duration:.2f}s"
-        )
+        print(f"DURATION : {duration:.2f}s")
         print("=" * 80)
 
         traceback.print_exc()
@@ -392,9 +481,25 @@ async def complete_upload(
             status_code=500,
             detail=str(e),
         )
+
+
 # ==========================================================
 # PROCESS EXISTING JOB
+#
+# Endpoint:
+#
+# POST /api/v1/upload/process/{job_id}
+#
+# This endpoint ONLY starts ETL.
+#
+# It requires:
+#
+#   job folder exists
+#   manifest.json exists
+#
+# Therefore /complete must succeed first.
 # ==========================================================
+
 
 @router.post(
     "/process/{job_id}",
@@ -403,26 +508,61 @@ async def process_existing_job(
     job_id: str,
     background_tasks: BackgroundTasks,
 ):
-    job_folder = RAW_UPLOAD / job_id
+    start = time.perf_counter()
+
+    print("=" * 80)
+    print("PROCESS EXISTING JOB")
+    print(f"JOB ID : {job_id}")
+    print("=" * 80)
+
+    job_folder = (
+        RAW_UPLOAD
+        / job_id
+    )
+
+    # ======================================================
+    # VERIFY JOB
+    # ======================================================
 
     if not job_folder.exists():
         raise HTTPException(
             status_code=404,
-            detail=f"Job folder not found: {job_folder}",
+            detail=f"Job not found: {job_id}",
         )
 
-    manifest_path = job_folder / "manifest.json"
+    manifest_path = (
+        job_folder
+        / "manifest.json"
+    )
 
     if not manifest_path.exists():
         raise HTTPException(
             status_code=404,
-            detail=f"Manifest not found: {manifest_path}",
+            detail=(
+                f"Manifest not found for job: "
+                f"{job_id}"
+            ),
         )
+
+    # ======================================================
+    # START ETL
+    # ======================================================
 
     background_tasks.add_task(
         _run_etl,
         job_folder,
     )
+
+    duration = (
+        time.perf_counter()
+        - start
+    )
+
+    print("=" * 80)
+    print("ETL SCHEDULED")
+    print(f"JOB ID   : {job_id}")
+    print(f"DURATION : {duration:.2f}s")
+    print("=" * 80)
 
     return {
         "success": True,
