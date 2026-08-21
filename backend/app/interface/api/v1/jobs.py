@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException
 
 from app.core.constants import RAW_UPLOAD
 from app.services.upload_service import UploadService
+from app.interface.api.v1.upload import ensure_job_processing
 
 
 router = APIRouter(
@@ -93,21 +94,12 @@ async def get_job(
         4. Supabase job.json
         5. Local chunk_upload.json
 
-    Important:
-
-        manifest.json represents the assembled job.
-
-        job.json represents the durable job state and can exist
-        before assembly finishes.
-
-    This endpoint must therefore continue returning a job while
-    assembly or ETL is running instead of returning 404 merely
-    because manifest.json is not available yet.
+    The endpoint also acts as the durable-job wake-up mechanism.
+    The frontend already polls this endpoint, so every poll is allowed
+    to idempotently kick an unfinished durable job after a FastAPI Cloud
+    instance restart. The upload router prevents duplicate in-process
+    execution for the same job_id.
     """
-
-    # ==========================================================
-    # VALIDATE JOB ID
-    # ==========================================================
 
     job_id = job_id.strip()
 
@@ -116,10 +108,6 @@ async def get_job(
             status_code=400,
             detail="Job ID is required.",
         )
-
-    # ==========================================================
-    # PATHS
-    # ==========================================================
 
     job_folder = (
         RAW_UPLOAD
@@ -141,13 +129,24 @@ async def get_job(
         / "chunk_upload.json"
     )
 
+    # ----------------------------------------------------------
+    # DURABLE WAKE-UP
+    # ----------------------------------------------------------
+    #
+    # This is intentionally fire-and-forget. It does not block the
+    # status response on assembly or ETL. If the current instance was
+    # restarted, the in-memory task registry is empty and this poll
+    # becomes the automatic resume trigger.
+    #
+    try:
+        ensure_job_processing(job_id)
+    except Exception:
+        # Status reporting must remain available even if the wake-up
+        # mechanism encounters an unexpected scheduling error.
+        pass
+
     # ==========================================================
     # 1. LOCAL MANIFEST
-    #
-    # Fast path.
-    #
-    # This is preferred because the current worker may be
-    # actively updating the manifest while ETL is running.
     # ==========================================================
 
     local_manifest_data = _read_json_file(
@@ -155,7 +154,6 @@ async def get_job(
     )
 
     if local_manifest_data is not None:
-
         return {
             **local_manifest_data,
             "success": True,
@@ -164,14 +162,6 @@ async def get_job(
 
     # ==========================================================
     # 2. LOCAL JOB METADATA
-    #
-    # IMPORTANT:
-    #
-    # Do this BEFORE going to Supabase.
-    #
-    # A background worker may already have created/updated
-    # job.json locally while manifest.json has not been created
-    # yet.
     # ==========================================================
 
     local_job_data = _read_json_file(
@@ -179,7 +169,6 @@ async def get_job(
     )
 
     if local_job_data is not None:
-
         return {
             **local_job_data,
             "success": True,
@@ -188,12 +177,9 @@ async def get_job(
 
     # ==========================================================
     # 3. SUPABASE MANIFEST
-    #
-    # Durable state after assembly.
     # ==========================================================
 
     try:
-
         manifest_key = (
             UploadService._job_manifest_s3_key(
                 job_id,
@@ -205,7 +191,6 @@ async def get_job(
         )
 
         if manifest_data is not None:
-
             return {
                 **manifest_data,
                 "success": True,
@@ -217,20 +202,9 @@ async def get_job(
 
     # ==========================================================
     # 4. SUPABASE JOB METADATA
-    #
-    # This should exist immediately after upload/complete.
-    #
-    # It is especially important during:
-    #
-    #     ASSEMBLY_QUEUED
-    #     ASSEMBLING
-    #     ASSEMBLY_FAILED
-    #
-    # when manifest.json may not exist yet.
     # ==========================================================
 
     try:
-
         metadata_key = (
             UploadService._job_metadata_s3_key(
                 job_id,
@@ -242,7 +216,6 @@ async def get_job(
         )
 
         if metadata is not None:
-
             return {
                 **metadata,
                 "success": True,
@@ -254,8 +227,6 @@ async def get_job(
 
     # ==========================================================
     # 5. LOCAL CHUNK METADATA
-    #
-    # Last local fallback.
     # ==========================================================
 
     chunk_data = _read_json_file(
@@ -263,16 +234,11 @@ async def get_job(
     )
 
     if chunk_data is not None:
-
         return {
             **chunk_data,
             "success": True,
             "job_id": job_id,
         }
-
-    # ==========================================================
-    # JOB DOES NOT EXIST
-    # ==========================================================
 
     raise HTTPException(
         status_code=404,
