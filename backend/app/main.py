@@ -14,12 +14,11 @@ from app.etl.detector.streaming_month_resolver_patch import (
     install_streaming_month_resolver_patch,
 )
 from app.infrastructure.storage.processed_storage import hydrate_processed_data
-
-# Install before the API router imports ETL modules. The patch only replaces
-# DLPD month scanning; all existing month business rules remain unchanged.
-install_streaming_month_resolver_patch()
-
 from app.interface.api.v1.router import api_v1_router
+
+# Install before any ETL job executes. The patch only replaces DLPD month
+# scanning; all existing month business rules remain unchanged.
+install_streaming_month_resolver_patch()
 
 settings = get_settings()
 configure_logging(settings.DEBUG)
