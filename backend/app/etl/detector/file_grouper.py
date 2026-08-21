@@ -4,6 +4,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import DefaultDict
 
+from app.core.constants import RAW_UPLOAD
 from app.etl.detector.detector import FileDetector
 
 
@@ -53,6 +54,29 @@ class FileGrouper:
 
         return aliases.get(normalized, normalized or None)
 
+    @staticmethod
+    def _find_uploaded_file(filename: str) -> Path | None:
+        """Find a legacy assembled file when the caller has no job_folder.
+
+        Older ETL jobs call ``group(manifest[\"files\"])`` without passing the
+        job directory. Search the durable incoming tree so those jobs can be
+        reclassified after a deployment instead of being permanently stuck
+        with dataset=None.
+        """
+        try:
+            candidates = [
+                path
+                for path in RAW_UPLOAD.glob(f"*/{Path(filename).name}")
+                if path.is_file()
+            ]
+        except Exception:
+            return None
+
+        if not candidates:
+            return None
+
+        return max(candidates, key=lambda path: path.stat().st_mtime_ns)
+
     @classmethod
     def _resolve_dataset(
         cls,
@@ -62,7 +86,6 @@ class FileGrouper:
         filename = file.get("filename") or file.get("name")
         manifest_dataset = cls._normalize_dataset(file.get("dataset"))
 
-        # Fast path: authoritative filename detection.
         if filename:
             try:
                 detected = FileDetector.detect(Path(str(filename)))
@@ -72,19 +95,26 @@ class FileGrouper:
             if detected in cls.KNOWN_DATASETS:
                 return detected
 
-        # Recovery path: inspect the actual assembled workbook. This is what
-        # fixes old jobs whose manifest contains dataset=None and filename
-        # such as test.xlsx.
+        # Prefer the current job folder when supplied.
+        actual_path = None
         if filename and job_folder is not None:
-            actual_path = job_folder / str(filename)
-            if actual_path.exists():
-                try:
-                    detected = FileDetector.detect(actual_path)
-                except Exception:
-                    detected = FileDetector.UNKNOWN
+            candidate = job_folder / str(filename)
+            if candidate.exists():
+                actual_path = candidate
 
-                if detected in cls.KNOWN_DATASETS:
-                    return detected
+        # Legacy recovery: older orchestrator versions did not pass the job
+        # folder into FileGrouper. Find the assembled workbook on disk.
+        if actual_path is None and filename:
+            actual_path = cls._find_uploaded_file(str(filename))
+
+        if actual_path is not None:
+            try:
+                detected = FileDetector.detect(actual_path)
+            except Exception:
+                detected = FileDetector.UNKNOWN
+
+            if detected in cls.KNOWN_DATASETS:
+                return detected
 
         if manifest_dataset in cls.KNOWN_DATASETS:
             return manifest_dataset
