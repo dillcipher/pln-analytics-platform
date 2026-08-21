@@ -8,7 +8,6 @@ from typing import Annotated
 
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
     File,
     Form,
     HTTPException,
@@ -25,6 +24,47 @@ router = APIRouter(
     prefix="/upload",
     tags=["Upload"],
 )
+
+
+# ==========================================================
+# IN-PROCESS TASK SCHEDULER
+# ==========================================================
+#
+# FastAPI BackgroundTasks starts work only after the response has
+# completed. On serverless/cloud deployments the instance may be
+# recycled immediately after the response, which can leave the job
+# permanently stuck at ASSEMBLY_QUEUED/UPLOADED.
+#
+# asyncio.create_task() schedules the coroutine on the currently
+# running event loop before the request lifecycle has fully unwound.
+# Strong references are kept until completion.
+#
+# This is still an in-process executor. A durable external worker/queue
+# is required for guarantees across a full instance restart. This change
+# removes the current "task never starts after response" failure mode
+# without reintroducing a second frontend ETL trigger.
+# ==========================================================
+
+_RUNNING_TASKS: set[asyncio.Task] = set()
+
+
+def _schedule_task(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _RUNNING_TASKS.add(task)
+
+    def _discard(completed_task: asyncio.Task) -> None:
+        _RUNNING_TASKS.discard(completed_task)
+
+        try:
+            completed_task.exception()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            # The underlying pipeline logs its own failure.
+            pass
+
+    task.add_done_callback(_discard)
+    return task
 
 
 # ==========================================================
@@ -191,7 +231,6 @@ async def _run_assembly_and_etl(
     response_model=UploadResponse,
 )
 async def upload_files(
-    background_tasks: BackgroundTasks,
     file: Annotated[
         UploadFile,
         File(
@@ -213,9 +252,11 @@ async def upload_files(
             / result["job_id"]
         )
 
-        background_tasks.add_task(
-            _run_etl,
-            job_folder,
+        _schedule_task(
+            asyncio.to_thread(
+                _run_etl,
+                job_folder,
+            )
         )
 
         duration = (
@@ -331,7 +372,6 @@ async def upload_chunk(
     response_model=UploadResponse,
 )
 async def complete_upload(
-    background_tasks: BackgroundTasks,
     upload_id: Annotated[
         str,
         Form(
@@ -391,13 +431,14 @@ async def complete_upload(
         # QUEUE HEAVY WORK
         # --------------------------------------------------
 
-        background_tasks.add_task(
-            _run_assembly_and_etl,
-            upload_id,
-            job_id,
-            filename,
-            total_chunks,
-            content_type,
+        _schedule_task(
+            _run_assembly_and_etl(
+                upload_id=upload_id,
+                job_id=job_id,
+                filename=filename,
+                total_chunks=total_chunks,
+                content_type=content_type,
+            )
         )
 
         duration = (
@@ -451,7 +492,6 @@ async def complete_upload(
 )
 async def process_existing_job(
     job_id: str,
-    background_tasks: BackgroundTasks,
 ):
     """
     Manually trigger ETL for an existing job.
@@ -497,9 +537,11 @@ async def process_existing_job(
 
     if manifest_path.exists():
 
-        background_tasks.add_task(
-            _run_etl,
-            job_folder,
+        _schedule_task(
+            asyncio.to_thread(
+                _run_etl,
+                job_folder,
+            )
         )
 
         duration = (
@@ -609,9 +651,11 @@ async def process_existing_job(
                 f"{manifest_path}"
             )
 
-        background_tasks.add_task(
-            _run_etl,
-            job_folder,
+        _schedule_task(
+            asyncio.to_thread(
+                _run_etl,
+                job_folder,
+            )
         )
 
         duration = (
@@ -705,7 +749,6 @@ async def recover_existing_job(
             description="Original content type",
         ),
     ] = None,
-    background_tasks: BackgroundTasks = None,
 ):
 
     job_folder = (
@@ -747,11 +790,12 @@ async def recover_existing_job(
         print("ACTION : SCHEDULE ETL")
         print("=" * 80)
 
-        if background_tasks is not None:
-            background_tasks.add_task(
+        _schedule_task(
+            asyncio.to_thread(
                 _run_etl,
                 job_folder,
             )
+        )
 
         return {
             "success": True,
@@ -805,11 +849,12 @@ async def recover_existing_job(
         # START ETL
         # --------------------------------------------------
 
-        if background_tasks is not None:
-            background_tasks.add_task(
+        _schedule_task(
+            asyncio.to_thread(
                 _run_etl,
                 job_folder,
             )
+        )
 
         return {
             **result,
