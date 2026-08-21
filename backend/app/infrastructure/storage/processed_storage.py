@@ -34,6 +34,27 @@ def _key(path: Path) -> str:
     return f"{S3_PREFIX}/{path.relative_to(PROCESSED).as_posix()}"
 
 
+def _download_object(client, bucket: str, key: str, destination: Path) -> None:
+    """Download without boto3's download_file/HeadObject requirement.
+
+    Some S3-compatible providers do not return ContentLength from HEAD in the
+    exact shape expected by s3transfer. download_file() then raises
+    KeyError('ContentLength') before the object body is downloaded. Using
+    get_object() streams the actual object body and works with those providers.
+    """
+    response = client.get_object(Bucket=bucket, Key=key)
+    body = response["Body"]
+    try:
+        with destination.open("wb") as fh:
+            while True:
+                chunk = body.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                fh.write(chunk)
+    finally:
+        body.close()
+
+
 def hydrate_processed_data() -> int:
     """Restore durable processed data into the local cloud-instance cache."""
     client = _client()
@@ -51,11 +72,14 @@ def hydrate_processed_data() -> int:
                 key = item.get("Key")
                 if not key or key.endswith("/"):
                     continue
+
                 relative = key[len(f"{S3_PREFIX}/"):]
                 destination = PROCESSED / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                client.download_file(S3_BUCKET, key, str(destination))
+
+                _download_object(client, S3_BUCKET, key, destination)
                 downloaded += 1
+                logger.info("Hydrated processed artifact: %s", relative)
     except Exception:
         logger.exception("Failed to hydrate processed data from object storage.")
 
@@ -84,6 +108,7 @@ def persist_processed_data() -> int:
                 content_type = "application/json"
             elif path.suffix.lower() == ".duckdb":
                 content_type = "application/vnd.duckdb"
+
             client.upload_file(
                 str(path),
                 S3_BUCKET,
@@ -91,6 +116,7 @@ def persist_processed_data() -> int:
                 ExtraArgs={"ContentType": content_type},
             )
             uploaded += 1
+
     except Exception:
         logger.exception("Failed to persist processed data to object storage.")
         raise
