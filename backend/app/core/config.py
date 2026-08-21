@@ -25,10 +25,20 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_list(name: str, defaults: list[str]) -> list[str]:
+    """Read a comma-separated list while always preserving required origins."""
     value = os.getenv(name)
-    if value is None or not value.strip():
-        return defaults.copy()
-    return [item.strip() for item in value.split(",") if item.strip()]
+    configured = (
+        [item.strip().rstrip("/") for item in value.split(",") if item.strip()]
+        if value and value.strip()
+        else []
+    )
+
+    result: list[str] = []
+    for item in [*defaults, *configured]:
+        normalized = item.strip().rstrip("/")
+        if normalized and normalized not in result:
+            result.append(normalized)
+    return result
 
 
 def _env_path(name: str, default: Path) -> Path:
@@ -41,6 +51,8 @@ class Settings:
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "production")
     DEBUG: bool = _env_bool("DEBUG", False)
 
+    # The production Vercel frontend is mandatory. Environment variables may
+    # add extra origins, but must never accidentally remove the production UI.
     CORS_ORIGINS: list[str] = _env_list(
         "CORS_ORIGINS",
         [
