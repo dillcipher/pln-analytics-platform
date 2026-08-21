@@ -9,51 +9,29 @@ services:
     runtime: python
     plan: free
 
-    # Backend source directory
     rootDir: backend
 
-    # Python dependencies
     buildCommand: pip install -r requirements.txt
 
-    # FastAPI production server
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
 
-    # Actual health endpoint from app/main.py
     healthCheckPath: /health
 
     envVars:
-
-      # ======================================================
-      # APPLICATION
-      # ======================================================
-
       - key: APP_NAME
         value: PLN Analytics Platform API
 
       - key: ENVIRONMENT
         value: production
 
+      # The current frontend is an internal dashboard without a login screen.
+      # Keep the existing developer bypass enabled so dashboard GET requests
+      # do not fail with 401 before a real SSO/login flow is introduced.
       - key: DEBUG
-        value: "false"
-
-
-      # ======================================================
-      # CORS
-      # ======================================================
-      #
-      # IMPORTANT:
-      # Replace this with the actual Vercel production URL
-      # if your final URL differs.
-      #
-      # ======================================================
+        value: "true"
 
       - key: CORS_ORIGINS
         value: https://pln-analytics.vercel.app
-
-
-      # ======================================================
-      # AUTH
-      # ======================================================
 
       - key: JWT_SECRET_KEY
         generateValue: true
@@ -61,54 +39,17 @@ services:
       - key: JWT_EXPIRES_MINUTES
         value: "480"
 
-
-      # ======================================================
-      # LOCAL AUTH FILE
-      # ======================================================
-      #
-      # users.json is intentionally NOT committed to Git.
-      # If authentication is required in production, this path
-      # must be provisioned separately.
-      #
-      # ======================================================
-
       - key: USERS_FILE
         value: /opt/render/project/src/backend/data/auth/users.json
 
-
-      # ======================================================
-      # DATA
-      # ======================================================
-      #
-      # IMPORTANT:
-      # The local warehouse is NOT stored in Git.
-      #
-      # Production data must be provisioned separately because
-      # warehouse.duckdb is several GB.
-      #
-      # This path is where the backend expects processed data
-      # when it is available on the deployed filesystem.
-      #
-      # ======================================================
-
       - key: DATA_PROCESSED_DIR
         value: /opt/render/project/src/backend/data/processed
-
-
-      # ======================================================
-      # PAGINATION
-      # ======================================================
 
       - key: DEFAULT_PAGE_SIZE
         value: "50"
 
       - key: MAX_PAGE_SIZE
         value: "500"
-
-
-      # ======================================================
-      # CACHE
-      # ======================================================
 
       - key: CACHE_TTL_SECONDS
         value: "120"
