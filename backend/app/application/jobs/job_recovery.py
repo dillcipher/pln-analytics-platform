@@ -8,7 +8,11 @@ from pathlib import Path
 
 from app.application.etl.etl_orchestrator import ETLOrchestrator
 from app.core.constants import RAW_UPLOAD
-from app.services.upload_service import UploadService
+from app.services.upload_service import (
+    UploadService,
+    S3_BUCKET,
+    _create_s3_client,
+)
 
 logger = logging.getLogger(__name__)
 _RUNNING_JOB_IDS: set[str] = set()
@@ -130,12 +134,13 @@ async def _recover_and_run(job_id: str) -> None:
 
         data = _read_json(manifest)
         status = str((data or {}).get("status", "")).upper()
-        if status in {"FINISHED", "ASSEMBLY_QUEUED", "ASSEMBLING", "UPLOADING"}:
-            # A live assembly/ETL caller may own this job. Only recover
-            # explicitly failed jobs here; the normal /jobs poll handles
-            # newly completed assembly.
-            if status != "FAILED":
-                return
+        if status != "FAILED":
+            logger.info(
+                "STARTUP RECOVERY SKIP | JOB=%s | STATUS=%s",
+                job_id,
+                status or "UNKNOWN",
+            )
+            return
 
         await _run_etl_with_retry(job_id, job_folder)
     except Exception:
@@ -166,11 +171,10 @@ def ensure_job_processing(job_id: str) -> None:
 async def recover_failed_jobs_on_startup() -> None:
     """Discover FAILED durable jobs in Supabase and resume them automatically."""
     try:
-        client = UploadService._create_s3_client()
-        bucket = UploadService.S3_BUCKET
+        client = _create_s3_client()
         response = await asyncio.to_thread(
             client.list_objects_v2,
-            Bucket=bucket,
+            Bucket=S3_BUCKET,
             Prefix="jobs/",
         )
         recovered = 0
