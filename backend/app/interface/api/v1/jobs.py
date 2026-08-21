@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 
 from app.core.constants import RAW_UPLOAD
+from app.infrastructure.storage.processed_storage import persist_processed_data
 from app.services.upload_service import UploadService
 from app.interface.api.v1.upload import ensure_job_processing
 
@@ -16,231 +18,94 @@ router = APIRouter(
 )
 
 
-def _read_json_file(
-    path: Path,
-) -> dict | None:
-    """
-    Safely read a local JSON file.
-
-    Returns:
-        dict | None
-    """
-
+def _read_json_file(path: Path) -> dict | None:
     if not path.exists():
         return None
-
     try:
-        with open(
-            path,
-            encoding="utf-8",
-        ) as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
-
-        if isinstance(data, dict):
-            return data
-
-    except (
-        OSError,
-        json.JSONDecodeError,
-    ):
-        pass
-
-    return None
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
-async def _get_s3_json(
-    key: str,
-) -> dict | None:
-    """
-    Safely read a JSON object from durable Supabase/S3 storage.
-
-    Returns:
-        dict | None
-    """
-
+async def _get_s3_json(key: str) -> dict | None:
     try:
-        exists = await UploadService._s3_head(
-            key,
-        )
-
-        if not exists:
+        if not await UploadService._s3_head(key):
             return None
-
-        data = await UploadService._s3_get_json(
-            key,
-        )
-
-        if isinstance(data, dict):
-            return data
-
+        data = await UploadService._s3_get_json(key)
+        return data if isinstance(data, dict) else None
     except Exception:
+        return None
+
+
+async def _persist_when_finished(data: dict) -> None:
+    status = str(data.get("status", "")).upper()
+    if status != "FINISHED":
+        return
+    try:
+        await asyncio.to_thread(persist_processed_data)
+    except Exception:
+        # Dashboard status must remain available even if the durable
+        # artifact upload encounters a transient storage error.
         pass
 
-    return None
+
+async def _return_job(data: dict, job_id: str) -> dict:
+    response = {
+        **data,
+        "success": True,
+        "job_id": job_id,
+    }
+    await _persist_when_finished(response)
+    return response
 
 
 @router.get("/{job_id}")
-async def get_job(
-    job_id: str,
-):
-    """
-    Get the current status of an upload/ETL job.
-
-    Source priority:
-
-        1. Local manifest.json
-        2. Local job.json
-        3. Supabase manifest.json
-        4. Supabase job.json
-        5. Local chunk_upload.json
-
-    The endpoint also acts as the durable-job wake-up mechanism.
-    The frontend already polls this endpoint, so every poll is allowed
-    to idempotently kick an unfinished durable job after a FastAPI Cloud
-    instance restart. The upload router prevents duplicate in-process
-    execution for the same job_id.
-    """
-
+async def get_job(job_id: str):
+    """Get current upload/ETL status and persist finished analytics artifacts."""
     job_id = job_id.strip()
-
     if not job_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Job ID is required.",
-        )
+        raise HTTPException(status_code=400, detail="Job ID is required.")
 
-    job_folder = (
-        RAW_UPLOAD
-        / job_id
-    )
+    job_folder = RAW_UPLOAD / job_id
+    local_manifest = job_folder / "manifest.json"
+    local_job_json = job_folder / "job.json"
+    local_chunk_metadata = job_folder / "chunk_upload.json"
 
-    local_manifest = (
-        job_folder
-        / "manifest.json"
-    )
-
-    local_job_json = (
-        job_folder
-        / "job.json"
-    )
-
-    local_chunk_metadata = (
-        job_folder
-        / "chunk_upload.json"
-    )
-
-    # ----------------------------------------------------------
-    # DURABLE WAKE-UP
-    # ----------------------------------------------------------
-    #
-    # This is intentionally fire-and-forget. It does not block the
-    # status response on assembly or ETL. If the current instance was
-    # restarted, the in-memory task registry is empty and this poll
-    # becomes the automatic resume trigger.
-    #
     try:
         ensure_job_processing(job_id)
     except Exception:
-        # Status reporting must remain available even if the wake-up
-        # mechanism encounters an unexpected scheduling error.
         pass
 
-    # ==========================================================
-    # 1. LOCAL MANIFEST
-    # ==========================================================
-
-    local_manifest_data = _read_json_file(
-        local_manifest,
-    )
-
+    local_manifest_data = _read_json_file(local_manifest)
     if local_manifest_data is not None:
-        return {
-            **local_manifest_data,
-            "success": True,
-            "job_id": job_id,
-        }
+        return await _return_job(local_manifest_data, job_id)
 
-    # ==========================================================
-    # 2. LOCAL JOB METADATA
-    # ==========================================================
-
-    local_job_data = _read_json_file(
-        local_job_json,
-    )
-
+    local_job_data = _read_json_file(local_job_json)
     if local_job_data is not None:
-        return {
-            **local_job_data,
-            "success": True,
-            "job_id": job_id,
-        }
-
-    # ==========================================================
-    # 3. SUPABASE MANIFEST
-    # ==========================================================
+        return await _return_job(local_job_data, job_id)
 
     try:
-        manifest_key = (
-            UploadService._job_manifest_s3_key(
-                job_id,
-            )
-        )
-
         manifest_data = await _get_s3_json(
-            manifest_key,
+            UploadService._job_manifest_s3_key(job_id),
         )
-
         if manifest_data is not None:
-            return {
-                **manifest_data,
-                "success": True,
-                "job_id": job_id,
-            }
-
+            return await _return_job(manifest_data, job_id)
     except Exception:
         pass
-
-    # ==========================================================
-    # 4. SUPABASE JOB METADATA
-    # ==========================================================
 
     try:
-        metadata_key = (
-            UploadService._job_metadata_s3_key(
-                job_id,
-            )
-        )
-
         metadata = await _get_s3_json(
-            metadata_key,
+            UploadService._job_metadata_s3_key(job_id),
         )
-
         if metadata is not None:
-            return {
-                **metadata,
-                "success": True,
-                "job_id": job_id,
-            }
-
+            return await _return_job(metadata, job_id)
     except Exception:
         pass
 
-    # ==========================================================
-    # 5. LOCAL CHUNK METADATA
-    # ==========================================================
-
-    chunk_data = _read_json_file(
-        local_chunk_metadata,
-    )
-
+    chunk_data = _read_json_file(local_chunk_metadata)
     if chunk_data is not None:
-        return {
-            **chunk_data,
-            "success": True,
-            "job_id": job_id,
-        }
+        return await _return_job(chunk_data, job_id)
 
-    raise HTTPException(
-        status_code=404,
-        detail=f"Job not found: {job_id}",
-    )
+    raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
