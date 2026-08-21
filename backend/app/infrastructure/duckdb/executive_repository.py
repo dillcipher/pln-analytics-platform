@@ -61,6 +61,40 @@ from app.infrastructure.duckdb.connection import (
 logger = logging.getLogger(__name__)
 
 
+def _table_exists_on_connection(
+    conn,
+    table_name: str,
+) -> bool:
+    """
+    Check table existence using the same DuckDB connection that will
+    execute the subsequent query.
+
+    This is deliberately defensive because the production warehouse can
+    temporarily exist without all ETL-generated fact tables.
+    """
+    if conn is None:
+        return False
+
+    try:
+        row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.tables
+            WHERE lower(table_name) = lower(?)
+            """,
+            [table_name],
+        ).fetchone()
+
+        return bool(row and int(row[0] or 0) > 0)
+    except Exception:
+        logger.warning(
+            "DuckDB table existence check failed for %s.",
+            table_name,
+            exc_info=True,
+        )
+        return False
+
+
 class DuckDbExecutiveRepository:
     """
     DuckDB implementation of the Executive Dashboard repository.
@@ -82,19 +116,49 @@ class DuckDbExecutiveRepository:
         from fact_anev.
         """
 
-        if dataset_exists("executive_kpis"):
-            months = list_month_partitions(
-                "executive_kpis",
-            )
-
-            if months:
-                return month_keys_to_options(
-                    months,
-                )
-
         conn = get_connection()
 
         try:
+            if _table_exists_on_connection(
+                conn,
+                "executive_kpis",
+            ):
+                try:
+                    rows = conn.execute(
+                        """
+                        SELECT DISTINCT
+                            CAST(MONTH_KEY AS VARCHAR) AS month_key
+                        FROM executive_kpis
+                        WHERE MONTH_KEY IS NOT NULL
+                        ORDER BY month_key
+                        """
+                    ).fetchall()
+
+                    months = [
+                        str(row[0])
+                        for row in rows
+                        if row[0] is not None
+                    ]
+
+                    if months:
+                        return month_keys_to_options(months)
+
+                except Exception:
+                    logger.exception(
+                        "Failed to read executive_kpis months; "
+                        "falling back to fact_anev."
+                    )
+
+            if not _table_exists_on_connection(
+                conn,
+                "fact_anev",
+            ):
+                logger.warning(
+                    "Executive months unavailable: "
+                    "fact_anev does not exist yet."
+                )
+                return []
+
             rows = conn.execute(
                 """
                 SELECT DISTINCT
@@ -111,9 +175,13 @@ class DuckDbExecutiveRepository:
                 if row[0] is not None
             ]
 
-            return month_keys_to_options(
-                months,
+            return month_keys_to_options(months)
+
+        except Exception:
+            logger.exception(
+                "Failed to resolve Executive available months."
             )
+            return []
 
         finally:
             conn.close()
@@ -151,7 +219,10 @@ class DuckDbExecutiveRepository:
         conn = get_connection()
 
         try:
-            if dataset_exists("executive_kpis"):
+            if _table_exists_on_connection(
+                conn,
+                "executive_kpis",
+            ):
                 try:
                     sql = f"""
                         SELECT
@@ -211,12 +282,21 @@ class DuckDbExecutiveRepository:
             # Fact-table fallback
             # --------------------------------------------------
 
-            if not dataset_exists("fact_anev"):
+            if not _table_exists_on_connection(
+                conn,
+                "fact_anev",
+            ):
+                logger.warning(
+                    "Executive KPI unavailable: fact_anev does not exist."
+                )
                 return None
 
             # fact_pengecekan is optional. If it is not available yet,
             # KPI derivation must still work and report zero inspected rows.
-            if dataset_exists("fact_pengecekan"):
+            if _table_exists_on_connection(
+                conn,
+                "fact_pengecekan",
+            ):
                 inspection_cte = """
                 latest_inspection AS (
                     SELECT
@@ -1743,7 +1823,10 @@ class DuckDbExecutiveRepository:
         #
         # Uses the same inspection definition as get_kpis().
         # ----------------------------------------------------------
-        if dataset_exists("fact_pengecekan"):
+        if _table_exists_on_connection(
+                conn,
+                "fact_pengecekan",
+            ):
             inspection_sql = """
                 WITH suspect_locations AS (
                     SELECT DISTINCT
@@ -2533,15 +2616,12 @@ class DuckDbExecutiveRepository:
         conn,
     ) -> bool:
         """
-        Lightweight check for fact_anev.
+        Lightweight existence check for fact_anev.
+
+        information_schema is queried first so a missing optional table
+        never raises a DuckDB CatalogException.
         """
-
-        try:
-            conn.execute(
-                "SELECT 1 FROM fact_anev LIMIT 1"
-            ).fetchone()
-
-            return True
-
-        except Exception:
-            return False
+        return _table_exists_on_connection(
+            conn,
+            "fact_anev",
+        )
