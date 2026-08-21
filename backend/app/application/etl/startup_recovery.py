@@ -33,11 +33,7 @@ RECOVERABLE_STATUSES = {
     "ASSEMBLY_COMPLETED",
     "FAILED",
 }
-MAX_FAILED_RECOVERY_ATTEMPTS = max(
-    1,
-    int(os.getenv("MAX_FAILED_RECOVERY_ATTEMPTS", "3")),
-)
-
+MAX_FAILED_RECOVERY_ATTEMPTS = max(1, int(os.getenv("MAX_FAILED_RECOVERY_ATTEMPTS", "3")))
 _RECOVERY_LOCK = asyncio.Lock()
 
 
@@ -69,7 +65,6 @@ def _load_pending_jobs() -> list[dict[str, Any]]:
 
     jobs: list[dict[str, Any]] = []
     seen: set[str] = set()
-
     try:
         paginator = client.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=f"{S3_JOB_PREFIX}/"):
@@ -84,7 +79,6 @@ def _load_pending_jobs() -> list[dict[str, Any]]:
                 if not job_id or job_id in seen:
                     continue
                 seen.add(job_id)
-
                 try:
                     response = client.get_object(Bucket=S3_BUCKET, Key=key)
                     body = response["Body"]
@@ -95,24 +89,18 @@ def _load_pending_jobs() -> list[dict[str, Any]]:
                 except Exception:
                     logger.exception("STARTUP RECOVERY: failed reading %s", key)
                     continue
-
                 if not isinstance(metadata, dict):
                     continue
-
                 status = str(metadata.get("status", "")).upper()
                 if status not in RECOVERABLE_STATUSES:
                     continue
-
                 metadata["job_id"] = metadata.get("job_id") or job_id
                 jobs.append(metadata)
-
     except Exception:
         logger.exception("STARTUP RECOVERY: failed listing durable jobs")
         return []
 
-    jobs.sort(
-        key=lambda item: str(item.get("uploaded_at") or item.get("created_at") or "")
-    )
+    jobs.sort(key=lambda item: str(item.get("uploaded_at") or item.get("created_at") or ""))
     return jobs
 
 
@@ -120,11 +108,9 @@ def _extract_file_metadata(metadata: dict[str, Any]) -> dict[str, Any] | None:
     files = metadata.get("files")
     if isinstance(files, list) and files and isinstance(files[0], dict):
         return files[0]
-
     filename = metadata.get("filename") or metadata.get("original_filename")
     if not filename:
         return None
-
     return {
         "filename": filename,
         "original_filename": metadata.get("original_filename") or filename,
@@ -134,39 +120,46 @@ def _extract_file_metadata(metadata: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _write_local_recovery_metadata(job_id: str, attempts: int) -> None:
+    manifest = RAW_UPLOAD / job_id / "manifest.json"
+    if not manifest.exists():
+        return
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        data["recovery_attempts"] = attempts
+        manifest.write_text(
+            json.dumps(data, indent=4, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+    except Exception:
+        logger.exception("STARTUP RECOVERY: could not update local recovery metadata | job=%s", job_id)
+
+
 async def _mark_recovery_attempt(metadata: dict[str, Any], job_id: str) -> int:
     attempts = int(metadata.get("recovery_attempts") or 0) + 1
     metadata["recovery_attempts"] = attempts
+    _write_local_recovery_metadata(job_id, attempts)
     try:
         await UploadService._s3_put_json(
             UploadService._job_metadata_s3_key(job_id),
             metadata,
         )
     except Exception:
-        logger.exception(
-            "STARTUP RECOVERY: could not persist retry counter | job=%s",
-            job_id,
-        )
+        logger.exception("STARTUP RECOVERY: could not persist retry counter | job=%s", job_id)
     return attempts
 
 
 async def _recover_one(metadata: dict[str, Any]) -> bool:
     job_id = str(metadata.get("job_id") or "").strip()
     file_metadata = _extract_file_metadata(metadata)
-
     if not job_id or not file_metadata:
         logger.error("STARTUP RECOVERY: invalid durable job metadata: %r", metadata)
         return False
 
-    filename = str(
-        file_metadata.get("filename")
-        or file_metadata.get("original_filename")
-        or ""
-    ).strip()
+    filename = str(file_metadata.get("filename") or file_metadata.get("original_filename") or "").strip()
     content_type = file_metadata.get("content_type")
     upload_id = file_metadata.get("upload_id") or metadata.get("upload_id")
     total_chunks = file_metadata.get("total_chunks") or metadata.get("total_chunks")
-
     if not filename:
         logger.error("STARTUP RECOVERY: job=%s has no filename", job_id)
         return False
@@ -174,15 +167,10 @@ async def _recover_one(metadata: dict[str, Any]) -> bool:
     status = str(metadata.get("status") or "").upper()
     attempts = int(metadata.get("recovery_attempts") or 0)
     if status == "FAILED" and attempts >= MAX_FAILED_RECOVERY_ATTEMPTS:
-        logger.error(
-            "STARTUP RECOVERY: retry limit reached | job=%s | attempts=%s",
-            job_id,
-            attempts,
-        )
+        logger.error("STARTUP RECOVERY: retry limit reached | job=%s | attempts=%s", job_id, attempts)
         return False
 
     await _mark_recovery_attempt(metadata, job_id)
-
     job_folder = RAW_UPLOAD / job_id
     manifest_path = job_folder / "manifest.json"
 
@@ -193,7 +181,6 @@ async def _recover_one(metadata: dict[str, Any]) -> bool:
             filename,
             status,
         )
-
         try:
             result = await UploadService.recover_assembled_job(
                 job_id=job_id,
@@ -203,10 +190,8 @@ async def _recover_one(metadata: dict[str, Any]) -> bool:
         except FileNotFoundError:
             if not upload_id or total_chunks is None:
                 raise
-
             logger.warning(
-                "STARTUP RECOVERY: final file missing; resuming chunks | "
-                "job=%s upload_id=%s chunks=%s",
+                "STARTUP RECOVERY: final file missing; resuming chunks | job=%s upload_id=%s chunks=%s",
                 job_id,
                 upload_id,
                 total_chunks,
@@ -221,17 +206,16 @@ async def _recover_one(metadata: dict[str, Any]) -> bool:
 
         if not isinstance(result, dict) or not result.get("success", True):
             raise RuntimeError(f"Durable recovery returned unsuccessful result: {result}")
-
         if not manifest_path.exists():
             raise FileNotFoundError(f"Recovered manifest not found: {manifest_path}")
 
+        _write_local_recovery_metadata(job_id, int(metadata.get("recovery_attempts") or 1))
         etl_result = await asyncio.to_thread(ETLOrchestrator.process, job_folder)
         if not isinstance(etl_result, dict) or not etl_result.get("success"):
             raise RuntimeError(f"Recovered ETL failed: {etl_result}")
 
         logger.info("STARTUP RECOVERY: job=%s finished successfully", job_id)
         return True
-
     except Exception:
         logger.exception("STARTUP RECOVERY: job=%s failed", job_id)
         return False
@@ -245,11 +229,7 @@ async def recover_pending_jobs() -> dict[str, int]:
             logger.info("STARTUP RECOVERY: no unfinished durable jobs found")
             return {"found": 0, "recovered": 0, "failed": 0}
 
-        logger.info(
-            "STARTUP RECOVERY: %s unfinished durable job(s) found",
-            len(jobs),
-        )
-
+        logger.info("STARTUP RECOVERY: %s unfinished durable job(s) found", len(jobs))
         recovered = 0
         failed = 0
         for metadata in jobs:
@@ -264,8 +244,4 @@ async def recover_pending_jobs() -> dict[str, int]:
             recovered,
             failed,
         )
-        return {
-            "found": len(jobs),
-            "recovered": recovered,
-            "failed": failed,
-        }
+        return {"found": len(jobs), "recovered": recovered, "failed": failed}
