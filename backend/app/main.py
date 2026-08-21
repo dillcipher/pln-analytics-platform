@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,14 +13,10 @@ from app.application.etl.startup_recovery import recover_pending_jobs
 from app.core.config import get_settings
 from app.core.logging_config import configure_logging
 from app.database.warehouse import Warehouse
-from app.etl.detector.streaming_month_resolver_patch import (
-    install_streaming_month_resolver_patch,
-)
+from app.etl.detector.streaming_month_resolver_patch import install_streaming_month_resolver_patch
 from app.etl.runtime_guard import install_runtime_guards
 from app.infrastructure.storage.processed_storage import hydrate_processed_data
 
-# Install all low-memory guards before importing the API router. This ensures
-# every upload/ETL path uses the same serialized ETL and stable S3 transfer.
 install_streaming_month_resolver_patch()
 install_runtime_guards()
 
@@ -33,7 +30,7 @@ app = FastAPI(
     title=settings.APP_NAME,
     description=(
         "Enterprise Analytics Platform for PLN. Modules: Upload Center, "
-        "Executive Dashboard, DLPD Monitoring, Suspect Analytics, and Warehouse Management."
+        "Executive Dashboard, Suspect Analytics, and Warehouse Management."
     ),
     version="1.0.0",
     docs_url="/docs",
@@ -62,6 +59,40 @@ def health_check():
     }
 
 
+@app.get("/health/ready", tags=["Health"])
+def readiness_check():
+    """Expose deployment readiness without requiring a dashboard request."""
+    tables = []
+    try:
+        tables = Warehouse.list_tables()
+    except Exception:
+        logger.exception("Readiness warehouse inspection failed.")
+
+    durable_storage = all(
+        os.getenv(name, "").strip()
+        for name in (
+            "S3_ENDPOINT",
+            "S3_ACCESS_KEY_ID",
+            "S3_SECRET_ACCESS_KEY",
+            "S3_BUCKET",
+        )
+    )
+
+    required_tables = {
+        "fact_dlpd_prabayar",
+        "fact_dlpd_pascabayar",
+        "fact_pengecekan",
+    }
+    warehouse_ready = required_tables.issubset(set(tables))
+
+    return {
+        "status": "ready" if durable_storage and warehouse_ready else "degraded",
+        "durable_storage": durable_storage,
+        "warehouse_ready": warehouse_ready,
+        "tables": tables,
+    }
+
+
 @app.on_event("startup")
 async def on_startup():
     logger.info("=" * 80)
@@ -78,14 +109,8 @@ async def on_startup():
     except Exception:
         logger.exception("Startup warehouse refresh failed; continuing startup.")
 
-    # Durable recovery is deliberately enabled by default. The recovery
-    # implementation processes jobs one-at-a-time and never loads all large
-    # workbooks into memory simultaneously. This is what makes an interrupted
-    # upload self-healing after a deployment/container restart.
-    recovery_enabled = True
-    if recovery_enabled:
-        logger.info("Scheduling durable recovery of unfinished uploads.")
-        asyncio.create_task(_startup_recovery_task())
+    logger.info("Scheduling durable recovery of unfinished uploads.")
+    asyncio.create_task(_startup_recovery_task())
 
     if not settings.DATA_PROCESSED_DIR.exists():
         logger.warning(
@@ -101,5 +126,4 @@ async def _startup_recovery_task() -> None:
         result = await recover_pending_jobs()
         logger.info("Startup ETL recovery result: %s", result)
     except Exception:
-        # Recovery must never prevent the API from becoming available.
         logger.exception("Startup ETL recovery task failed.")
