@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException
 from app.core.constants import RAW_UPLOAD
 from app.infrastructure.storage.processed_storage import persist_processed_data
 from app.services.upload_service import UploadService
-from app.interface.api.v1.upload import ensure_job_processing
+from app.application.jobs.job_recovery import ensure_job_processing
 
 
 router = APIRouter(
@@ -46,17 +46,11 @@ async def _persist_when_finished(data: dict) -> None:
     try:
         await asyncio.to_thread(persist_processed_data)
     except Exception:
-        # Dashboard status must remain available even if the durable
-        # artifact upload encounters a transient storage error.
         pass
 
 
 async def _return_job(data: dict, job_id: str) -> dict:
-    response = {
-        **data,
-        "success": True,
-        "job_id": job_id,
-    }
+    response = {**data, "success": True, "job_id": job_id}
     await _persist_when_finished(response)
     return response
 
