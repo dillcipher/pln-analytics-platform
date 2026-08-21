@@ -13,12 +13,15 @@ from app.database.warehouse import Warehouse
 from app.etl.detector.streaming_month_resolver_patch import (
     install_streaming_month_resolver_patch,
 )
+from app.etl.runtime_guard import install_runtime_guards
 from app.infrastructure.storage.processed_storage import hydrate_processed_data
-from app.interface.api.v1.router import api_v1_router
 
-# Install before any ETL job executes. The patch only replaces DLPD month
-# scanning; all existing month business rules remain unchanged.
+# Install all low-memory guards before importing the API router. This ensures
+# every upload/ETL path uses the same serialized ETL and stable S3 transfer.
 install_streaming_month_resolver_patch()
+install_runtime_guards()
+
+from app.interface.api.v1.router import api_v1_router  # noqa: E402
 
 settings = get_settings()
 configure_logging(settings.DEBUG)
@@ -73,13 +76,10 @@ async def on_startup():
     except Exception:
         logger.exception("Startup warehouse refresh failed; continuing startup.")
 
-    # IMPORTANT:
-    # Do not automatically scan and re-run historical FAILED ETL jobs during
-    # application startup. A small cloud instance can have several failed jobs
-    # containing large Excel workbooks; starting recovery for all of them at
-    # once can exhaust RAM and repeatedly restart the container.
-    # Recovery remains available through the explicit job-processing flow.
-    logger.info("Startup ETL recovery disabled to protect container memory.")
+    # Do not automatically replay every historical job on startup. The
+    # runtime guard serializes ETL, while explicit recovery remains available
+    # through the job-processing endpoint. This keeps deployment startup cheap.
+    logger.info("Startup ETL recovery remains disabled; ETL memory gate is active.")
 
     if not settings.DATA_PROCESSED_DIR.exists():
         logger.warning(
