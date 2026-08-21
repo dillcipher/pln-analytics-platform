@@ -17,8 +17,6 @@ from app.services.upload_service import (
 logger = logging.getLogger(__name__)
 _RUNNING_JOB_IDS: set[str] = set()
 
-# ETL retries operate on the already assembled durable workbook. No chunks
-# are uploaded again and no new upload job is created.
 ETL_MAX_RETRIES = max(1, int(os.getenv("ETL_MAX_RETRIES", "3")))
 ETL_RETRY_DELAY_SECONDS = max(1, int(os.getenv("ETL_RETRY_DELAY_SECONDS", "5")))
 
@@ -39,7 +37,7 @@ def _run_etl(job_folder: Path) -> dict | None:
 
 
 async def _restore_manifest(job_id: str, job_folder: Path) -> Path | None:
-    """Restore an already-completed assembly from durable storage only."""
+    """Restore the durable manifest if it is not already local."""
     manifest = job_folder / "manifest.json"
     if manifest.exists():
         return manifest
@@ -53,21 +51,47 @@ async def _restore_manifest(job_id: str, job_folder: Path) -> Path | None:
 
 
 async def _restore_final_file(job_id: str, job_folder: Path, filename: str) -> Path | None:
-    """Restore the final assembled workbook, never reconstructing live chunks."""
+    """Restore the assembled workbook from durable storage, never chunks."""
     destination = job_folder / filename
     if destination.exists() and destination.stat().st_size > 0:
         return destination
 
     final_key = UploadService._job_file_s3_key(job_id, filename)
     if not await UploadService._s3_head(final_key):
+        logger.warning("DURABLE FILE NOT FOUND | JOB=%s | FILE=%s", job_id, filename)
         return None
 
+    job_folder.mkdir(parents=True, exist_ok=True)
     await UploadService._s3_download_file(final_key, destination)
     return destination if destination.exists() and destination.stat().st_size > 0 else None
 
 
+async def _restore_manifest_files(job_id: str, job_folder: Path, manifest: Path) -> bool:
+    """Restore every assembled file referenced by manifest before ETL."""
+    data = _read_json(manifest)
+    files = (data or {}).get("files")
+    if not isinstance(files, list) or not files:
+        logger.warning("RECOVERY MANIFEST HAS NO FILES | JOB=%s", job_id)
+        return False
+
+    all_restored = True
+    for record in files:
+        if not isinstance(record, dict):
+            all_restored = False
+            continue
+        filename = record.get("filename")
+        if not filename:
+            all_restored = False
+            continue
+        restored = await _restore_final_file(job_id, job_folder, str(filename))
+        if restored is None:
+            all_restored = False
+
+    return all_restored
+
+
 async def _run_etl_with_retry(job_id: str, job_folder: Path) -> None:
-    """Retry ETL in-place using the durable assembled files and checkpoint."""
+    """Retry ETL in-place using durable assembled files and checkpoint."""
     for attempt in range(1, ETL_MAX_RETRIES + 1):
         logger.info(
             "ETL RETRY | JOB=%s | ATTEMPT=%s/%s | NO REUPLOAD",
@@ -142,6 +166,16 @@ async def _recover_and_run(job_id: str) -> None:
             )
             return
 
+        # IMPORTANT: the manifest can survive while the assembled workbook
+        # is missing from the ephemeral container after a deploy/restart.
+        # Restore all final files before invoking ETL. Never re-upload chunks.
+        if not await _restore_manifest_files(job_id, job_folder, manifest):
+            logger.error(
+                "STARTUP RECOVERY BLOCKED | JOB=%s | REQUIRED ASSEMBLED FILE MISSING",
+                job_id,
+            )
+            return
+
         await _run_etl_with_retry(job_id, job_folder)
     except Exception:
         logger.exception("Durable job recovery failed for %s", job_id)
@@ -171,6 +205,8 @@ def ensure_job_processing(job_id: str) -> None:
 async def recover_failed_jobs_on_startup() -> None:
     """Discover FAILED durable jobs in Supabase and resume them automatically."""
     try:
+        # Use the module-level helper. Do not call a nonexistent
+        # UploadService._create_s3_client() method.
         client = _create_s3_client()
         response = await asyncio.to_thread(
             client.list_objects_v2,
