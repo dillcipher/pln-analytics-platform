@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import get_settings
 from app.core.logging_config import configure_logging
+from app.database.warehouse import Warehouse
 from app.infrastructure.storage.processed_storage import hydrate_processed_data
 from app.interface.api.v1.router import api_v1_router
 
@@ -55,8 +56,20 @@ def on_startup():
     logger.info("Environment : %s", settings.ENVIRONMENT)
     logger.info("Processed Data : %s", settings.DATA_PROCESSED_DIR)
 
+    # FastAPI Cloud instances are replaceable. Restore durable processed
+    # artifacts first, then rebuild/refresh DuckDB tables from the parquet
+    # cache so a fresh instance never exposes an empty warehouse merely
+    # because its local DuckDB file was missing or stale.
     hydrated = hydrate_processed_data()
     logger.info("Hydrated processed artifacts: %s", hydrated)
+
+    try:
+        Warehouse.refresh_tables()
+        logger.info("Startup warehouse refresh completed.")
+    except Exception:
+        # A brand-new deployment legitimately has no processed parquet yet.
+        # Do not make the API unhealthy just because there is no dataset.
+        logger.exception("Startup warehouse refresh failed; continuing startup.")
 
     if not settings.DATA_PROCESSED_DIR.exists():
         logger.warning(
