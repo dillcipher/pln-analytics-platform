@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -78,13 +79,18 @@ async def on_startup():
     except Exception:
         logger.exception("Startup warehouse refresh failed; continuing startup.")
 
-    # Durable processed artifacts are hydrated before the initial warehouse
-    # refresh. Any upload that was interrupted after reaching durable storage
-    # is then recovered in the background and sent through the exact same ETL
-    # path used by a fresh upload. The runtime guard serializes the heavy work
-    # so recovery cannot start several large Excel jobs concurrently.
-    logger.info("Scheduling startup recovery of unfinished durable uploads.")
-    asyncio.create_task(_startup_recovery_task())
+    # Automatic recovery of every unfinished durable workbook can consume the
+    # entire container when several large Excel jobs are present at once.
+    # Keep production startup deterministic and memory-safe. Recovery remains
+    # available explicitly through the existing job-recovery flow.
+    recovery_enabled = os.getenv("ENABLE_STARTUP_RECOVERY", "false").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if recovery_enabled:
+        logger.info("Scheduling startup recovery of unfinished durable uploads.")
+        asyncio.create_task(_startup_recovery_task())
+    else:
+        logger.info("Startup ETL recovery disabled to protect container memory.")
 
     if not settings.DATA_PROCESSED_DIR.exists():
         logger.warning(
