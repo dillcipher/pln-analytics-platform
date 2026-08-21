@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 
 from fastapi import FastAPI
@@ -13,7 +12,6 @@ from app.core.logging_config import configure_logging
 from app.database.warehouse import Warehouse
 from app.infrastructure.storage.processed_storage import hydrate_processed_data
 from app.interface.api.v1.router import api_v1_router
-from app.application.jobs.job_recovery import recover_failed_jobs_on_startup
 
 settings = get_settings()
 configure_logging(settings.DEBUG)
@@ -68,10 +66,13 @@ async def on_startup():
     except Exception:
         logger.exception("Startup warehouse refresh failed; continuing startup.")
 
-    # Recover FAILED jobs from durable Supabase/S3 state after the API is
-    # initialized. This reuses the assembled workbook and ETL checkpoint;
-    # it never uploads chunks again or creates a new job.
-    asyncio.create_task(recover_failed_jobs_on_startup())
+    # IMPORTANT:
+    # Do not automatically scan and re-run historical FAILED ETL jobs during
+    # application startup. A small cloud instance can have several failed jobs
+    # containing large Excel workbooks; starting recovery for all of them at
+    # once can exhaust RAM and repeatedly restart the container.
+    # Recovery remains available through the explicit job-processing flow.
+    logger.info("Startup ETL recovery disabled to protect container memory.")
 
     if not settings.DATA_PROCESSED_DIR.exists():
         logger.warning(
