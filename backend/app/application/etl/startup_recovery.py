@@ -53,7 +53,6 @@ def _load_pending_jobs() -> list[dict[str, Any]]:
 
     jobs: list[dict[str, Any]] = []
     seen: set[str] = set()
-
     try:
         paginator = client.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=f"{S3_JOB_PREFIX}/"):
@@ -90,7 +89,7 @@ def _load_pending_jobs() -> list[dict[str, Any]]:
 
 
 def _extract_file_metadata(metadata: dict[str, Any]) -> dict[str, Any] | None:
-    """Normalize both legacy manifest-shaped and current upload metadata."""
+    """Normalize legacy manifest metadata and current chunk-upload metadata."""
     files = metadata.get("files")
     if isinstance(files, list) and files and isinstance(files[0], dict):
         return files[0]
@@ -131,7 +130,6 @@ async def recover_pending_jobs() -> dict[str, int]:
         content_type = file_metadata.get("content_type")
         upload_id = file_metadata.get("upload_id") or metadata.get("upload_id")
         total_chunks = file_metadata.get("total_chunks") or metadata.get("total_chunks")
-
         if not filename:
             failed += 1
             logger.error("STARTUP RECOVERY: job=%s has no filename", job_id)
@@ -140,18 +138,35 @@ async def recover_pending_jobs() -> dict[str, int]:
         try:
             logger.info(
                 "STARTUP RECOVERY: recovering job=%s file=%s status=%s",
-                job_id,
-                filename,
-                metadata.get("status"),
+                job_id, filename, metadata.get("status"),
             )
 
-            result = await UploadService.recover_assembled_job(
-                job_id=job_id,
-                filename=filename,
-                content_type=content_type,
-                upload_id=upload_id,
-                total_chunks=int(total_chunks) if total_chunks is not None else None,
-            )
+            # Preferred path: the assembled workbook was persisted under
+            # jobs/<job_id>/<filename>. This is what current uploads produce.
+            try:
+                result = await UploadService.recover_assembled_job(
+                    job_id=job_id,
+                    filename=filename,
+                    content_type=content_type,
+                )
+            except FileNotFoundError:
+                # Legacy interrupted uploads may have no assembled object yet.
+                # If their durable chunk metadata still exists, resume assembly
+                # directly from Supabase instead of forcing a re-upload.
+                if not upload_id or total_chunks is None:
+                    raise
+
+                logger.warning(
+                    "STARTUP RECOVERY: final file missing; resuming chunks | job=%s upload_id=%s chunks=%s",
+                    job_id, upload_id, total_chunks,
+                )
+                result = await UploadService.assemble_chunk_upload(
+                    upload_id=str(upload_id),
+                    job_id=job_id,
+                    filename=filename,
+                    total_chunks=int(total_chunks),
+                    content_type=content_type,
+                )
 
             if not result.get("success", True):
                 raise RuntimeError(f"Durable recovery returned unsuccessful result: {result}")
