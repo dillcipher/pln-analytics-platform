@@ -178,3 +178,5 @@ backend/data/processed/metadata/
 
 # Local authentication data
 backend/data/auth/users.json
+.vercel
+.env*

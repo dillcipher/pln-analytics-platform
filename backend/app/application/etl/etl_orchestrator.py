@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 from app.application.jobs.job_manager import JobManager
@@ -648,6 +649,207 @@ class ETLOrchestrator:
         return paths
 
     # ==========================================================
+    # ETL CHECKPOINT / RESUME
+    # ==========================================================
+
+    @classmethod
+    def _checkpoint_path(
+        cls,
+        job_folder: Path,
+    ) -> Path:
+        """
+        Return the persistent checkpoint file for this ETL job.
+
+        The checkpoint lives inside the job folder, so it survives an
+        application restart as long as the job storage itself survives.
+        """
+        return job_folder / "etl_checkpoint.json"
+
+    @classmethod
+    def _load_checkpoint(
+        cls,
+        job_folder: Path,
+        job_id: str | None,
+    ) -> dict:
+        """
+        Load a previously written ETL checkpoint.
+
+        A checkpoint belonging to another job is ignored. Corrupt
+        checkpoints are also ignored so they cannot prevent the ETL
+        from starting.
+        """
+        path = cls._checkpoint_path(
+            job_folder,
+        )
+
+        if not path.exists():
+            return {
+                "version": 1,
+                "job_id": job_id,
+                "phase1_completed": {},
+                "phase2_completed": {},
+                "warehouse_refreshed": False,
+            }
+
+        try:
+            with open(
+                path,
+                encoding="utf-8",
+            ) as f:
+                checkpoint = json.load(f)
+
+        except Exception:
+            logger.exception(
+                "ETL CHECKPOINT READ FAILED | %s",
+                path,
+            )
+            return {
+                "version": 1,
+                "job_id": job_id,
+                "phase1_completed": {},
+                "phase2_completed": {},
+                "warehouse_refreshed": False,
+            }
+
+        if checkpoint.get("job_id") != job_id:
+            logger.warning(
+                "ETL CHECKPOINT JOB MISMATCH | "
+                "expected=%s actual=%s | ignoring checkpoint",
+                job_id,
+                checkpoint.get("job_id"),
+            )
+            return {
+                "version": 1,
+                "job_id": job_id,
+                "phase1_completed": {},
+                "phase2_completed": {},
+                "warehouse_refreshed": False,
+            }
+
+        checkpoint.setdefault(
+            "version",
+            1,
+        )
+        checkpoint.setdefault(
+            "phase1_completed",
+            {},
+        )
+        checkpoint.setdefault(
+            "phase2_completed",
+            {},
+        )
+        checkpoint.setdefault(
+            "warehouse_refreshed",
+            False,
+        )
+
+        return checkpoint
+
+    @classmethod
+    def _save_checkpoint(
+        cls,
+        job_folder: Path,
+        checkpoint: dict,
+    ) -> None:
+        """
+        Persist an ETL checkpoint atomically.
+
+        A temporary file plus os.replace prevents a process restart from
+        leaving behind a partially written JSON checkpoint.
+        """
+        path = cls._checkpoint_path(
+            job_folder,
+        )
+        temporary_path = path.with_suffix(
+            ".json.tmp",
+        )
+
+        try:
+            job_folder.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            with open(
+                temporary_path,
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(
+                    checkpoint,
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                f.flush()
+                os.fsync(
+                    f.fileno(),
+                )
+
+            os.replace(
+                temporary_path,
+                path,
+            )
+
+        except Exception:
+            logger.exception(
+                "ETL CHECKPOINT WRITE FAILED | %s",
+                path,
+            )
+
+            try:
+                if temporary_path.exists():
+                    temporary_path.unlink()
+            except Exception:
+                logger.exception(
+                    "ETL CHECKPOINT TEMP CLEANUP FAILED | %s",
+                    temporary_path,
+                )
+
+            # Checkpoint persistence must never turn a successfully
+            # processed dataset into a failed ETL job.
+            return
+
+    @staticmethod
+    def _processing_group_key(
+        dataset: str,
+        month: str | None,
+        files: list[dict],
+    ) -> str:
+        """
+        Build a deterministic checkpoint key for a processing group.
+        """
+        filenames = sorted(
+            str(
+                file_record.get(
+                    "filename",
+                    "",
+                )
+            )
+            for file_record in files
+            if file_record.get("filename")
+        )
+
+        return json.dumps(
+            {
+                "dataset": dataset,
+                "month": (
+                    str(month)
+                    if month is not None
+                    else None
+                ),
+                "files": filenames,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(
+                ",",
+                ":",
+            ),
+        )
+
+    # ==========================================================
     # PROCESS
     # ==========================================================
 
@@ -710,6 +912,31 @@ class ETLOrchestrator:
 
         outputs: list[dict] = []
 
+        checkpoint = cls._load_checkpoint(
+            job_folder=job_folder,
+            job_id=manifest.get("job_id"),
+        )
+
+        has_checkpoint = bool(
+            checkpoint.get("phase1_completed")
+            or checkpoint.get("phase2_completed")
+            or checkpoint.get("warehouse_refreshed")
+        )
+
+        if has_checkpoint:
+            logger.warning(
+                "ETL RESUME CHECKPOINT FOUND | JOB=%s",
+                manifest.get("job_id"),
+            )
+        else:
+            checkpoint["job_id"] = manifest.get(
+                "job_id",
+            )
+            cls._save_checkpoint(
+                job_folder,
+                checkpoint,
+            )
+
         try:
 
             # ==================================================
@@ -737,6 +964,14 @@ class ETLOrchestrator:
                 progress=21,
                 step="GROUPING FILES COMPLETED",
             )
+
+            if has_checkpoint:
+                JobManager.update(
+                    job_folder,
+                    status=JobStatus.MERGING,
+                    progress=22,
+                    step="RESUMING ETL FROM CHECKPOINT",
+                )
 
             if not grouped:
 
@@ -1001,14 +1236,56 @@ class ETLOrchestrator:
                     "-" * 80,
                 )
 
-                output = (
-                    MonthlyMerger.merge(
-                        dataset="CUSTOMER_LOCATION",
-                        month=month,
-                        files=paths,
-                        output_dir=cls.OUTPUT_DIR,
+                month_key = str(
+                    month,
+                )
+
+                completed_output = (
+                    checkpoint.get(
+                        "phase1_completed",
+                        {},
+                    ).get(
+                        month_key,
                     )
                 )
+
+                if (
+                    completed_output
+                    and Path(
+                        completed_output,
+                    ).exists()
+                ):
+                    output = Path(
+                        completed_output,
+                    )
+
+                    logger.info(
+                        "RESUME SKIP CUSTOMER_LOCATION | "
+                        "MONTH=%s | OUTPUT=%s",
+                        month_key,
+                        output,
+                    )
+                else:
+                    output = (
+                        MonthlyMerger.merge(
+                            dataset="CUSTOMER_LOCATION",
+                            month=month,
+                            files=paths,
+                            output_dir=cls.OUTPUT_DIR,
+                        )
+                    )
+
+                    checkpoint.setdefault(
+                        "phase1_completed",
+                        {},
+                    )[month_key] = str(
+                        output,
+                    )
+
+                    cls._save_checkpoint(
+                        job_folder,
+                        checkpoint,
+                    )
 
                 customer_location_outputs[
                     str(month)
@@ -1068,20 +1345,58 @@ class ETLOrchestrator:
                         "-" * 80,
                     )
 
-                    output = (
-                        MonthlyMerger.merge(
-                            dataset=(
-                                "CUSTOMER_LOCATION"
-                            ),
-                            month=month,
-                            files=(
-                                coordinate_master_paths
-                            ),
-                            output_dir=(
-                                cls.OUTPUT_DIR
-                            ),
+                    completed_output = (
+                        checkpoint.get(
+                            "phase1_completed",
+                            {},
+                        ).get(
+                            month_key,
                         )
                     )
+
+                    if (
+                        completed_output
+                        and Path(
+                            completed_output,
+                        ).exists()
+                    ):
+                        output = Path(
+                            completed_output,
+                        )
+
+                        logger.info(
+                            "RESUME SKIP CUSTOMER_LOCATION "
+                            "FROM MASTER | MONTH=%s | OUTPUT=%s",
+                            month_key,
+                            output,
+                        )
+                    else:
+                        output = (
+                            MonthlyMerger.merge(
+                                dataset=(
+                                    "CUSTOMER_LOCATION"
+                                ),
+                                month=month,
+                                files=(
+                                    coordinate_master_paths
+                                ),
+                                output_dir=(
+                                    cls.OUTPUT_DIR
+                                ),
+                            )
+                        )
+
+                        checkpoint.setdefault(
+                            "phase1_completed",
+                            {},
+                        )[month_key] = str(
+                            output,
+                        )
+
+                        cls._save_checkpoint(
+                            job_folder,
+                            checkpoint,
+                        )
 
                     customer_location_outputs[
                         month_key
@@ -1330,16 +1645,61 @@ class ETLOrchestrator:
                 # MERGE
                 # --------------------------------------------------
 
-                output = (
-                    MonthlyMerger.merge(
-                        dataset=dataset,
-                        month=month,
-                        files=paths,
-                        output_dir=(
-                            cls.OUTPUT_DIR
-                        ),
+                group_key = cls._processing_group_key(
+                    dataset=dataset,
+                    month=month,
+                    files=valid_files,
+                )
+
+                completed_output = (
+                    checkpoint.get(
+                        "phase2_completed",
+                        {},
+                    ).get(
+                        group_key,
                     )
                 )
+
+                if (
+                    completed_output
+                    and Path(
+                        completed_output,
+                    ).exists()
+                ):
+                    output = Path(
+                        completed_output,
+                    )
+
+                    logger.info(
+                        "RESUME SKIP DATASET | "
+                        "%s | MONTH=%s | OUTPUT=%s",
+                        dataset,
+                        month,
+                        output,
+                    )
+                else:
+                    output = (
+                        MonthlyMerger.merge(
+                            dataset=dataset,
+                            month=month,
+                            files=paths,
+                            output_dir=(
+                                cls.OUTPUT_DIR
+                            ),
+                        )
+                    )
+
+                    checkpoint.setdefault(
+                        "phase2_completed",
+                        {},
+                    )[group_key] = str(
+                        output,
+                    )
+
+                    cls._save_checkpoint(
+                        job_folder,
+                        checkpoint,
+                    )
 
                 logger.info(
                     "PARQUET CREATED : %s",
@@ -1440,7 +1800,23 @@ class ETLOrchestrator:
                 "=" * 80,
             )
 
-            Warehouse.refresh_tables()
+            if checkpoint.get(
+                "warehouse_refreshed",
+                False,
+            ):
+                logger.info(
+                    "RESUME SKIP WAREHOUSE REFRESH | "
+                    "checkpoint already marked complete",
+                )
+            else:
+                Warehouse.refresh_tables()
+
+                checkpoint["warehouse_refreshed"] = True
+
+                cls._save_checkpoint(
+                    job_folder,
+                    checkpoint,
+                )
 
             logger.info(
                 "=" * 80,
@@ -1457,6 +1833,21 @@ class ETLOrchestrator:
             # ==================================================
             # FINISHED
             # ==================================================
+
+            checkpoint.pop(
+                "last_error",
+                None,
+            )
+            checkpoint.pop(
+                "last_failed_at",
+                None,
+            )
+            checkpoint["finished"] = True
+
+            cls._save_checkpoint(
+                job_folder,
+                checkpoint,
+            )
 
             JobManager.update(
                 job_folder,
@@ -1494,6 +1885,18 @@ class ETLOrchestrator:
         # ======================================================
 
         except Exception as exc:
+
+            checkpoint["last_error"] = str(
+                exc,
+            )
+            checkpoint["last_failed_at"] = (
+                __import__("datetime").datetime.now().isoformat()
+            )
+
+            cls._save_checkpoint(
+                job_folder,
+                checkpoint,
+            )
 
             JobManager.update(
                 job_folder,

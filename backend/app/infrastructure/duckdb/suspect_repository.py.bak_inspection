@@ -1,0 +1,1689 @@
+"""DuckDB-backed implementation of SuspectRepository."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from app.core.config import get_settings
+from app.core.month_utils import month_keys_to_options
+from app.domain.entities import MonthOption, PageResult
+from app.infrastructure.duckdb.connection import (
+    dataset_exists,
+    get_connection,
+    list_month_partitions,
+    read_dataset_sql,
+)
+from app.infrastructure.duckdb.query_helpers import (
+    build_equality_filters,
+    build_search_clause,
+    paginate,
+)
+
+
+_DETAIL_FILTER_COLUMN_MAP = {
+    "unitupi": "UNITUPI",
+    "unitap": "UNITAP",
+    "unitup": "UNITUP",
+    "tariff": "TARIFF",
+    "suspect_name": "SUSPECT_NAME",
+    "location_code": "LOCATION_CODE",
+}
+
+
+_SUMMARY_FILTER_COLUMN_MAP = {
+    "unitupi": "UNITUPI",
+    "unitap": "UNITAP",
+    "unitup": "UNITUP",
+    "tariff": "TARIFF",
+}
+
+
+class DuckDbSuspectRepository:
+
+    # ==========================================================
+    # MONTH
+    # ==========================================================
+
+    def get_available_months(
+        self,
+    ) -> list[MonthOption]:
+        """Return every month actually available in the Suspect data.
+
+        ``suspect_detail`` is a measurement/detail dataset and can lag behind
+        ``fact_anev``.  Suspect Analytics, classification, repeat analysis,
+        and the map are driven by ``fact_anev``, so the month selector must be
+        sourced from the same fact table.
+
+        The fallback to ``suspect_detail`` keeps the endpoint usable when an
+        ANEV fact table has not been materialized yet.
+        """
+        conn = get_connection()
+
+        try:
+            if dataset_exists("fact_anev"):
+                rows = conn.execute(
+                    """
+                    SELECT DISTINCT
+                        CAST(MONTH AS VARCHAR) AS month_key
+                    FROM fact_anev
+                    WHERE MONTH IS NOT NULL
+                    ORDER BY month_key
+                    """
+                ).fetchall()
+
+                months = [
+                    str(row[0])
+                    for row in rows
+                    if row[0] is not None
+                ]
+
+                if months:
+                    return month_keys_to_options(months)
+
+            # Fallback for installations where fact_anev is not available.
+            if dataset_exists("suspect_detail"):
+                return month_keys_to_options(
+                    list_month_partitions("suspect_detail")
+                )
+
+            return []
+
+        finally:
+            conn.close()
+
+    # ==========================================================
+    # DASHBOARD / ANALYTICS COMPATIBILITY
+    # ==========================================================
+
+    def get_dashboard(
+        self,
+        month_key: str,
+        filters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Return the complete Suspect dashboard payload.
+
+        This method is kept as the repository-level compatibility entry point
+        required by the domain protocol.  The HTTP analytics endpoint uses
+        the more focused use-cases, but older callers can use this method
+        without triggering an AttributeError.
+        """
+        filters = filters or {}
+
+        anev = self.get_anev_summary(
+            month_key,
+            filters,
+        )
+
+        repeat = self.get_repeat_summary(
+            month_key,
+        )
+
+        return {
+            "anev": anev,
+            "pasca_repeat": repeat,
+            "repeat_cases": [
+                {
+                    "label": str(item["repeat_count"]),
+                    "value": int(item["locations"]),
+                }
+                for item in repeat.get("frequency", [])
+                if int(item.get("repeat_count", 0)) > 1
+            ],
+            "classification": anev.get(
+                "classification",
+                [],
+            ),
+        }
+
+
+    # ==========================================================
+    # MAIN
+    # ==========================================================
+
+    def get_main(
+        self,
+        month_key: str,
+        page: int,
+        page_size: int,
+        search: str | None,
+    ) -> PageResult:
+
+        if not dataset_exists(
+            "suspect_main"
+        ):
+            return PageResult(
+                items=[],
+                total_rows=0,
+                page=page,
+                page_size=page_size,
+            )
+
+        settings = get_settings()
+        conn = get_connection()
+
+        try:
+
+            offset, page_size = paginate(
+                page,
+                page_size,
+                settings.MAX_PAGE_SIZE,
+            )
+
+            search_sql, search_params = (
+                build_search_clause(
+                    search,
+                    ["SUSPECT_NAME"],
+                )
+            )
+
+            from_clause = read_dataset_sql(
+                "suspect_main",
+                month_key,
+            )
+
+            where_sql = (
+                f"WHERE MONTH_KEY = ? "
+                f"{search_sql}"
+            )
+
+            params = [
+                month_key,
+                *search_params,
+            ]
+
+            total_rows = conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM {from_clause}
+                {where_sql}
+                """,
+                params,
+            ).fetchone()[0]
+
+            page_sql = f"""
+                SELECT
+                    SUSPECT_NAME,
+                    PELANGGAN,
+                    FREKUENSI
+                FROM {from_clause}
+                {where_sql}
+                ORDER BY FREKUENSI DESC
+                LIMIT ?
+                OFFSET ?
+            """
+
+            rows = conn.execute(
+                page_sql,
+                [
+                    *params,
+                    page_size,
+                    offset,
+                ],
+            ).fetchall()
+
+            items = [
+                {
+                    "suspect_name": row[0],
+                    "pelanggan": row[1],
+                    "frekuensi": row[2],
+                }
+                for row in rows
+            ]
+
+            return PageResult(
+                items=items,
+                total_rows=total_rows,
+                page=page,
+                page_size=page_size,
+            )
+
+        finally:
+
+            conn.close()
+
+    # ==========================================================
+    # SUMMARY
+    # ==========================================================
+
+    def get_summary(
+        self,
+        month_key: str,
+        filters: dict[str, Any],
+    ) -> list[dict]:
+
+        if not dataset_exists(
+            "suspect_summary"
+        ):
+            return []
+
+        conn = get_connection()
+
+        try:
+
+            equality_sql, equality_params = (
+                build_equality_filters(
+                    filters,
+                    _SUMMARY_FILTER_COLUMN_MAP,
+                )
+            )
+
+            search_sql = ""
+            search_params: list[Any] = []
+
+            if filters.get(
+                "search_customer"
+            ):
+
+                (
+                    search_sql,
+                    search_params,
+                ) = build_search_clause(
+                    filters[
+                        "search_customer"
+                    ],
+                    ["LOCATION_NAME"],
+                )
+
+            sql = f"""
+                SELECT *
+                FROM {
+                    read_dataset_sql(
+                        "suspect_summary",
+                        month_key,
+                    )
+                }
+                WHERE MONTH_KEY = ?
+                {equality_sql}
+                {search_sql}
+                ORDER BY GRAND_TOTAL DESC
+            """
+
+            cursor = conn.execute(
+                sql,
+                [
+                    month_key,
+                    *equality_params,
+                    *search_params,
+                ],
+            )
+
+            columns = [
+                description[0]
+                for description in cursor.description
+            ]
+
+            return [
+                dict(
+                    zip(
+                        columns,
+                        row,
+                    )
+                )
+                for row in cursor.fetchall()
+            ]
+
+        finally:
+
+            conn.close()
+
+    # ==========================================================
+    # DETAIL
+    # ==========================================================
+
+    def get_detail(
+        self,
+        month_key: str,
+        filters: dict[str, Any],
+        page: int,
+        page_size: int,
+    ) -> PageResult:
+        """Return detail rows using the same classification source as analytics.
+
+        Analytics classification comes from ``fact_anev`` while the electrical
+        measurements live in ``suspect_detail``. When a classification is
+        selected, join the two datasets by LOCATION_CODE so a classification
+        click cannot produce a false zero just because the two datasets use
+        slightly different label normalization.
+        """
+        if not dataset_exists("suspect_detail"):
+            return PageResult(
+                items=[],
+                total_rows=0,
+                page=page,
+                page_size=page_size,
+            )
+
+        settings = get_settings()
+        conn = get_connection()
+
+        try:
+            offset, page_size = paginate(
+                page,
+                page_size,
+                settings.MAX_PAGE_SIZE,
+            )
+
+            # Filters that are native to suspect_detail.
+            detail_filters = dict(filters)
+            selected_classification = detail_filters.pop(
+                "suspect_name", None
+            )
+            repeat_count = detail_filters.pop(
+                "repeat_count", None
+            )
+
+            equality_sql, equality_params = build_equality_filters(
+                detail_filters,
+                _DETAIL_FILTER_COLUMN_MAP,
+            )
+
+            search_sql = ""
+            search_params: list[Any] = []
+            if filters.get("search_customer"):
+                search_sql, search_params = build_search_clause(
+                    filters["search_customer"],
+                    ["LOCATION_NAME", "IDPEL"],
+                )
+
+            joins: list[str] = []
+            ctes: list[str] = []
+            classification_params: list[Any] = []
+            repeat_params: list[Any] = []
+
+            if selected_classification and dataset_exists("fact_anev"):
+                # Normalize the nine supported labels and compare against the
+                # normalized UI label. The measurements remain sourced from
+                # suspect_detail.
+                normalized_sql = """
+                    CASE
+                        WHEN REPLACE(REGEXP_REPLACE(TRIM(UPPER(CAST(SUSPECT_NAME AS VARCHAR))), '\\s+', ' ', 'g'), ' ', '') = 'ASYMMETRICPOWERBYINSTANT'
+                            THEN 'ASYMMETRIC POWER BY INSTANT'
+                        WHEN REPLACE(REGEXP_REPLACE(TRIM(UPPER(CAST(SUSPECT_NAME AS VARCHAR))), '\\s+', ' ', 'g'), ' ', '') = 'INCORRECTPHASEBYINSTANT'
+                            THEN 'INCORRECT PHASE BY INSTANT'
+                        WHEN REPLACE(REGEXP_REPLACE(TRIM(UPPER(CAST(SUSPECT_NAME AS VARCHAR))), '\\s+', ' ', 'g'), ' ', '') = 'OVERCURRENTBYINSTANT'
+                            THEN 'OVER CURRENT BY INSTANT'
+                        WHEN REPLACE(REGEXP_REPLACE(TRIM(UPPER(CAST(SUSPECT_NAME AS VARCHAR))), '\\s+', ' ', 'g'), ' ', '') = 'OVERVOLTAGEBYINSTANT'
+                            THEN 'OVER VOLTAGE BY INSTANT'
+                        WHEN REPLACE(REGEXP_REPLACE(TRIM(UPPER(CAST(SUSPECT_NAME AS VARCHAR))), '\\s+', ' ', 'g'), ' ', '') = 'REVERSALBYINSTANT'
+                            THEN 'REVERSAL BY INSTANT'
+                        WHEN REPLACE(REGEXP_REPLACE(TRIM(UPPER(CAST(SUSPECT_NAME AS VARCHAR))), '\\s+', ' ', 'g'), ' ', '') = 'TIMEDIFFERENCE-INSTANT'
+                            THEN 'TIME DIFFERENCE - INSTANT'
+                        WHEN REPLACE(REGEXP_REPLACE(TRIM(UPPER(CAST(SUSPECT_NAME AS VARCHAR))), '\\s+', ' ', 'g'), ' ', '') = 'UNBALANCECURRENTBYINSTANT'
+                            THEN 'UNBALANCE CURRENT BY INSTANT'
+                        WHEN REPLACE(REGEXP_REPLACE(TRIM(UPPER(CAST(SUSPECT_NAME AS VARCHAR))), '\\s+', ' ', 'g'), ' ', '') = 'UNDERVOLTAGEBYINSTANT'
+                            THEN 'UNDER VOLTAGE BY INSTANT'
+                        WHEN REPLACE(REGEXP_REPLACE(TRIM(UPPER(CAST(SUSPECT_NAME AS VARCHAR))), '\\s+', ' ', 'g'), ' ', '') = 'VOLTAGEDIP-INSTANT'
+                            THEN 'VOLTAGE DIP - INSTANT'
+                        ELSE REGEXP_REPLACE(TRIM(UPPER(CAST(SUSPECT_NAME AS VARCHAR))), '\\s+', ' ', 'g')
+                    END
+                """
+                ctes.append(
+                    f"""
+                    classification_locations AS (
+                        SELECT DISTINCT
+                            CAST(LOCATION_CODE AS VARCHAR) AS LOCATION_CODE,
+                            CAST(MONTH AS VARCHAR) AS MONTH_KEY
+                        FROM fact_anev
+                        WHERE CAST(MONTH AS VARCHAR) = ?
+                          AND LOCATION_CODE IS NOT NULL
+                          AND SUSPECT_NAME IS NOT NULL
+                          AND ({normalized_sql}) = ?
+                    )
+                    """
+                )
+                classification_params.extend([
+                    str(month_key),
+                    " ".join(str(selected_classification).strip().upper().split()),
+                ])
+                joins.append(
+                    """
+                    INNER JOIN classification_locations cl
+                        ON CAST(s.LOCATION_CODE AS VARCHAR) = cl.LOCATION_CODE
+                       AND CAST(s.MONTH_KEY AS VARCHAR) = cl.MONTH_KEY
+                    """
+                )
+            elif selected_classification:
+                # Fallback when ANEV is unavailable.
+                equality_sql += " AND SUSPECT_NAME = ?"
+                equality_params.append(selected_classification)
+
+            if repeat_count is not None and dataset_exists("fact_anev"):
+                ctes.append(
+                    """
+                    repeat_locations AS (
+                        SELECT
+                            CAST(LOCATION_CODE AS VARCHAR) AS LOCATION_CODE,
+                            COUNT(DISTINCT CAST(MONTH AS VARCHAR)) AS REPEAT_COUNT
+                        FROM fact_anev
+                        WHERE LOCATION_CODE IS NOT NULL
+                          AND MONTH IS NOT NULL
+                          AND CAST(MONTH AS VARCHAR) <= ?
+                        GROUP BY LOCATION_CODE
+                    )
+                    """
+                )
+                repeat_params.extend([
+                    str(month_key),
+                ])
+                joins.append(
+                    """
+                    INNER JOIN repeat_locations rr
+                        ON rr.LOCATION_CODE = CAST(s.LOCATION_CODE AS VARCHAR)
+                       AND rr.REPEAT_COUNT = ?
+                    """
+                )
+                repeat_params.append(int(repeat_count))
+
+            from_clause = read_dataset_sql(
+                "suspect_detail",
+                month_key,
+            )
+
+            where_sql = f"""
+                WHERE CAST(s.MONTH_KEY AS VARCHAR) = ?
+                {equality_sql}
+                {search_sql}
+            """
+
+            cte_sql = ""
+            if ctes:
+                cte_sql = "WITH " + ",\n".join(ctes)
+
+            base_params = [
+                *classification_params,
+                *repeat_params,
+                str(month_key),
+                *equality_params,
+                *search_params,
+            ]
+
+            total_rows = conn.execute(
+                f"""
+                {cte_sql}
+                SELECT COUNT(*)
+                FROM {from_clause} s
+                {' '.join(joins)}
+                {where_sql}
+                """,
+                base_params,
+            ).fetchone()[0]
+
+            cursor = conn.execute(
+                f"""
+                {cte_sql}
+                SELECT s.*
+                FROM {from_clause} s
+                {' '.join(joins)}
+                {where_sql}
+                ORDER BY s.READ_DATE DESC
+                LIMIT ?
+                OFFSET ?
+                """,
+                [
+                    *base_params,
+                    page_size,
+                    offset,
+                ],
+            )
+
+            columns = [
+                description[0]
+                for description in cursor.description
+            ]
+            items = [
+                dict(zip(columns, row))
+                for row in cursor.fetchall()
+            ]
+
+            return PageResult(
+                items=items,
+                total_rows=int(total_rows or 0),
+                page=page,
+                page_size=page_size,
+            )
+        finally:
+            conn.close()
+
+    # ==========================================================
+    # DETAIL TREND
+    # ==========================================================
+
+    def get_detail_trend(
+        self,
+        month_key: str,
+        location_code: str,
+    ) -> dict[str, Any]:
+
+        empty = {
+            "location_code": location_code,
+            "voltage_l1": [],
+            "voltage_l2": [],
+            "voltage_l3": [],
+            "current_l1": [],
+            "current_l2": [],
+            "current_l3": [],
+            "stats": {},
+        }
+
+        if not dataset_exists(
+            "suspect_detail"
+        ):
+            return empty
+
+        conn = get_connection()
+
+        try:
+
+            sql = f"""
+                SELECT
+                    READ_DATE,
+                    VOLTAGE_L1,
+                    VOLTAGE_L2,
+                    VOLTAGE_L3,
+                    CURRENT_L1,
+                    CURRENT_L2,
+                    CURRENT_L3,
+                    POWER_FACTOR_TOTAL
+                FROM {
+                    read_dataset_sql(
+                        "suspect_detail",
+                        month_key,
+                    )
+                }
+                WHERE
+                    MONTH_KEY = ?
+                    AND LOCATION_CODE = ?
+                ORDER BY READ_DATE ASC
+            """
+
+            rows = conn.execute(
+                sql,
+                [
+                    month_key,
+                    location_code,
+                ],
+            ).fetchall()
+
+            if not rows:
+                return empty
+
+            def series(
+                index: int,
+            ) -> list[dict]:
+
+                return [
+                    {
+                        "read_date": str(
+                            row[0]
+                        ),
+                        "value": row[index],
+                    }
+                    for row in rows
+                    if row[index] is not None
+                ]
+
+            pf_values = [
+                row[7]
+                for row in rows
+                if row[7] is not None
+            ]
+
+            voltage_l1_values = [
+                row[1]
+                for row in rows
+                if row[1] is not None
+            ]
+
+            stats = {
+                "reading_count": len(rows),
+
+                "avg_power_factor": (
+                    round(
+                        sum(pf_values)
+                        / len(pf_values),
+                        3,
+                    )
+                    if pf_values
+                    else 0.0
+                ),
+
+                "avg_voltage_l1": (
+                    round(
+                        sum(
+                            voltage_l1_values
+                        )
+                        / len(
+                            voltage_l1_values
+                        ),
+                        2,
+                    )
+                    if voltage_l1_values
+                    else 0.0
+                ),
+            }
+
+            return {
+                "location_code": location_code,
+
+                "voltage_l1": series(1),
+                "voltage_l2": series(2),
+                "voltage_l3": series(3),
+
+                "current_l1": series(4),
+                "current_l2": series(5),
+                "current_l3": series(6),
+
+                "stats": stats,
+            }
+
+        finally:
+
+            conn.close()
+
+    # ==========================================================
+    # CLASSIFICATION SUMMARY
+    # ==========================================================
+
+    def get_classification_summary(
+        self,
+        month_key: str,
+        filters: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return classification counts from ``fact_anev``.
+
+        ``fact_anev`` is a measurement-level fact table, therefore the
+        classification chart counts DISTINCT LOCATION_CODE rather than raw
+        measurement rows.  This keeps the chart consistent with ANEV/PRA
+        totals, Executive analytics, and the repeat definition.
+        """
+        if not dataset_exists("fact_anev"):
+            return []
+
+        filters = filters or {}
+        conn = get_connection()
+
+        try:
+            clauses = [
+                "CAST(MONTH AS VARCHAR) = ?",
+                "LOCATION_CODE IS NOT NULL",
+                "SUSPECT_NAME IS NOT NULL",
+            ]
+            params: list[Any] = [str(month_key)]
+
+            for key, column in (
+                ("unitupi", "UNITUPI"),
+                ("unitap", "UNITAP"),
+                ("unitup", "UNITUP"),
+                ("tariff", "TARIFF"),
+            ):
+                value = filters.get(key)
+                if value not in (None, ""):
+                    clauses.append(f"CAST({column} AS VARCHAR) = ?")
+                    params.append(str(value))
+
+            search_value = filters.get("search_customer")
+            if search_value not in (None, ""):
+                clauses.append(
+                    "(CAST(LOCATION_CODE AS VARCHAR) ILIKE ? "
+                    "OR CAST(LOCATION_NAME AS VARCHAR) ILIKE ?)"
+                )
+                pattern = f"%{str(search_value).strip()}%"
+                params.extend([pattern, pattern])
+
+            where_sql = "\n                    AND ".join(clauses)
+
+            rows = conn.execute(
+                f"""
+                SELECT
+                    CAST(SUSPECT_NAME AS VARCHAR) AS classification,
+                    COUNT(
+                        DISTINCT CAST(LOCATION_CODE AS VARCHAR)
+                    ) AS total
+                FROM fact_anev
+                WHERE {where_sql}
+                GROUP BY SUSPECT_NAME
+                ORDER BY total DESC, classification ASC
+                """,
+                params,
+            ).fetchall()
+
+            return [
+                {
+                    "classification": row[0],
+                    "total": int(row[1] or 0),
+                }
+                for row in rows
+            ]
+
+        finally:
+            conn.close()
+
+    # ==========================================================
+    # ANEV SUMMARY
+    # ==========================================================
+
+    def get_anev_summary(
+        self,
+        month_key: str,
+        filters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Return ANEV analytics from fact_anev.
+
+        ANEV is intentionally sourced from fact_anev, not suspect_detail.
+        One LOCATION_CODE is counted once for the selected month.
+        """
+
+        empty = {
+            "total_locations": 0,
+            "total_classifications": 0,
+            "classification": [],
+            "unitap": [],
+            "tariff": [],
+        }
+
+        if not dataset_exists("fact_anev"):
+            return empty
+
+        filters = filters or {}
+        conn = get_connection()
+
+        try:
+            clauses = [
+                "CAST(MONTH AS VARCHAR) = ?",
+                "LOCATION_CODE IS NOT NULL",
+            ]
+            params: list[Any] = [str(month_key)]
+
+            if filters.get("unitupi"):
+                clauses.append(
+                    "CAST(UNITUPI AS VARCHAR) = ?"
+                )
+                params.append(str(filters["unitupi"]))
+
+            if filters.get("unitap"):
+                clauses.append(
+                    "CAST(UNITAP AS VARCHAR) = ?"
+                )
+                params.append(str(filters["unitap"]))
+
+            if filters.get("unitup"):
+                clauses.append(
+                    "CAST(UNITUP AS VARCHAR) = ?"
+                )
+                params.append(str(filters["unitup"]))
+
+            if filters.get("tariff"):
+                clauses.append(
+                    "CAST(TARIFF AS VARCHAR) = ?"
+                )
+                params.append(str(filters["tariff"]))
+
+            where_sql = "\n                    AND ".join(clauses)
+
+            total_row = conn.execute(
+                f"""
+                SELECT COUNT(
+                    DISTINCT CAST(LOCATION_CODE AS VARCHAR)
+                )
+                FROM fact_anev
+                WHERE {where_sql}
+                """,
+                params,
+            ).fetchone()
+
+            total_locations = (
+                int(total_row[0] or 0)
+                if total_row
+                else 0
+            )
+
+            classification_rows = conn.execute(
+                f"""
+                SELECT
+                    CAST(SUSPECT_NAME AS VARCHAR) AS classification,
+                    COUNT(
+                        DISTINCT CAST(LOCATION_CODE AS VARCHAR)
+                    ) AS total
+                FROM fact_anev
+                WHERE
+                    {where_sql}
+                    AND SUSPECT_NAME IS NOT NULL
+                GROUP BY SUSPECT_NAME
+                ORDER BY total DESC
+                """,
+                params,
+            ).fetchall()
+
+            classification = [
+                {
+                    "classification": row[0],
+                    "total": int(row[1] or 0),
+                }
+                for row in classification_rows
+            ]
+
+            unitap_rows = conn.execute(
+                f"""
+                SELECT
+                    CAST(UNITAP AS VARCHAR) AS unitap,
+                    COUNT(
+                        DISTINCT CAST(LOCATION_CODE AS VARCHAR)
+                    ) AS total
+                FROM fact_anev
+                WHERE
+                    {where_sql}
+                    AND UNITAP IS NOT NULL
+                GROUP BY UNITAP
+                ORDER BY total DESC
+                """,
+                params,
+            ).fetchall()
+
+            unitap = [
+                {
+                    "unitap": row[0],
+                    "total": int(row[1] or 0),
+                }
+                for row in unitap_rows
+            ]
+
+            tariff_rows = conn.execute(
+                f"""
+                SELECT
+                    CAST(TARIFF AS VARCHAR) AS tariff,
+                    COUNT(
+                        DISTINCT CAST(LOCATION_CODE AS VARCHAR)
+                    ) AS total
+                FROM fact_anev
+                WHERE
+                    {where_sql}
+                    AND TARIFF IS NOT NULL
+                GROUP BY TARIFF
+                ORDER BY total DESC
+                """,
+                params,
+            ).fetchall()
+
+            tariff = [
+                {
+                    "tariff": row[0],
+                    "total": int(row[1] or 0),
+                }
+                for row in tariff_rows
+            ]
+
+            return {
+                "total_locations": total_locations,
+                "total_classifications": len(classification),
+                "classification": classification,
+                "unitap": unitap,
+                "tariff": tariff,
+            }
+
+        finally:
+            conn.close()
+
+
+    # ==========================================================
+    # REPEAT / FREQUENCY SUMMARY
+    # ==========================================================
+
+    def get_repeat_summary(
+        self,
+        month_key: str,
+    ) -> dict[str, Any]:
+        """
+        PASCA repeat analysis from fact_anev.
+
+        One LOCATION_CODE + one MONTH = one occurrence.
+        Raw measurement rows in the same month do not increase
+        the repeat count.
+        """
+
+        empty = {
+            "total_customers": 0,
+            "repeat_customers": 0,
+            "repeat_occurrences": 0,
+            "repeat_rate_pct": 0.0,
+            "frequency": [],
+            "by_suspect": [],
+        }
+
+        if not dataset_exists("fact_anev"):
+            return empty
+
+        conn = get_connection()
+
+        try:
+            frequency_sql = r"""
+                WITH location_month AS (
+                    SELECT DISTINCT
+                        CAST(LOCATION_CODE AS VARCHAR) AS locationcode,
+                        CAST(MONTH AS VARCHAR) AS month_key
+                    FROM fact_anev
+                    WHERE
+                        LOCATION_CODE IS NOT NULL
+                        AND MONTH IS NOT NULL
+                        AND CAST(MONTH AS VARCHAR) <= ?
+                ),
+                location_frequency AS (
+                    SELECT
+                        locationcode,
+                        COUNT(*) AS months_seen
+                    FROM location_month
+                    GROUP BY locationcode
+                )
+                SELECT
+                    months_seen AS repeat_count,
+                    COUNT(*) AS locations
+                FROM location_frequency
+                GROUP BY months_seen
+                ORDER BY repeat_count ASC
+            """
+
+            frequency_rows = conn.execute(
+                frequency_sql,
+                [str(month_key)],
+            ).fetchall()
+
+            frequency = [
+                {
+                    "repeat_count": int(row[0] or 0),
+                    "locations": int(row[1] or 0),
+                }
+                for row in frequency_rows
+                if row[0] is not None
+            ]
+
+            total_customers = sum(
+                item["locations"]
+                for item in frequency
+            )
+
+            repeat_customers = sum(
+                item["locations"]
+                for item in frequency
+                if item["repeat_count"] > 1
+            )
+
+            repeat_occurrences = sum(
+                (
+                    item["repeat_count"] - 1
+                ) * item["locations"]
+                for item in frequency
+                if item["repeat_count"] > 1
+            )
+
+            repeat_rate_pct = (
+                round(
+                    repeat_customers
+                    / total_customers
+                    * 100,
+                    2,
+                )
+                if total_customers
+                else 0.0
+            )
+
+            by_suspect_sql = r"""
+                WITH location_month_classification AS (
+                    SELECT DISTINCT
+                        CAST(LOCATION_CODE AS VARCHAR) AS locationcode,
+                        CAST(MONTH AS VARCHAR) AS month_key,
+                        CAST(SUSPECT_NAME AS VARCHAR) AS classification
+                    FROM fact_anev
+                    WHERE
+                        LOCATION_CODE IS NOT NULL
+                        AND MONTH IS NOT NULL
+                        AND CAST(MONTH AS VARCHAR) <= ?
+                        AND SUSPECT_NAME IS NOT NULL
+                ),
+                location_frequency AS (
+                    SELECT
+                        locationcode,
+                        COUNT(DISTINCT month_key) AS months_seen
+                    FROM location_month_classification
+                    GROUP BY locationcode
+                ),
+                classification_locations AS (
+                    SELECT DISTINCT
+                        lmc.locationcode,
+                        lmc.classification,
+                        lf.months_seen
+                    FROM location_month_classification lmc
+                    INNER JOIN location_frequency lf
+                        ON lmc.locationcode = lf.locationcode
+                )
+                SELECT
+                    classification,
+                    COUNT(*) AS total_customers,
+                    COUNT(
+                        CASE
+                            WHEN months_seen > 1 THEN 1
+                        END
+                    ) AS repeat_customers,
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN months_seen > 1
+                                THEN months_seen - 1
+                                ELSE 0
+                            END
+                        ),
+                        0
+                    ) AS repeat_occurrences
+                FROM classification_locations
+                GROUP BY classification
+                ORDER BY
+                    repeat_customers DESC,
+                    total_customers DESC
+            """
+
+            by_suspect_rows = conn.execute(
+                by_suspect_sql,
+                [str(month_key)],
+            ).fetchall()
+
+            by_suspect = [
+                {
+                    "classification": row[0],
+                    "total_customers": int(row[1] or 0),
+                    "repeat_customers": int(row[2] or 0),
+                    "repeat_occurrences": int(row[3] or 0),
+                }
+                for row in by_suspect_rows
+            ]
+
+            return {
+                "total_customers": total_customers,
+                "repeat_customers": repeat_customers,
+                "repeat_occurrences": repeat_occurrences,
+                "repeat_rate_pct": repeat_rate_pct,
+                "frequency": frequency,
+                "by_suspect": by_suspect,
+            }
+
+        finally:
+            conn.close()
+
+
+    # ==========================================================
+    # MAP POINTS / LOCATION COORDINATES
+    # ==========================================================
+    #
+    # Suspect location -> IDPEL -> fact_customer_location
+    #
+    # Coordinate normalization:
+    #   normal   : X = latitude,  Y = longitude
+    #   reversed : X = longitude, Y = latitude
+    #
+    # One LOCATION_CODE is rendered as one point.
+    # Raw measurement rows must never create duplicate markers.
+    #
+    # The map follows the same filters as the Suspect page:
+    #   - month
+    #   - UNITAP
+    #   - suspect classification
+    #   - repeat count
+    #
+    # Repeat count means distinct months in fact_anev up to the
+    # selected month, exactly like get_repeat_summary().
+    # ==========================================================
+
+    def get_map_points(
+        self,
+        month_key: str,
+        search: str | None = None,
+        unitupi: str | None = None,
+        unitap: str | None = None,
+        unitup: str | None = None,
+        tariff: str | None = None,
+        suspect_name: str | None = None,
+        repeat_count: int | None = None,
+        limit: int = 100_000,
+    ) -> dict[str, Any]:
+        """Return deduplicated suspect locations with valid coordinates.
+
+        Coordinate strategy:
+
+        1. Primary source: ``fact_customer_location`` using
+           ``fact_anev.LOCATION_CODE = fact_customer_location.IDPEL``.
+        2. Fallback source: ``fact_pengecekan`` using the same IDPEL key.
+        3. Primary coordinates win when both are available.
+        4. ``fact_pengecekan`` is deduplicated to one latest valid coordinate
+           per IDPEL using WAKTU_PERIKSA.
+        5. Coordinate orientation is normalized for the customer-location
+           source because historical DIL data can contain X/Y reversed.
+        6. Only coordinates inside the PLN Lampung operating area are
+           accepted:
+              latitude  -6.6 .. -3.7
+              longitude 103.0 .. 106.5
+
+           This rejects known malformed/out-of-area coordinates that would
+           otherwise place markers in the ocean or another province.
+
+        Locations without a valid coordinate are retained in the coverage
+        calculation but are not emitted as map points.
+        """
+        empty = {
+            "total_locations": 0,
+            "matched_idpel": 0,
+            "mapped_locations": 0,
+            "unmapped_locations": 0,
+            "points": [],
+        }
+
+        if not dataset_exists("fact_anev"):
+            return empty
+
+        if not (
+            dataset_exists("fact_customer_location")
+            or dataset_exists("fact_pengecekan")
+        ):
+            return empty
+
+        conn = get_connection()
+
+        try:
+            safe_limit = max(1, min(int(limit), 100_000))
+
+            # Coordinate datasets are optional.  Build harmless empty
+            # relations when one source is unavailable so the primary source
+            # can still serve the map.
+            customer_location_source = (
+                "fact_customer_location"
+                if dataset_exists("fact_customer_location")
+                else """(
+                    SELECT
+                        CAST(NULL AS VARCHAR) AS IDPEL,
+                        CAST(NULL AS DOUBLE) AS KOORDINAT_X,
+                        CAST(NULL AS DOUBLE) AS KOORDINAT_Y
+                    WHERE FALSE
+                )"""
+            )
+
+            pengecekan_source = (
+                "fact_pengecekan"
+                if dataset_exists("fact_pengecekan")
+                else """(
+                    SELECT
+                        CAST(NULL AS VARCHAR) AS IDPEL,
+                        CAST(NULL AS DOUBLE) AS LATITUDE,
+                        CAST(NULL AS DOUBLE) AS LONGITUDE,
+                        CAST(NULL AS TIMESTAMP) AS WAKTU_PERIKSA
+                    WHERE FALSE
+                )"""
+            )
+
+            normalized_suspect_sql = """
+                CASE
+                    WHEN REPLACE(
+                        REGEXP_REPLACE(
+                            TRIM(UPPER(CAST(SUSPECT_NAME AS VARCHAR))),
+                            '\\s+', ' ', 'g'
+                        ), ' ', ''
+                    ) = 'ASYMMETRICPOWERBYINSTANT'
+                    THEN 'ASYMMETRIC POWER BY INSTANT'
+
+                    WHEN REPLACE(
+                        REGEXP_REPLACE(
+                            TRIM(UPPER(CAST(SUSPECT_NAME AS VARCHAR))),
+                            '\\s+', ' ', 'g'
+                        ), ' ', ''
+                    ) = 'INCORRECTPHASEBYINSTANT'
+                    THEN 'INCORRECT PHASE BY INSTANT'
+
+                    WHEN REPLACE(
+                        REGEXP_REPLACE(
+                            TRIM(UPPER(CAST(SUSPECT_NAME AS VARCHAR))),
+                            '\\s+', ' ', 'g'
+                        ), ' ', ''
+                    ) = 'OVERCURRENTBYINSTANT'
+                    THEN 'OVER CURRENT BY INSTANT'
+
+                    WHEN REPLACE(
+                        REGEXP_REPLACE(
+                            TRIM(UPPER(CAST(SUSPECT_NAME AS VARCHAR))),
+                            '\\s+', ' ', 'g'
+                        ), ' ', ''
+                    ) = 'OVERVOLTAGEBYINSTANT'
+                    THEN 'OVER VOLTAGE BY INSTANT'
+
+                    WHEN REPLACE(
+                        REGEXP_REPLACE(
+                            TRIM(UPPER(CAST(SUSPECT_NAME AS VARCHAR))),
+                            '\\s+', ' ', 'g'
+                        ), ' ', ''
+                    ) = 'REVERSALBYINSTANT'
+                    THEN 'REVERSAL BY INSTANT'
+
+                    WHEN REPLACE(
+                        REGEXP_REPLACE(
+                            TRIM(UPPER(CAST(SUSPECT_NAME AS VARCHAR))),
+                            '\\s+', ' ', 'g'
+                        ), ' ', ''
+                    ) = 'TIMEDIFFERENCE-INSTANT'
+                    THEN 'TIME DIFFERENCE - INSTANT'
+
+                    WHEN REPLACE(
+                        REGEXP_REPLACE(
+                            TRIM(UPPER(CAST(SUSPECT_NAME AS VARCHAR))),
+                            '\\s+', ' ', 'g'
+                        ), ' ', ''
+                    ) = 'UNBALANCECURRENTBYINSTANT'
+                    THEN 'UNBALANCE CURRENT BY INSTANT'
+
+                    WHEN REPLACE(
+                        REGEXP_REPLACE(
+                            TRIM(UPPER(CAST(SUSPECT_NAME AS VARCHAR))),
+                            '\\s+', ' ', 'g'
+                        ), ' ', ''
+                    ) = 'UNDERVOLTAGEBYINSTANT'
+                    THEN 'UNDER VOLTAGE BY INSTANT'
+
+                    WHEN REPLACE(
+                        REGEXP_REPLACE(
+                            TRIM(UPPER(CAST(SUSPECT_NAME AS VARCHAR))),
+                            '\\s+', ' ', 'g'
+                        ), ' ', ''
+                    ) = 'VOLTAGEDIP-INSTANT'
+                    THEN 'VOLTAGE DIP - INSTANT'
+
+                    ELSE REGEXP_REPLACE(
+                        TRIM(UPPER(CAST(SUSPECT_NAME AS VARCHAR))),
+                        '\\s+', ' ', 'g'
+                    )
+                END
+            """
+
+            clauses = [
+                "CAST(MONTH AS VARCHAR) = ?",
+                "LOCATION_CODE IS NOT NULL",
+                "SUSPECT_NAME IS NOT NULL",
+            ]
+            params: list[Any] = [str(month_key)]
+
+            if unitupi:
+                clauses.append("CAST(UNITUPI AS VARCHAR) = ?")
+                params.append(str(unitupi))
+
+            if unitap:
+                clauses.append("CAST(UNITAP AS VARCHAR) = ?")
+                params.append(str(unitap))
+
+            if unitup:
+                clauses.append("CAST(UNITUP AS VARCHAR) = ?")
+                params.append(str(unitup))
+
+            if tariff:
+                clauses.append("CAST(TARIFF AS VARCHAR) = ?")
+                params.append(str(tariff))
+
+            if suspect_name:
+                clauses.append(f"{normalized_suspect_sql} = ?")
+                params.append(" ".join(str(suspect_name).strip().upper().split()))
+
+            if search:
+                search_value = f"%{search.strip()}%"
+                clauses.append(
+                    "(CAST(LOCATION_CODE AS VARCHAR) ILIKE ? "
+                    "OR CAST(LOCATION_NAME AS VARCHAR) ILIKE ?)"
+                )
+                params.extend([search_value, search_value])
+
+            repeat_cte = ""
+            repeat_join = ""
+            repeat_params: list[Any] = []
+
+            if repeat_count is not None:
+                repeat_cte = """
+                    , repeat_frequency AS (
+                        SELECT
+                            CAST(LOCATION_CODE AS VARCHAR) AS LOCATION_CODE,
+                            COUNT(DISTINCT CAST(MONTH AS VARCHAR)) AS REPEAT_COUNT
+                        FROM fact_anev
+                        WHERE
+                            LOCATION_CODE IS NOT NULL
+                            AND MONTH IS NOT NULL
+                            AND CAST(MONTH AS VARCHAR) <= ?
+                        GROUP BY LOCATION_CODE
+                    )
+                """
+                repeat_join = """
+                    INNER JOIN repeat_frequency rf
+                        ON rf.LOCATION_CODE = s.LOCATION_CODE
+                       AND rf.REPEAT_COUNT = ?
+                """
+                repeat_params = [str(month_key), int(repeat_count)]
+
+            # ------------------------------------------------------
+            # Build the filtered suspect-location population first.
+            # One row per LOCATION_CODE, while preserving all suspect
+            # classifications for the map popup.
+            # ------------------------------------------------------
+            sql = f"""
+                WITH suspect_rows AS (
+                    SELECT
+                        CAST(LOCATION_CODE AS VARCHAR) AS LOCATION_CODE,
+                        CAST(LOCATION_CODE AS VARCHAR) AS IDPEL,
+                        CAST(LOCATION_NAME AS VARCHAR) AS LOCATION_NAME,
+                        CAST(UNITUPI AS VARCHAR) AS UNITUPI,
+                        CAST(UNITAP AS VARCHAR) AS UNITAP,
+                        CAST(UNITUP AS VARCHAR) AS UNITUP,
+                        CAST(TARIFF AS VARCHAR) AS TARIFF,
+                        TRY_CAST(POWER AS DOUBLE) AS POWER,
+                        {normalized_suspect_sql} AS SUSPECT_NAME
+                    FROM fact_anev
+                    WHERE {' AND '.join(clauses)}
+                ),
+
+                suspect_locations AS (
+                    SELECT
+                        LOCATION_CODE,
+                        ANY_VALUE(IDPEL) AS IDPEL,
+                        ANY_VALUE(LOCATION_NAME) AS LOCATION_NAME,
+                        ANY_VALUE(UNITUPI) AS UNITUPI,
+                        ANY_VALUE(UNITAP) AS UNITAP,
+                        ANY_VALUE(UNITUP) AS UNITUP,
+                        ANY_VALUE(TARIFF) AS TARIFF,
+                        ANY_VALUE(POWER) AS POWER,
+                        STRING_AGG(
+                            DISTINCT SUSPECT_NAME,
+                            ', ' ORDER BY SUSPECT_NAME
+                        ) AS SUSPECT_NAME
+                    FROM suspect_rows
+                    GROUP BY LOCATION_CODE
+                )
+                {repeat_cte}
+
+                , customer_location_raw AS (
+                    SELECT
+                        REGEXP_REPLACE(
+                            TRIM(CAST(IDPEL AS VARCHAR)),
+                            '\\.0$', ''
+                        ) AS IDPEL,
+                        TRY_CAST(KOORDINAT_X AS DOUBLE) AS RAW_X,
+                        TRY_CAST(KOORDINAT_Y AS DOUBLE) AS RAW_Y
+                    FROM {customer_location_source}
+                    WHERE IDPEL IS NOT NULL
+                ),
+
+                customer_location_normalized AS (
+                    SELECT
+                        IDPEL,
+                        CASE
+                            WHEN RAW_X BETWEEN -6.6 AND -3.7
+                             AND RAW_Y BETWEEN 103.0 AND 106.5
+                            THEN RAW_X
+                            WHEN RAW_X BETWEEN 103.0 AND 106.5
+                             AND RAW_Y BETWEEN -6.6 AND -3.7
+                            THEN RAW_Y
+                            ELSE NULL
+                        END AS LATITUDE,
+                        CASE
+                            WHEN RAW_X BETWEEN -6.6 AND -3.7
+                             AND RAW_Y BETWEEN 103.0 AND 106.5
+                            THEN RAW_Y
+                            WHEN RAW_X BETWEEN 103.0 AND 106.5
+                             AND RAW_Y BETWEEN -6.6 AND -3.7
+                            THEN RAW_X
+                            ELSE NULL
+                        END AS LONGITUDE
+                    FROM customer_location_raw
+                ),
+
+                customer_location_by_idpel AS (
+                    SELECT IDPEL, LATITUDE, LONGITUDE
+                    FROM (
+                        SELECT
+                            IDPEL,
+                            LATITUDE,
+                            LONGITUDE,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY IDPEL
+                                ORDER BY
+                                    CASE
+                                        WHEN LATITUDE IS NOT NULL
+                                         AND LONGITUDE IS NOT NULL
+                                        THEN 0
+                                        ELSE 1
+                                    END
+                            ) AS RN
+                        FROM customer_location_normalized
+                        WHERE LATITUDE IS NOT NULL
+                          AND LONGITUDE IS NOT NULL
+                    ) x
+                    WHERE RN = 1
+                ),
+
+                pengecekan_raw AS (
+                    SELECT
+                        REGEXP_REPLACE(
+                            TRIM(CAST(IDPEL AS VARCHAR)),
+                            '\\.0$', ''
+                        ) AS IDPEL,
+                        TRY_CAST(LATITUDE AS DOUBLE) AS LATITUDE,
+                        TRY_CAST(LONGITUDE AS DOUBLE) AS LONGITUDE,
+                        WAKTU_PERIKSA
+                    FROM {pengecekan_source}
+                    WHERE IDPEL IS NOT NULL
+                ),
+
+                pengecekan_by_idpel AS (
+                    SELECT IDPEL, LATITUDE, LONGITUDE
+                    FROM (
+                        SELECT
+                            IDPEL,
+                            LATITUDE,
+                            LONGITUDE,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY IDPEL
+                                ORDER BY
+                                    WAKTU_PERIKSA DESC NULLS LAST
+                            ) AS RN
+                        FROM pengecekan_raw
+                        WHERE LATITUDE BETWEEN -6.6 AND -3.7
+                          AND LONGITUDE BETWEEN 103.0 AND 106.5
+                    ) x
+                    WHERE RN = 1
+                ),
+
+                mapped AS (
+                    SELECT
+                        s.LOCATION_CODE,
+                        s.IDPEL,
+                        s.LOCATION_NAME,
+                        s.UNITUPI,
+                        s.UNITAP,
+                        s.UNITUP,
+                        s.TARIFF,
+                        s.POWER,
+                        s.SUSPECT_NAME,
+                        CASE
+                            WHEN c.LATITUDE IS NOT NULL
+                             AND c.LONGITUDE IS NOT NULL
+                            THEN c.LATITUDE
+                            ELSE p.LATITUDE
+                        END AS LATITUDE,
+                        CASE
+                            WHEN c.LATITUDE IS NOT NULL
+                             AND c.LONGITUDE IS NOT NULL
+                            THEN c.LONGITUDE
+                            ELSE p.LONGITUDE
+                        END AS LONGITUDE,
+                        CASE
+                            WHEN c.LATITUDE IS NOT NULL
+                             AND c.LONGITUDE IS NOT NULL
+                            THEN 'customer_location'
+                            WHEN p.LATITUDE IS NOT NULL
+                             AND p.LONGITUDE IS NOT NULL
+                            THEN 'pengecekan'
+                            ELSE NULL
+                        END AS COORDINATE_SOURCE
+                    FROM suspect_locations s
+                    LEFT JOIN customer_location_by_idpel c
+                        ON REGEXP_REPLACE(
+                            TRIM(s.IDPEL), '\\.0$', ''
+                        ) = c.IDPEL
+                    LEFT JOIN pengecekan_by_idpel p
+                        ON REGEXP_REPLACE(
+                            TRIM(s.IDPEL), '\\.0$', ''
+                        ) = p.IDPEL
+                    {repeat_join}
+                )
+
+                SELECT
+                    LOCATION_CODE,
+                    IDPEL,
+                    LOCATION_NAME,
+                    UNITUPI,
+                    UNITAP,
+                    UNITUP,
+                    TARIFF,
+                    POWER,
+                    SUSPECT_NAME,
+                    LATITUDE,
+                    LONGITUDE,
+                    COORDINATE_SOURCE
+                FROM mapped
+                ORDER BY UNITUP, LOCATION_CODE
+                LIMIT ?
+            """
+
+            query_params = [*params, *repeat_params, safe_limit]
+            rows = conn.execute(sql, query_params).fetchall()
+
+            points = []
+            for row in rows:
+                latitude = row[9]
+                longitude = row[10]
+                if latitude is None or longitude is None:
+                    continue
+
+                points.append({
+                    "location_code": str(row[0]),
+                    "idpel": str(row[1]) if row[1] is not None else None,
+                    "location_name": row[2],
+                    "unitupi": row[3],
+                    "unitap": row[4],
+                    "unitup": row[5],
+                    "tariff": row[6],
+                    "power": row[7],
+                    "suspect_name": row[8],
+                    "latitude": float(latitude),
+                    "longitude": float(longitude),
+                    "coordinate_source": row[11],
+                })
+
+            # ------------------------------------------------------
+            # Coverage uses the exact same filtered population and
+            # exact same coordinate precedence, but without LIMIT.
+            # ------------------------------------------------------
+            coverage_sql = f"""
+                WITH suspect_rows AS (
+                    SELECT
+                        CAST(LOCATION_CODE AS VARCHAR) AS LOCATION_CODE,
+                        CAST(LOCATION_CODE AS VARCHAR) AS IDPEL
+                    FROM fact_anev
+                    WHERE {' AND '.join(clauses)}
+                ),
+
+                suspect_locations AS (
+                    SELECT
+                        LOCATION_CODE,
+                        ANY_VALUE(IDPEL) AS IDPEL
+                    FROM suspect_rows
+                    GROUP BY LOCATION_CODE
+                )
+                {repeat_cte}
+
+                , customer_location_raw AS (
+                    SELECT
+                        REGEXP_REPLACE(
+                            TRIM(CAST(IDPEL AS VARCHAR)),
+                            '\\.0$', ''
+                        ) AS IDPEL,
+                        TRY_CAST(KOORDINAT_X AS DOUBLE) AS RAW_X,
+                        TRY_CAST(KOORDINAT_Y AS DOUBLE) AS RAW_Y
+                    FROM {customer_location_source}
+                    WHERE IDPEL IS NOT NULL
+                ),
+
+                customer_location_by_idpel AS (
+                    SELECT DISTINCT IDPEL
+                    FROM customer_location_raw
+                    WHERE
+                        (
+                            RAW_X BETWEEN -6.6 AND -3.7
+                            AND RAW_Y BETWEEN 103.0 AND 106.5
+                        )
+                        OR (
+                            RAW_X BETWEEN 103.0 AND 106.5
+                            AND RAW_Y BETWEEN -6.6 AND -3.7
+                        )
+                ),
+
+                pengecekan_by_idpel AS (
+                    SELECT DISTINCT
+                        REGEXP_REPLACE(
+                            TRIM(CAST(IDPEL AS VARCHAR)),
+                            '\\.0$', ''
+                        ) AS IDPEL
+                    FROM {pengecekan_source}
+                    WHERE IDPEL IS NOT NULL
+                      AND LATITUDE BETWEEN -6.6 AND -3.7
+                      AND LONGITUDE BETWEEN 103.0 AND 106.5
+                ),
+
+                mapped AS (
+                    SELECT
+                        s.LOCATION_CODE,
+                        s.IDPEL,
+                        c.IDPEL AS CUSTOMER_COORD_ID,
+                        p.IDPEL AS PENGECEKAN_COORD_ID
+                    FROM suspect_locations s
+                    LEFT JOIN customer_location_by_idpel c
+                        ON REGEXP_REPLACE(
+                            TRIM(s.IDPEL), '\\.0$', ''
+                        ) = c.IDPEL
+                    LEFT JOIN pengecekan_by_idpel p
+                        ON REGEXP_REPLACE(
+                            TRIM(s.IDPEL), '\\.0$', ''
+                        ) = p.IDPEL
+                    {repeat_join}
+                )
+
+                SELECT
+                    COUNT(DISTINCT LOCATION_CODE) AS TOTAL_LOCATIONS,
+                    COUNT(DISTINCT CASE
+                        WHEN CUSTOMER_COORD_ID IS NOT NULL
+                          OR PENGECEKAN_COORD_ID IS NOT NULL
+                        THEN LOCATION_CODE
+                    END) AS MAPPED_LOCATIONS,
+                    COUNT(DISTINCT CASE
+                        WHEN IDPEL IS NOT NULL
+                        THEN LOCATION_CODE
+                    END) AS MATCHED_IDPEL
+                FROM mapped
+            """
+
+            coverage = conn.execute(
+                coverage_sql,
+                [*params, *repeat_params],
+            ).fetchone()
+
+            total_locations = int(coverage[0] or 0) if coverage else 0
+            mapped_locations = int(coverage[1] or 0) if coverage else 0
+            matched_idpel = int(coverage[2] or 0) if coverage else 0
+
+            return {
+                "total_locations": total_locations,
+                "matched_idpel": matched_idpel,
+                "mapped_locations": mapped_locations,
+                "unmapped_locations": max(total_locations - mapped_locations, 0),
+                "points": points,
+            }
+
+        finally:
+            conn.close()
