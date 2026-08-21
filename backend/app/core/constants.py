@@ -1,70 +1,42 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
-
-# =====================================================
-# PROJECT ROOT
-# =====================================================
-
-# backend/app/core/constants.py
-#                 ↑
-# parent[0] = core
-# parent[1] = app
-# parent[2] = backend
-# parent[3] = pln-analytics-platform
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
-# =====================================================
-# DATA ROOT
-# =====================================================
+# FastAPI Cloud instances have ephemeral local storage. The root paths can
+# therefore be redirected to a mounted/persistent directory when available.
+DATA = Path(
+    os.getenv("DATA_ROOT_DIR", str(PROJECT_ROOT / "data"))
+).expanduser()
 
-DATA = PROJECT_ROOT / "data"
+RAW = Path(
+    os.getenv("DATA_RAW_DIR", str(DATA / "raw"))
+).expanduser()
+RAW_UPLOAD = Path(
+    os.getenv("DATA_INCOMING_DIR", str(RAW / "incoming"))
+).expanduser()
 
-# =====================================================
-# RAW DATA
-# =====================================================
-
-RAW = DATA / "raw"
-
-RAW_UPLOAD = RAW / "incoming"
-
-# =====================================================
-# PROCESSED DATA
-# =====================================================
-
-PROCESSED = DATA / "processed"
-
+PROCESSED = Path(
+    os.getenv("DATA_PROCESSED_DIR", str(DATA / "processed"))
+).expanduser()
 PARQUET = PROCESSED / "parquet"
-
 WAREHOUSE = PROCESSED / "warehouse.duckdb"
-
 METADATA = PROCESSED / "metadata"
-
 REGISTRY = METADATA / "registry.json"
 
-# =====================================================
-# PARQUET FOLDERS
-# =====================================================
-
 ANEV_PARQUET = PARQUET / "anev"
-
 DLPD_PARQUET = PARQUET / "dlpd"
-
 PENGECEKAN_PARQUET = PARQUET / "pengecekan"
-
-# =====================================================
-# CREATE DIRECTORIES
-# =====================================================
+CUSTOMER_LOCATION_PARQUET = PARQUET / "customer_location"
 
 for folder in (
     RAW_UPLOAD,
     ANEV_PARQUET,
     DLPD_PARQUET,
     PENGECEKAN_PARQUET,
+    CUSTOMER_LOCATION_PARQUET,
     METADATA,
 ):
-    folder.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    folder.mkdir(parents=True, exist_ok=True)
