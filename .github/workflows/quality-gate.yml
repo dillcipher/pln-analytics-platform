@@ -1,0 +1,46 @@
+name: quality-gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install backend dependencies
+        run: pip install -r requirements.txt
+      - name: Compile backend
+        run: python -m compileall app
+      - name: Validate critical imports
+        env:
+          S3_ENDPOINT: https://example.invalid/storage/v1/s3
+          S3_ACCESS_KEY_ID: ci
+          S3_SECRET_ACCESS_KEY: ci
+        run: python -c "from app.application.etl.startup_recovery import recover_pending_jobs; from app.etl.runtime_guard import install_runtime_guards; from app.infrastructure.duckdb.dlpd_repository import DuckDbDlpdRepository; print('backend imports ok')"
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: TypeScript and production build
+        run: npm run build
