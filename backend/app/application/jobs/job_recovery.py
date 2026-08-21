@@ -86,59 +86,59 @@ async def _restore_manifest_files(job_id: str, job_folder: Path, manifest: Path)
 
 
 async def _run_etl_with_retry(job_id: str, job_folder: Path) -> None:
-    """Run recovery ETL with retries; caller owns the single-job recovery gate."""
-    for attempt in range(1, ETL_MAX_RETRIES + 1):
-        logger.info("ETL RETRY | JOB=%s | ATTEMPT=%s/%s | NO REUPLOAD", job_id, attempt, ETL_MAX_RETRIES)
-        try:
-            result = await asyncio.to_thread(_run_etl, job_folder)
-        except Exception as exc:
-            result = {"success": False, "error": str(exc)}
-            logger.exception("ETL ATTEMPT CRASHED | JOB=%s | ATTEMPT=%s/%s", job_id, attempt, ETL_MAX_RETRIES)
-        if isinstance(result, dict) and result.get("success"):
-            logger.info("ETL RETRY SUCCEEDED | JOB=%s | ATTEMPT=%s/%s", job_id, attempt, ETL_MAX_RETRIES)
-            return
-        error = result.get("error") if isinstance(result, dict) else "ETL returned no success result"
-        if attempt < ETL_MAX_RETRIES:
-            logger.warning("ETL ATTEMPT FAILED | JOB=%s | ATTEMPT=%s/%s | RETRYING IN %ss | ERROR=%s", job_id, attempt, ETL_MAX_RETRIES, ETL_RETRY_DELAY_SECONDS, error)
-            await asyncio.sleep(ETL_RETRY_DELAY_SECONDS)
-        else:
-            logger.error("ETL EXHAUSTED RETRIES | JOB=%s | ATTEMPTS=%s | ERROR=%s", job_id, ETL_MAX_RETRIES, error)
+    """Run recovery ETL under a single-process memory gate."""
+    async with _get_recovery_semaphore():
+        for attempt in range(1, ETL_MAX_RETRIES + 1):
+            logger.info("ETL RETRY | JOB=%s | ATTEMPT=%s/%s | NO REUPLOAD", job_id, attempt, ETL_MAX_RETRIES)
+            try:
+                result = await asyncio.to_thread(_run_etl, job_folder)
+            except Exception as exc:
+                result = {"success": False, "error": str(exc)}
+                logger.exception("ETL ATTEMPT CRASHED | JOB=%s | ATTEMPT=%s/%s", job_id, attempt, ETL_MAX_RETRIES)
+            if isinstance(result, dict) and result.get("success"):
+                logger.info("ETL RETRY SUCCEEDED | JOB=%s | ATTEMPT=%s/%s", job_id, attempt, ETL_MAX_RETRIES)
+                return
+            error = result.get("error") if isinstance(result, dict) else "ETL returned no success result"
+            if attempt < ETL_MAX_RETRIES:
+                logger.warning("ETL ATTEMPT FAILED | JOB=%s | ATTEMPT=%s/%s | RETRYING IN %ss | ERROR=%s", job_id, attempt, ETL_MAX_RETRIES, ETL_RETRY_DELAY_SECONDS, error)
+                await asyncio.sleep(ETL_RETRY_DELAY_SECONDS)
+            else:
+                logger.error("ETL EXHAUSTED RETRIES | JOB=%s | ATTEMPTS=%s | ERROR=%s", job_id, ETL_MAX_RETRIES, error)
 
 
 async def _recover_and_run(job_id: str) -> None:
-    async with _get_recovery_semaphore():
-        try:
-            job_folder = RAW_UPLOAD / job_id
+    try:
+        job_folder = RAW_UPLOAD / job_id
+        manifest = await _restore_manifest(job_id, job_folder)
+        if manifest is None:
+            metadata_key = UploadService._job_metadata_s3_key(job_id)
+            if not await UploadService._s3_head(metadata_key):
+                return
+            metadata = await UploadService._s3_get_json(metadata_key)
+            if not isinstance(metadata, dict):
+                return
+            filename = metadata.get("filename") or metadata.get("original_filename")
+            if not filename:
+                return
+            final_file = await _restore_final_file(job_id, job_folder, filename)
+            if final_file is None:
+                return
             manifest = await _restore_manifest(job_id, job_folder)
             if manifest is None:
-                metadata_key = UploadService._job_metadata_s3_key(job_id)
-                if not await UploadService._s3_head(metadata_key):
-                    return
-                metadata = await UploadService._s3_get_json(metadata_key)
-                if not isinstance(metadata, dict):
-                    return
-                filename = metadata.get("filename") or metadata.get("original_filename")
-                if not filename:
-                    return
-                final_file = await _restore_final_file(job_id, job_folder, filename)
-                if final_file is None:
-                    return
-                manifest = await _restore_manifest(job_id, job_folder)
-                if manifest is None:
-                    return
-            data = _read_json(manifest)
-            status = str((data or {}).get("status", "")).upper()
-            if status != "FAILED":
-                logger.info("STARTUP RECOVERY SKIP | JOB=%s | STATUS=%s", job_id, status or "UNKNOWN")
                 return
-            if not await _restore_manifest_files(job_id, job_folder, manifest):
-                logger.error("STARTUP RECOVERY BLOCKED | JOB=%s | REQUIRED ASSEMBLED FILE MISSING", job_id)
-                return
-            await _run_etl_with_retry(job_id, job_folder)
-        except Exception:
-            logger.exception("Durable job recovery failed for %s", job_id)
-        finally:
-            _RUNNING_JOB_IDS.discard(job_id)
+        data = _read_json(manifest)
+        status = str((data or {}).get("status", "")).upper()
+        if status != "FAILED":
+            logger.info("STARTUP RECOVERY SKIP | JOB=%s | STATUS=%s", job_id, status or "UNKNOWN")
+            return
+        if not await _restore_manifest_files(job_id, job_folder, manifest):
+            logger.error("STARTUP RECOVERY BLOCKED | JOB=%s | REQUIRED ASSEMBLED FILE MISSING", job_id)
+            return
+        await _run_etl_with_retry(job_id, job_folder)
+    except Exception:
+        logger.exception("Durable job recovery failed for %s", job_id)
+    finally:
+        _RUNNING_JOB_IDS.discard(job_id)
 
 
 def ensure_job_processing(job_id: str) -> None:
