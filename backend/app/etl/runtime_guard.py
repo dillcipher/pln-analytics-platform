@@ -9,7 +9,6 @@ from pathlib import Path
 
 import boto3
 from botocore.client import Config
-from boto3.s3.transfer import TransferConfig
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +29,15 @@ def install_runtime_guards() -> None:
     if not getattr(UploadService, "_pln_stable_s3_upload", False):
         async def _stable_s3_put_file(cls, local_path: Path, s3_key: str) -> None:
             size = local_path.stat().st_size
-            transfer = TransferConfig(
-                multipart_threshold=64 * 1024 * 1024,
-                multipart_chunksize=16 * 1024 * 1024,
-                max_concurrency=1,
-                use_threads=False,
-            )
+            # Supabase Storage's S3 gateway has been returning opaque
+            # UploadPart failures for multipart uploads. PLN workbooks are
+            # uploaded as a streaming single PUT instead. This is constant
+            # memory and avoids the multipart UploadPart path entirely.
+            single_put_limit = 5 * 1024 * 1024 * 1024
+            if size > single_put_limit:
+                raise ValueError(
+                    f"File {local_path.name} exceeds the 5 GiB single-object upload limit."
+                )
 
             def _upload() -> None:
                 last_error: Exception | None = None
@@ -50,19 +52,19 @@ def install_runtime_guards() -> None:
                             config=Config(
                                 signature_version="s3v4",
                                 retries={"max_attempts": 5, "mode": "adaptive"},
-                                connect_timeout=20,
-                                read_timeout=180,
+                                connect_timeout=30,
+                                read_timeout=600,
                             ),
                         )
-                        client.upload_file(
-                            str(local_path),
-                            S3_BUCKET,
-                            s3_key,
-                            ExtraArgs={"ContentType": "application/octet-stream"},
-                            Config=transfer,
-                        )
+                        with local_path.open("rb") as source:
+                            client.put_object(
+                                Bucket=S3_BUCKET,
+                                Key=s3_key,
+                                Body=source,
+                                ContentType="application/octet-stream",
+                            )
                         logger.info(
-                            "STABLE S3 UPLOAD OK | FILE=%s | BYTES=%s | ATTEMPT=%s",
+                            "STABLE S3 SINGLE-PUT OK | FILE=%s | BYTES=%s | ATTEMPT=%s",
                             local_path.name,
                             size,
                             attempt,
@@ -78,7 +80,7 @@ def install_runtime_guards() -> None:
                             exc,
                         )
                         if attempt < S3_UPLOAD_RETRIES:
-                            time.sleep(min(2 * attempt, 6))
+                            time.sleep(min(2 * attempt, 8))
                 raise last_error if last_error is not None else RuntimeError("S3 upload failed")
 
             await asyncio.to_thread(_upload)
