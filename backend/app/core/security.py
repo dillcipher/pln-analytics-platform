@@ -40,7 +40,12 @@ SALT_BYTES = 16
 def hash_password(password: str) -> str:
     """Returns 'pbkdf2_sha256$<iterations>$<salt_hex>$<hash_hex>'."""
     salt = secrets.token_bytes(SALT_BYTES)
-    derived = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERATIONS)
+    derived = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        PBKDF2_ITERATIONS,
+    )
     return f"pbkdf2_sha256${PBKDF2_ITERATIONS}${salt.hex()}${derived.hex()}"
 
 
@@ -55,7 +60,12 @@ def verify_password(password: str, stored_hash: str) -> bool:
     iterations = int(iterations_str)
     salt = bytes.fromhex(salt_hex)
     expected = bytes.fromhex(hash_hex)
-    candidate = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    candidate = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        iterations,
+    )
     return hmac.compare_digest(candidate, expected)
 
 
@@ -88,10 +98,18 @@ def create_access_token(
     if extra_claims:
         payload.update(extra_claims)
 
-    header_b64 = _b64url_encode(json.dumps(header, separators=(",", ":")).encode())
-    payload_b64 = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
+    header_b64 = _b64url_encode(
+        json.dumps(header, separators=(",", ":")).encode()
+    )
+    payload_b64 = _b64url_encode(
+        json.dumps(payload, separators=(",", ":")).encode()
+    )
     signing_input = f"{header_b64}.{payload_b64}".encode()
-    signature = hmac.new(secret_key.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    signature = hmac.new(
+        secret_key.encode("utf-8"),
+        signing_input,
+        hashlib.sha256,
+    ).digest()
     signature_b64 = _b64url_encode(signature)
 
     return f"{header_b64}.{payload_b64}.{signature_b64}"
@@ -101,22 +119,53 @@ class TokenError(Exception):
     """Raised for any invalid, tampered, or expired token."""
 
 
-def decode_access_token(token: str, secret_key: str) -> dict[str, Any]:
+def decode_access_token(
+    token: str | None,
+    secret_key: str,
+) -> dict[str, Any]:
+    """Decode and verify a JWT.
+
+    ``None``/empty input is treated as an authentication failure rather than
+    leaking an AttributeError from ``str.split`` into FastAPI as HTTP 500.
+    """
+    if not token or not isinstance(token, str):
+        raise TokenError("Missing access token")
+
     try:
         header_b64, payload_b64, signature_b64 = token.split(".")
-    except ValueError as exc:
+    except (ValueError, AttributeError) as exc:
         raise TokenError("Malformed token") from exc
 
-    signing_input = f"{header_b64}.{payload_b64}".encode()
-    expected_signature = hmac.new(secret_key.encode("utf-8"), signing_input, hashlib.sha256).digest()
-    actual_signature = _b64url_decode(signature_b64)
+    if not header_b64 or not payload_b64 or not signature_b64:
+        raise TokenError("Malformed token")
+
+    try:
+        signing_input = f"{header_b64}.{payload_b64}".encode()
+        expected_signature = hmac.new(
+            secret_key.encode("utf-8"),
+            signing_input,
+            hashlib.sha256,
+        ).digest()
+        actual_signature = _b64url_decode(signature_b64)
+    except (ValueError, TypeError) as exc:
+        raise TokenError("Malformed token") from exc
 
     if not hmac.compare_digest(expected_signature, actual_signature):
         raise TokenError("Signature verification failed")
 
-    payload = json.loads(_b64url_decode(payload_b64))
+    try:
+        payload = json.loads(_b64url_decode(payload_b64))
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise TokenError("Malformed token payload") from exc
 
-    if "exp" in payload and int(time.time()) > payload["exp"]:
-        raise TokenError("Token expired")
+    if not isinstance(payload, dict):
+        raise TokenError("Invalid token payload")
+
+    if "exp" in payload:
+        try:
+            if int(time.time()) > int(payload["exp"]):
+                raise TokenError("Token expired")
+        except (TypeError, ValueError) as exc:
+            raise TokenError("Invalid token expiry") from exc
 
     return payload
