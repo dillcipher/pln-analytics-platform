@@ -453,58 +453,219 @@ async def process_existing_job(
     job_id: str,
     background_tasks: BackgroundTasks,
 ):
+    """
+    Manually trigger ETL for an existing job.
+
+    The job may have been created by a previous application instance.
+    Local RAW_UPLOAD storage is therefore treated as a cache, not the
+    source of truth.
+
+    Recovery order:
+
+        1. Local manifest -> schedule ETL immediately.
+        2. Durable Supabase job metadata -> recover the assembled file
+           from Supabase when local storage is missing/incomplete.
+        3. After recovery creates manifest.json -> schedule ETL.
+
+    This prevents a valid durable job from returning 404 merely because
+    the FastAPI instance was restarted or replaced.
+    """
 
     start = time.perf_counter()
+
+    job_id = job_id.strip()
+
+    if not job_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Job ID is required.",
+        )
 
     job_folder = (
         RAW_UPLOAD
         / job_id
     )
 
-    if not job_folder.exists():
-        raise HTTPException(
-            status_code=404,
-            detail=f"Job not found: {job_id}",
-        )
-
     manifest_path = (
         job_folder
         / "manifest.json"
     )
 
-    if not manifest_path.exists():
+    # ==========================================================
+    # FAST PATH: LOCAL MANIFEST ALREADY EXISTS
+    # ==========================================================
+
+    if manifest_path.exists():
+
+        background_tasks.add_task(
+            _run_etl,
+            job_folder,
+        )
+
+        duration = (
+            time.perf_counter()
+            - start
+        )
+
+        print("=" * 80)
+        print("ETL SCHEDULED")
+        print("JOB ID   :", job_id)
+        print("SOURCE   : LOCAL MANIFEST")
+        print(
+            f"DURATION : {duration:.2f}s",
+        )
+        print("=" * 80)
+
+        return {
+            "success": True,
+            "job_id": job_id,
+            "status": "ETL_QUEUED",
+            "message": "ETL scheduled",
+        }
+
+    # ==========================================================
+    # DURABLE RECOVERY
+    #
+    # Local storage may disappear when the FastAPI instance is
+    # restarted/replaced. Job metadata and the final assembled
+    # Excel are persisted in Supabase.
+    # ==========================================================
+
+    try:
+        metadata_key = (
+            UploadService._job_metadata_s3_key(
+                job_id,
+            )
+        )
+
+        metadata_exists = await UploadService._s3_head(
+            metadata_key,
+        )
+
+        if not metadata_exists:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Job not found: {job_id}",
+            )
+
+        metadata = await UploadService._s3_get_json(
+            metadata_key,
+        )
+
+        if not isinstance(metadata, dict):
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Durable metadata not found for job: "
+                    f"{job_id}"
+                ),
+            )
+
+        filename = (
+            metadata.get("filename")
+            or metadata.get("original_filename")
+        )
+
+        if not filename:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Job metadata has no filename: "
+                    f"{job_id}"
+                ),
+            )
+
+        content_type = metadata.get(
+            "content_type",
+        )
+
+        print("=" * 80)
+        print("RECOVERING DURABLE JOB")
+        print("JOB ID   :", job_id)
+        print("FILENAME :", filename)
+        print("SOURCE   : SUPABASE")
+        print("=" * 80)
+
+        # recover_assembled_job is deliberately used here instead
+        # of assemble_chunk_upload().
+        #
+        # The former first checks for the durable FINAL FILE and
+        # downloads it when local storage is gone. This is important
+        # because successful assembly deletes the original chunks
+        # from Supabase.
+        await UploadService.recover_assembled_job(
+            job_id=job_id,
+            filename=filename,
+            content_type=content_type,
+        )
+
+        # ======================================================
+        # VERIFY RECOVERY
+        # ======================================================
+
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"Manifest was not created during recovery: "
+                f"{manifest_path}"
+            )
+
+        background_tasks.add_task(
+            _run_etl,
+            job_folder,
+        )
+
+        duration = (
+            time.perf_counter()
+            - start
+        )
+
+        print("=" * 80)
+        print("DURABLE JOB RECOVERED")
+        print("JOB ID   :", job_id)
+        print("MANIFEST :", manifest_path)
+        print("ETL      : SCHEDULED")
+        print(
+            f"DURATION : {duration:.2f}s",
+        )
+        print("=" * 80)
+
+        return {
+            "success": True,
+            "job_id": job_id,
+            "status": "ETL_QUEUED",
+            "message": (
+                "Job recovered from durable storage; "
+                "ETL scheduled"
+            ),
+        }
+
+    except HTTPException:
+        raise
+
+    except FileNotFoundError as exc:
+        # The durable metadata exists, but the assembled final file
+        # is not available yet. That means assembly is still running
+        # (or the durable upload is incomplete), not that the job ID
+        # itself is invalid.
         raise HTTPException(
             status_code=409,
             detail=(
-                f"Assembly still running or "
-                f"manifest not ready for job: "
-                f"{job_id}"
+                f"Job is not ready for ETL yet: "
+                f"{job_id}. "
+                f"{exc}"
             ),
         )
 
-    background_tasks.add_task(
-        _run_etl,
-        job_folder,
-    )
+    except Exception as exc:
+        traceback.print_exc()
 
-    duration = (
-        time.perf_counter()
-        - start
-    )
-
-    print("=" * 80)
-    print("ETL SCHEDULED")
-    print("JOB ID   :", job_id)
-    print(
-        f"DURATION : {duration:.2f}s",
-    )
-    print("=" * 80)
-
-    return {
-        "success": True,
-        "job_id": job_id,
-        "message": "ETL scheduled",
-    }
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Failed to recover/process job "
+                f"{job_id}: {exc}"
+            ),
+        )
 
 
 # ==========================================================
