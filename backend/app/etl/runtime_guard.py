@@ -31,6 +31,23 @@ def _s3_configured() -> bool:
     )
 
 
+def _s3_client(bucket: str):
+    return boto3.client(
+        "s3",
+        endpoint_url=os.getenv("S3_ENDPOINT", "").strip(),
+        region_name=os.getenv("S3_REGION", "ap-southeast-1").strip(),
+        aws_access_key_id=os.getenv("S3_ACCESS_KEY_ID", "").strip(),
+        aws_secret_access_key=os.getenv("S3_SECRET_ACCESS_KEY", "").strip(),
+        config=Config(
+            signature_version="s3v4",
+            retries={"max_attempts": 5, "mode": "adaptive"},
+            connect_timeout=30,
+            read_timeout=600,
+            s3={"addressing_style": "path"},
+        ),
+    )
+
+
 def install_runtime_guards() -> None:
     """Install the production execution contract before API routes load."""
     global _INSTALLED
@@ -63,20 +80,7 @@ def install_runtime_guards() -> None:
                 last_error: Exception | None = None
                 for attempt in range(1, S3_UPLOAD_RETRIES + 1):
                     try:
-                        client = boto3.client(
-                            "s3",
-                            endpoint_url=os.getenv("S3_ENDPOINT", "").strip(),
-                            region_name=os.getenv("S3_REGION", "ap-southeast-1").strip(),
-                            aws_access_key_id=os.getenv("S3_ACCESS_KEY_ID", "").strip(),
-                            aws_secret_access_key=os.getenv("S3_SECRET_ACCESS_KEY", "").strip(),
-                            config=Config(
-                                signature_version="s3v4",
-                                retries={"max_attempts": 5, "mode": "adaptive"},
-                                connect_timeout=30,
-                                read_timeout=600,
-                                s3={"addressing_style": "path"},
-                            ),
-                        )
+                        client = _s3_client(S3_BUCKET)
                         with local_path.open("rb") as source:
                             client.put_object(
                                 Bucket=S3_BUCKET,
@@ -120,20 +124,7 @@ def install_runtime_guards() -> None:
                 raise RuntimeError("Durable storage is not configured.")
 
             def _download() -> None:
-                client = boto3.client(
-                    "s3",
-                    endpoint_url=os.getenv("S3_ENDPOINT", "").strip(),
-                    region_name=os.getenv("S3_REGION", "ap-southeast-1").strip(),
-                    aws_access_key_id=os.getenv("S3_ACCESS_KEY_ID", "").strip(),
-                    aws_secret_access_key=os.getenv("S3_SECRET_ACCESS_KEY", "").strip(),
-                    config=Config(
-                        signature_version="s3v4",
-                        retries={"max_attempts": 5, "mode": "adaptive"},
-                        connect_timeout=30,
-                        read_timeout=600,
-                        s3={"addressing_style": "path"},
-                    ),
-                )
+                client = _s3_client(S3_BUCKET)
                 response = client.get_object(Bucket=S3_BUCKET, Key=s3_key)
                 body = response["Body"]
                 temporary = local_path.with_suffix(local_path.suffix + ".download")
@@ -205,22 +196,13 @@ def install_runtime_guards() -> None:
     # ----------------------------------------------------------
     # DLPD query hardening
     # ----------------------------------------------------------
-    # The repository already owns month semantics; this guard only adds the
-    # tariff predicate that the domain filter object exposes but the legacy SQL
-    # builder omitted. It keeps all DLPD surfaces (KPI/ULP/list/map/export)
-    # consistent without duplicating the repository implementation.
     from app.infrastructure.duckdb.dlpd_repository import DuckDbDlpdRepository
 
     if not getattr(DuckDbDlpdRepository, "_pln_filter_hardened", False):
         original_build_where = DuckDbDlpdRepository._build_where
 
         def _hardened_build_where(self, customer_type, month_key, filters):
-            sql, params = original_build_where(
-                self,
-                customer_type,
-                month_key,
-                filters,
-            )
+            sql, params = original_build_where(self, customer_type, month_key, filters)
             tariff = str(getattr(filters, "tariff", "") or "").strip()
             if tariff:
                 clause = "TRIM(CAST(d.TARIF AS VARCHAR)) = ?"
@@ -233,6 +215,66 @@ def install_runtime_guards() -> None:
 
         DuckDbDlpdRepository._build_where = _hardened_build_where
         DuckDbDlpdRepository._pln_filter_hardened = True
+
+    # ----------------------------------------------------------
+    # Durable ETL checkpoints
+    # ----------------------------------------------------------
+    if not getattr(ETLOrchestrator, "_pln_durable_checkpoint", False):
+        original_save_checkpoint = ETLOrchestrator._save_checkpoint.__func__
+        original_load_checkpoint = ETLOrchestrator._load_checkpoint.__func__
+
+        def _save_checkpoint(cls, job_folder: Path, checkpoint: dict) -> None:
+            original_save_checkpoint(cls, job_folder, checkpoint)
+            if not _s3_configured():
+                return
+            job_id = str(checkpoint.get("job_id") or job_folder.name).strip()
+            if not job_id:
+                return
+            try:
+                client = _s3_client(S3_BUCKET)
+                body = json.dumps(checkpoint, indent=2, default=str).encode("utf-8")
+                client.put_object(
+                    Bucket=S3_BUCKET,
+                    Key=f"jobs/{job_id}/etl_checkpoint.json",
+                    Body=body,
+                    ContentLength=len(body),
+                    ContentType="application/json",
+                )
+            except Exception:
+                # Checkpoint durability is an optimization; the ETL result
+                # remains authoritative. Never fail an otherwise healthy ETL
+                # solely because checkpoint telemetry could not be uploaded.
+                logger.exception("DURABLE ETL CHECKPOINT WRITE FAILED | JOB=%s", job_id)
+
+        def _load_checkpoint(cls, job_folder: Path, job_id: str | None) -> dict:
+            local = original_load_checkpoint(cls, job_folder, job_id)
+            if local.get("phase1_completed") or local.get("phase2_completed") or local.get("warehouse_refreshed"):
+                return local
+            if not job_id or not _s3_configured():
+                return local
+
+            try:
+                client = _s3_client(S3_BUCKET)
+                response = client.get_object(
+                    Bucket=S3_BUCKET,
+                    Key=f"jobs/{job_id}/etl_checkpoint.json",
+                )
+                durable = json.loads(response["Body"].read().decode("utf-8"))
+                response["Body"].close()
+                if not isinstance(durable, dict) or durable.get("job_id") != job_id:
+                    return local
+                job_folder.mkdir(parents=True, exist_ok=True)
+                original_save_checkpoint(cls, job_folder, durable)
+                logger.info("DURABLE ETL CHECKPOINT RESTORED | JOB=%s", job_id)
+                return durable
+            except Exception as exc:
+                # A missing checkpoint is normal for a first attempt.
+                logger.info("No durable ETL checkpoint restored | JOB=%s | %s", job_id, exc)
+                return local
+
+        ETLOrchestrator._save_checkpoint = classmethod(_save_checkpoint)
+        ETLOrchestrator._load_checkpoint = classmethod(_load_checkpoint)
+        ETLOrchestrator._pln_durable_checkpoint = True
 
     # ----------------------------------------------------------
     # Serialized ETL
@@ -254,5 +296,5 @@ def install_runtime_guards() -> None:
 
     _INSTALLED = True
     logger.info(
-        "Production runtime guards installed: durable uploads + streaming S3 + serialized ETL"
+        "Production runtime guards installed: durable uploads + checkpoints + streaming S3 + serialized ETL"
     )
