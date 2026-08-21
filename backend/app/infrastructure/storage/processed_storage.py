@@ -6,7 +6,7 @@ from pathlib import Path
 
 import boto3
 
-from app.core.constants import PROCESSED
+from app.core.constants import PROCESSED, WAREHOUSE
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +35,7 @@ def _key(path: Path) -> str:
 
 
 def hydrate_processed_data() -> int:
-    """Restore durable processed parquet/metadata into the local cache."""
+    """Restore durable processed data into the local cloud-instance cache."""
     client = _client()
     if client is None:
         logger.warning("Processed storage is not configured; using local data only.")
@@ -64,7 +64,7 @@ def hydrate_processed_data() -> int:
 
 
 def persist_processed_data() -> int:
-    """Persist processed parquet/metadata so cloud instances can be replaced safely."""
+    """Persist the warehouse, parquet, and metadata after successful ETL."""
     client = _client()
     if client is None:
         logger.warning("Processed storage is not configured; processed data remains local.")
@@ -72,14 +72,18 @@ def persist_processed_data() -> int:
 
     uploaded = 0
     try:
-        for path in PROCESSED.rglob("*"):
-            if not path.is_file() or path.name == "warehouse.duckdb":
-                continue
+        candidates = [path for path in PROCESSED.rglob("*") if path.is_file()]
+        if WAREHOUSE.exists() and WAREHOUSE not in candidates:
+            candidates.append(WAREHOUSE)
+
+        for path in candidates:
             content_type = "application/octet-stream"
             if path.suffix.lower() == ".parquet":
                 content_type = "application/vnd.apache.parquet"
             elif path.suffix.lower() == ".json":
                 content_type = "application/json"
+            elif path.suffix.lower() == ".duckdb":
+                content_type = "application/vnd.duckdb"
             client.upload_file(
                 str(path),
                 S3_BUCKET,
