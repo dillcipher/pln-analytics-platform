@@ -36,107 +36,77 @@ _oauth2_scheme = OAuth2PasswordBearer(
 
 @lru_cache
 def get_user_store() -> UserStore:
-
     settings = get_settings()
+    return UserStore(settings.USERS_FILE)
 
-    return UserStore(
-        settings.USERS_FILE,
+
+def _unauthorized(detail: str = "Authentication required") -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail=detail,
+        headers={"WWW-Authenticate": "Bearer"},
     )
 
 
 def get_current_user(
     token: str | None = Depends(_oauth2_scheme),
 ) -> AuthenticatedUser:
-
     settings = get_settings()
 
-    # ==========================================================
-    # DEVELOPMENT
-    # ==========================================================
-
+    # Development mode keeps the existing local/developer bypass.
     if settings.DEBUG:
-    
         return AuthenticatedUser(
-        username="developer",
-        full_name="Developer",
-        role="admin",
-        unitupi_scope=None,
-    )
+            username="developer",
+            full_name="Developer",
+            role="admin",
+            unitupi_scope=None,
+        )
 
-    # ==========================================================
-    # PRODUCTION
-    # ==========================================================
+    # Production must never pass None into the JWT decoder. Previously a
+    # missing Authorization header reached decode_access_token(None, ...),
+    # which caused AttributeError/HTTP 500 instead of a normal 401 response.
+    if not token:
+        raise _unauthorized()
 
     try:
-
         payload = decode_access_token(
             token,
             settings.JWT_SECRET_KEY,
         )
-
-    except TokenError as exc:
-
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired credentials",
-            headers={
-                "WWW-Authenticate": "Bearer",
-            },
-        ) from exc
+    except (TokenError, TypeError, ValueError, AttributeError) as exc:
+        raise _unauthorized("Invalid or expired credentials") from exc
 
     user = get_user_store().get(
-        payload.get(
-            "sub",
-            "",
-        ),
+        payload.get("sub", ""),
     )
 
     if user is None:
-
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User no longer exists",
-            headers={
-                "WWW-Authenticate": "Bearer",
-            },
-        )
+        raise _unauthorized("User no longer exists")
 
     return user
 
 
 def require_admin(
-    user: AuthenticatedUser = Depends(
-        get_current_user,
-    ),
-) -> AuthenticatedUser:
-
+    user: AuthenticatedUser = Depends(get_current_user),
+):
     if user.role != "admin":
-
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin role required",
+            detail="Administrator access required",
         )
-
     return user
-
-
-# ==========================================================
-# Repository Providers
-# ==========================================================
-
-@lru_cache
-def get_executive_repository() -> DuckDbExecutiveRepository:
-
-    return DuckDbExecutiveRepository()
 
 
 @lru_cache
 def get_dlpd_repository() -> DuckDbDlpdRepository:
-
     return DuckDbDlpdRepository()
 
 
 @lru_cache
-def get_suspect_repository() -> DuckDbSuspectRepository:
+def get_executive_repository() -> DuckDbExecutiveRepository:
+    return DuckDbExecutiveRepository()
 
+
+@lru_cache
+def get_suspect_repository() -> DuckDbSuspectRepository:
     return DuckDbSuspectRepository()
