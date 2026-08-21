@@ -4,11 +4,7 @@ from app.infrastructure.duckdb.dlpd_repository import DuckDbDlpdRepository
 
 def test_all_months_does_not_add_month_predicate():
     repo = DuckDbDlpdRepository.__new__(DuckDbDlpdRepository)
-    sql, params = repo._build_where(
-        "pascabayar",
-        None,
-        DlpdFilters(),
-    )
+    sql, params = repo._build_where("pascabayar", None, DlpdFilters())
     assert sql == ""
     assert params == []
 
@@ -33,8 +29,9 @@ def test_concrete_month_repeat_uses_six_month_window():
         DlpdFilters(dlpd_repeat="4"),
     )
     assert "IN (?, ?, ?, ?, ?, ?)" in sql
+    assert params[0] == "202606"
     assert params[-1] == 4
-    assert params[:6] == [
+    assert params[1:7] == [
         "202601",
         "202602",
         "202603",
@@ -52,8 +49,6 @@ def test_month_normalization_accepts_ui_sentinels():
 
 
 def repo_month(value: str | None) -> str | None:
-    # Import the private helper intentionally: it is the SQL boundary contract
-    # shared by dashboard, ULP, customer list, map and export.
     from app.infrastructure.duckdb.dlpd_repository import _normalize_month_key
 
     return _normalize_month_key(value)
