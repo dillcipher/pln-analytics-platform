@@ -75,7 +75,7 @@ def _table_exists_on_connection(
 def _warehouse_needs_refresh(
     conn: duckdb.DuckDBPyConnection,
 ) -> bool:
-    """Detect missing catalog tables whose durable parquet already exists."""
+    """Detect durable parquet that is not yet registered in DuckDB."""
     datasets = {
         "fact_anev": PARQUET / "anev" / "*.parquet",
         "fact_dlpd_pascabayar": PARQUET / "dlpd" / "dlpd_pascabayar*.parquet",
@@ -86,12 +86,11 @@ def _warehouse_needs_refresh(
 
     for table_name, pattern in datasets.items():
         try:
-            if not any(pattern.parent.glob(pattern.name)):
-                continue
+            has_parquet = any(pattern.parent.glob(pattern.name))
         except Exception:
-            continue
+            has_parquet = False
 
-        if not _table_exists_on_connection(conn, table_name):
+        if has_parquet and not _table_exists_on_connection(conn, table_name):
             logger.warning(
                 "Durable parquet exists for %s but the DuckDB table is missing.",
                 table_name,
@@ -133,7 +132,12 @@ def get_connection() -> duckdb.DuckDBPyConnection:
     conn = _get_thread_connection()
 
     if _is_connection_alive(conn):
-        return conn  # type: ignore[return-value]
+        # A worker can stay alive across an ETL run. In that case its
+        # read-only connection may have been opened before new parquet was
+        # persisted. Re-check the catalog even for an existing connection.
+        conn = _ensure_warehouse_tables(conn)  # type: ignore[arg-type]
+        _set_thread_connection(conn)
+        return conn
 
     if conn is not None:
         try:
