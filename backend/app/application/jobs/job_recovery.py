@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 
 from app.application.etl.etl_orchestrator import ETLOrchestrator
@@ -11,6 +12,11 @@ from app.services.upload_service import UploadService
 
 logger = logging.getLogger(__name__)
 _RUNNING_JOB_IDS: set[str] = set()
+
+# ETL retries operate on the already assembled durable workbook. No chunks
+# are uploaded again and no new upload job is created.
+ETL_MAX_RETRIES = max(1, int(os.getenv("ETL_MAX_RETRIES", "3")))
+ETL_RETRY_DELAY_SECONDS = max(1, int(os.getenv("ETL_RETRY_DELAY_SECONDS", "5")))
 
 
 def _read_json(path: Path) -> dict | None:
@@ -24,8 +30,8 @@ def _read_json(path: Path) -> dict | None:
         return None
 
 
-def _run_etl(job_folder: Path) -> None:
-    ETLOrchestrator.process(job_folder)
+def _run_etl(job_folder: Path) -> dict | None:
+    return ETLOrchestrator.process(job_folder)
 
 
 async def _restore_manifest(job_id: str, job_folder: Path) -> Path | None:
@@ -54,6 +60,64 @@ async def _restore_final_file(job_id: str, job_folder: Path, filename: str) -> P
 
     await UploadService._s3_download_file(final_key, destination)
     return destination if destination.exists() and destination.stat().st_size > 0 else None
+
+
+async def _run_etl_with_retry(job_id: str, job_folder: Path) -> None:
+    """Retry ETL in-place using the durable assembled files and checkpoint."""
+    for attempt in range(1, ETL_MAX_RETRIES + 1):
+        logger.info(
+            "ETL RETRY | JOB=%s | ATTEMPT=%s/%s | NO REUPLOAD",
+            job_id,
+            attempt,
+            ETL_MAX_RETRIES,
+        )
+
+        try:
+            result = await asyncio.to_thread(_run_etl, job_folder)
+        except Exception as exc:
+            result = {
+                "success": False,
+                "error": str(exc),
+            }
+            logger.exception(
+                "ETL ATTEMPT CRASHED | JOB=%s | ATTEMPT=%s/%s",
+                job_id,
+                attempt,
+                ETL_MAX_RETRIES,
+            )
+
+        if isinstance(result, dict) and result.get("success"):
+            logger.info(
+                "ETL RETRY SUCCEEDED | JOB=%s | ATTEMPT=%s/%s",
+                job_id,
+                attempt,
+                ETL_MAX_RETRIES,
+            )
+            return
+
+        error = (
+            result.get("error")
+            if isinstance(result, dict)
+            else "ETL returned no success result"
+        )
+
+        if attempt < ETL_MAX_RETRIES:
+            logger.warning(
+                "ETL ATTEMPT FAILED | JOB=%s | ATTEMPT=%s/%s | RETRYING IN %ss | ERROR=%s",
+                job_id,
+                attempt,
+                ETL_MAX_RETRIES,
+                ETL_RETRY_DELAY_SECONDS,
+                error,
+            )
+            await asyncio.sleep(ETL_RETRY_DELAY_SECONDS)
+        else:
+            logger.error(
+                "ETL EXHAUSTED RETRIES | JOB=%s | ATTEMPTS=%s | ERROR=%s",
+                job_id,
+                ETL_MAX_RETRIES,
+                error,
+            )
 
 
 async def _recover_and_run(job_id: str) -> None:
@@ -88,7 +152,7 @@ async def _recover_and_run(job_id: str) -> None:
             if manifest is None:
                 return
 
-        await asyncio.to_thread(_run_etl, job_folder)
+        await _run_etl_with_retry(job_id, job_folder)
     except Exception:
         logger.exception("Durable job recovery failed for %s", job_id)
     finally:
