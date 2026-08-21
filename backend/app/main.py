@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.application.etl.startup_recovery import recover_pending_jobs
 from app.core.config import get_settings
 from app.core.logging_config import configure_logging
 from app.database.warehouse import Warehouse
@@ -76,10 +78,13 @@ async def on_startup():
     except Exception:
         logger.exception("Startup warehouse refresh failed; continuing startup.")
 
-    # Do not automatically replay every historical job on startup. The
-    # runtime guard serializes ETL, while explicit recovery remains available
-    # through the job-processing endpoint. This keeps deployment startup cheap.
-    logger.info("Startup ETL recovery remains disabled; ETL memory gate is active.")
+    # Durable processed artifacts are hydrated before the initial warehouse
+    # refresh. Any upload that was interrupted after reaching durable storage
+    # is then recovered in the background and sent through the exact same ETL
+    # path used by a fresh upload. The runtime guard serializes the heavy work
+    # so recovery cannot start several large Excel jobs concurrently.
+    logger.info("Scheduling startup recovery of unfinished durable uploads.")
+    asyncio.create_task(_startup_recovery_task())
 
     if not settings.DATA_PROCESSED_DIR.exists():
         logger.warning(
@@ -88,3 +93,12 @@ async def on_startup():
         )
 
     logger.info("=" * 80)
+
+
+async def _startup_recovery_task() -> None:
+    try:
+        result = await recover_pending_jobs()
+        logger.info("Startup ETL recovery result: %s", result)
+    except Exception:
+        # Recovery must never prevent the API from becoming available.
+        logger.exception("Startup ETL recovery task failed.")
