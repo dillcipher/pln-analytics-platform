@@ -10,7 +10,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import get_settings
 from app.core.logging_config import configure_logging
 from app.database.warehouse import Warehouse
+from app.etl.detector.streaming_month_resolver_patch import (
+    install_streaming_month_resolver_patch,
+)
 from app.infrastructure.storage.processed_storage import hydrate_processed_data
+
+# Install before the API router imports ETL modules. The patch only replaces
+# DLPD month scanning; all existing month business rules remain unchanged.
+install_streaming_month_resolver_patch()
+
 from app.interface.api.v1.router import api_v1_router
 
 settings = get_settings()
