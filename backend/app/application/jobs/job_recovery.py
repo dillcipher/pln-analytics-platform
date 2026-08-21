@@ -75,10 +75,7 @@ async def _run_etl_with_retry(job_id: str, job_folder: Path) -> None:
         try:
             result = await asyncio.to_thread(_run_etl, job_folder)
         except Exception as exc:
-            result = {
-                "success": False,
-                "error": str(exc),
-            }
+            result = {"success": False, "error": str(exc)}
             logger.exception(
                 "ETL ATTEMPT CRASHED | JOB=%s | ATTEMPT=%s/%s",
                 job_id,
@@ -95,28 +92,17 @@ async def _run_etl_with_retry(job_id: str, job_folder: Path) -> None:
             )
             return
 
-        error = (
-            result.get("error")
-            if isinstance(result, dict)
-            else "ETL returned no success result"
-        )
-
+        error = result.get("error") if isinstance(result, dict) else "ETL returned no success result"
         if attempt < ETL_MAX_RETRIES:
             logger.warning(
                 "ETL ATTEMPT FAILED | JOB=%s | ATTEMPT=%s/%s | RETRYING IN %ss | ERROR=%s",
-                job_id,
-                attempt,
-                ETL_MAX_RETRIES,
-                ETL_RETRY_DELAY_SECONDS,
-                error,
+                job_id, attempt, ETL_MAX_RETRIES, ETL_RETRY_DELAY_SECONDS, error,
             )
             await asyncio.sleep(ETL_RETRY_DELAY_SECONDS)
         else:
             logger.error(
                 "ETL EXHAUSTED RETRIES | JOB=%s | ATTEMPTS=%s | ERROR=%s",
-                job_id,
-                ETL_MAX_RETRIES,
-                error,
+                job_id, ETL_MAX_RETRIES, error,
             )
 
 
@@ -125,31 +111,30 @@ async def _recover_and_run(job_id: str) -> None:
         job_folder = RAW_UPLOAD / job_id
         manifest = await _restore_manifest(job_id, job_folder)
 
-        # IMPORTANT: /jobs is polled immediately after /complete. During
-        # that window the original instance may still be assembling the
-        # workbook. Never run ETL from job metadata or live chunks before
-        # the assembly has produced its durable manifest/final file.
         if manifest is None:
             metadata_key = UploadService._job_metadata_s3_key(job_id)
             if not await UploadService._s3_head(metadata_key):
                 return
-
             metadata = await UploadService._s3_get_json(metadata_key)
             if not isinstance(metadata, dict):
                 return
-
             filename = metadata.get("filename") or metadata.get("original_filename")
             if not filename:
                 return
-
             final_file = await _restore_final_file(job_id, job_folder, filename)
             if final_file is None:
-                # Assembly is still in progress. Let the original assembly
-                # task finish; a later poll can retry recovery safely.
                 return
-
             manifest = await _restore_manifest(job_id, job_folder)
             if manifest is None:
+                return
+
+        data = _read_json(manifest)
+        status = str((data or {}).get("status", "")).upper()
+        if status in {"FINISHED", "ASSEMBLY_QUEUED", "ASSEMBLING", "UPLOADING"}:
+            # A live assembly/ETL caller may own this job. Only recover
+            # explicitly failed jobs here; the normal /jobs poll handles
+            # newly completed assembly.
+            if status != "FAILED":
                 return
 
         await _run_etl_with_retry(job_id, job_folder)
@@ -164,7 +149,6 @@ def ensure_job_processing(job_id: str) -> None:
     job_id = job_id.strip()
     if not job_id or job_id in _RUNNING_JOB_IDS:
         return
-
     _RUNNING_JOB_IDS.add(job_id)
     task = asyncio.create_task(_recover_and_run(job_id))
 
@@ -177,3 +161,38 @@ def ensure_job_processing(job_id: str) -> None:
             logger.exception("Unexpected durable job task failure for %s", job_id)
 
     task.add_done_callback(_done)
+
+
+async def recover_failed_jobs_on_startup() -> None:
+    """Discover FAILED durable jobs in Supabase and resume them automatically."""
+    try:
+        client = UploadService._create_s3_client()
+        bucket = UploadService.S3_BUCKET
+        response = await asyncio.to_thread(
+            client.list_objects_v2,
+            Bucket=bucket,
+            Prefix="jobs/",
+        )
+        recovered = 0
+        for item in response.get("Contents", []):
+            key = str(item.get("Key", ""))
+            if not key.endswith("/job.json"):
+                continue
+            job_id = key[len("jobs/"):-len("/job.json")]
+            if not job_id:
+                continue
+            try:
+                data = await UploadService._s3_get_json(key)
+                status = str((data or {}).get("status", "")).upper()
+                if status == "FAILED":
+                    logger.warning(
+                        "STARTUP JOB RECOVERY | JOB=%s | STATUS=FAILED | AUTO RETRY",
+                        job_id,
+                    )
+                    ensure_job_processing(job_id)
+                    recovered += 1
+            except Exception:
+                logger.exception("Could not inspect durable job %s", job_id)
+        logger.info("STARTUP JOB RECOVERY SCAN COMPLETED | RECOVERED=%s", recovered)
+    except Exception:
+        logger.exception("Startup durable job recovery scan failed")
