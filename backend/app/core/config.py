@@ -53,10 +53,17 @@ class Settings:
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "production")
     DEBUG: bool = _env_bool("DEBUG", False)
 
-    # The current deployed frontend has no login screen/token flow. Keep API
-    # authentication opt-in so public dashboard deployments do not return 401
-    # for every data request. Set AUTH_REQUIRED=true when a login flow is ready.
-    AUTH_REQUIRED: bool = _env_bool("AUTH_REQUIRED", False)
+    # The deployed frontend currently has no login screen/token flow.
+    # Authentication therefore remains OFF unless it is deliberately enabled
+    # with BOTH flags. The second gate prevents a stale AUTH_REQUIRED=true
+    # environment variable from breaking the public dashboard with 401/500s.
+    # When a real login flow is ready, set:
+    #   AUTH_ENABLED=true
+    #   AUTH_REQUIRED=true
+    AUTH_REQUIRED: bool = (
+        _env_bool("AUTH_ENABLED", False)
+        and _env_bool("AUTH_REQUIRED", False)
+    )
 
     CORS_ORIGINS: list[str] = _env_list(
         "CORS_ORIGINS",
