@@ -54,58 +54,62 @@ def _open_connection() -> duckdb.DuckDBPyConnection:
         return duckdb.connect(str(WAREHOUSE))
 
 
-def _has_registered_fact_tables(
+def _table_exists_on_connection(
     conn: duckdb.DuckDBPyConnection,
+    table_name: str,
 ) -> bool:
-    """Return whether the warehouse has at least one application fact table."""
     try:
         row = conn.execute(
             """
             SELECT COUNT(*)
             FROM information_schema.tables
-            WHERE table_name IN (
-                'fact_anev',
-                'fact_dlpd_prabayar',
-                'fact_dlpd_pascabayar',
-                'fact_pengecekan',
-                'fact_customer_location'
-            )
-            """
+            WHERE table_name = ?
+            """,
+            [table_name],
         ).fetchone()
         return bool(row and row[0])
     except Exception:
         return False
 
 
-def _processed_parquet_exists() -> bool:
-    """Check whether durable processed parquet exists before rebuilding."""
-    try:
-        if not PARQUET.exists():
-            return False
-        return any(PARQUET.rglob("*.parquet"))
-    except Exception:
-        return False
+def _warehouse_needs_refresh(
+    conn: duckdb.DuckDBPyConnection,
+) -> bool:
+    """Detect missing catalog tables whose durable parquet already exists."""
+    datasets = {
+        "fact_anev": PARQUET / "anev" / "*.parquet",
+        "fact_dlpd_pascabayar": PARQUET / "dlpd" / "dlpd_pascabayar*.parquet",
+        "fact_dlpd_prabayar": PARQUET / "dlpd" / "dlpd_prabayar*.parquet",
+        "fact_pengecekan": PARQUET / "pengecekan" / "*.parquet",
+        "fact_customer_location": PARQUET / "customer_location" / "*.parquet",
+    }
+
+    for table_name, pattern in datasets.items():
+        try:
+            if not any(pattern.parent.glob(pattern.name)):
+                continue
+        except Exception:
+            continue
+
+        if not _table_exists_on_connection(conn, table_name):
+            logger.warning(
+                "Durable parquet exists for %s but the DuckDB table is missing.",
+                table_name,
+            )
+            return True
+
+    return False
 
 
 def _ensure_warehouse_tables(
     conn: duckdb.DuckDBPyConnection,
 ) -> duckdb.DuckDBPyConnection:
-    """Self-heal a fresh cloud instance whose DuckDB tables are missing.
-
-    FastAPI Cloud instances are disposable. Processed parquet files are
-    durable, while the local DuckDB catalog can be absent/stale. If an API
-    worker opens such a warehouse before startup hydration/refresh has taken
-    effect, rebuild the catalog once and reopen the read connection.
-    """
-    if _has_registered_fact_tables(conn):
-        return conn
-
-    if not _processed_parquet_exists():
+    """Self-heal a cloud instance when durable parquet is not registered."""
+    if not _warehouse_needs_refresh(conn):
         return conn
 
     logger.warning(
-        "Warehouse has no registered fact tables although processed parquet "
-        "exists; rebuilding DuckDB catalog before serving the request."
+        "Warehouse catalog is stale/missing; rebuilding from durable parquet."
     )
 
     try:
@@ -114,15 +118,15 @@ def _ensure_warehouse_tables(
         pass
 
     try:
-        # Import lazily to avoid an import cycle during application startup.
+        # Lazy import avoids the connection -> warehouse -> connection cycle.
         from app.database.warehouse import Warehouse
 
         Warehouse.refresh_tables()
         logger.info("On-demand warehouse refresh completed.")
-        return _open_connection()
     except Exception:
         logger.exception("On-demand warehouse refresh failed.")
-        return _open_connection()
+
+    return _open_connection()
 
 
 def get_connection() -> duckdb.DuckDBPyConnection:
