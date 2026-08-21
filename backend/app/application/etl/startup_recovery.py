@@ -7,6 +7,7 @@ import os
 from typing import Any
 
 import boto3
+from botocore.client import Config
 
 from app.application.etl.etl_orchestrator import ETLOrchestrator
 from app.core.constants import RAW_UPLOAD
@@ -21,9 +22,6 @@ S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY", "").strip()
 S3_BUCKET = os.getenv("S3_BUCKET", "pln-analytics-uploads").strip()
 S3_JOB_PREFIX = "jobs"
 
-# A job is terminal only when it is FINISHED. FAILED is deliberately included
-# so a transient ETL crash can recover after the next deployment. Failed jobs
-# are capped so a permanently bad source cannot create an infinite startup loop.
 RECOVERABLE_STATUSES = {
     "UPLOADED",
     "DETECTING",
@@ -40,9 +38,6 @@ MAX_FAILED_RECOVERY_ATTEMPTS = max(
     int(os.getenv("MAX_FAILED_RECOVERY_ATTEMPTS", "3")),
 )
 
-# Only one recovery worker is allowed in a process. This prevents startup
-# recovery from competing with a user-triggered /process call for the same
-# machine's memory and DuckDB file.
 _RECOVERY_LOCK = asyncio.Lock()
 
 
@@ -55,6 +50,13 @@ def _client():
         region_name=S3_REGION,
         aws_access_key_id=S3_ACCESS_KEY_ID,
         aws_secret_access_key=S3_SECRET_ACCESS_KEY,
+        config=Config(
+            signature_version="s3v4",
+            retries={"max_attempts": 5, "mode": "adaptive"},
+            connect_timeout=30,
+            read_timeout=600,
+            s3={"addressing_style": "path"},
+        ),
     )
 
 
@@ -70,29 +72,21 @@ def _load_pending_jobs() -> list[dict[str, Any]]:
 
     try:
         paginator = client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(
-            Bucket=S3_BUCKET,
-            Prefix=f"{S3_JOB_PREFIX}/",
-        ):
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=f"{S3_JOB_PREFIX}/"):
             for item in page.get("Contents", []):
                 key = str(item.get("Key") or "")
                 if not key.startswith(f"{S3_JOB_PREFIX}/") or not key.endswith("/job.json"):
                     continue
-
                 parts = key.split("/")
                 if len(parts) != 3:
                     continue
-
                 job_id = parts[1]
                 if not job_id or job_id in seen:
                     continue
                 seen.add(job_id)
 
                 try:
-                    response = client.get_object(
-                        Bucket=S3_BUCKET,
-                        Key=key,
-                    )
+                    response = client.get_object(Bucket=S3_BUCKET, Key=key)
                     body = response["Body"]
                     try:
                         metadata = json.loads(body.read().decode("utf-8"))
@@ -117,17 +111,12 @@ def _load_pending_jobs() -> list[dict[str, Any]]:
         return []
 
     jobs.sort(
-        key=lambda item: str(
-            item.get("uploaded_at")
-            or item.get("created_at")
-            or ""
-        )
+        key=lambda item: str(item.get("uploaded_at") or item.get("created_at") or "")
     )
     return jobs
 
 
 def _extract_file_metadata(metadata: dict[str, Any]) -> dict[str, Any] | None:
-    """Normalize legacy manifest metadata and current chunk-upload metadata."""
     files = metadata.get("files")
     if isinstance(files, list) and files and isinstance(files[0], dict):
         return files[0]
@@ -146,23 +135,18 @@ def _extract_file_metadata(metadata: dict[str, Any]) -> dict[str, Any] | None:
 
 
 async def _mark_recovery_attempt(metadata: dict[str, Any], job_id: str) -> int:
-    """Increment the durable retry counter before attempting recovery."""
     attempts = int(metadata.get("recovery_attempts") or 0) + 1
     metadata["recovery_attempts"] = attempts
-
     try:
         await UploadService._s3_put_json(
             UploadService._job_metadata_s3_key(job_id),
             metadata,
         )
     except Exception:
-        # The recovery itself may still succeed. Do not turn an observability
-        # write failure into a data-processing failure.
         logger.exception(
             "STARTUP RECOVERY: could not persist retry counter | job=%s",
             job_id,
         )
-
     return attempts
 
 
@@ -210,10 +194,6 @@ async def _recover_one(metadata: dict[str, Any]) -> bool:
             status,
         )
 
-        # recover_assembled_job is the canonical recovery path. It first uses
-        # a locally cached final workbook, then downloads the durable final
-        # workbook from Supabase. If no final object exists but old chunk
-        # metadata is still available, fall back to chunk assembly.
         try:
             result = await UploadService.recover_assembled_job(
                 job_id=job_id,
@@ -240,20 +220,12 @@ async def _recover_one(metadata: dict[str, Any]) -> bool:
             )
 
         if not isinstance(result, dict) or not result.get("success", True):
-            raise RuntimeError(
-                f"Durable recovery returned unsuccessful result: {result}"
-            )
+            raise RuntimeError(f"Durable recovery returned unsuccessful result: {result}")
 
         if not manifest_path.exists():
-            raise FileNotFoundError(
-                f"Recovered manifest not found: {manifest_path}"
-            )
+            raise FileNotFoundError(f"Recovered manifest not found: {manifest_path}")
 
-        etl_result = await asyncio.to_thread(
-            ETLOrchestrator.process,
-            job_folder,
-        )
-
+        etl_result = await asyncio.to_thread(ETLOrchestrator.process, job_folder)
         if not isinstance(etl_result, dict) or not etl_result.get("success"):
             raise RuntimeError(f"Recovered ETL failed: {etl_result}")
 
@@ -266,7 +238,7 @@ async def _recover_one(metadata: dict[str, Any]) -> bool:
 
 
 async def recover_pending_jobs() -> dict[str, int]:
-    """Recover unfinished durable jobs without blocking API startup."""
+    """Recover unfinished durable jobs without blocking API availability."""
     async with _RECOVERY_LOCK:
         jobs = await asyncio.to_thread(_load_pending_jobs)
         if not jobs:
@@ -280,7 +252,6 @@ async def recover_pending_jobs() -> dict[str, int]:
 
         recovered = 0
         failed = 0
-
         for metadata in jobs:
             if await _recover_one(metadata):
                 recovered += 1
