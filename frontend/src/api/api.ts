@@ -4,7 +4,15 @@ function normalizeBaseUrl(url: string): string {
     return url.trim().replace(/\/+$/, "");
 }
 
-const explicitApiUrl = normalizeBaseUrl(
+function normalizeProductionApiUrl(url: string): string {
+    const normalized = normalizeBaseUrl(url);
+    if (!normalized) return "";
+    return normalized.endsWith("/api/v1")
+        ? normalized
+        : `${normalized}/api/v1`;
+}
+
+const explicitApiUrl = normalizeProductionApiUrl(
     typeof import.meta.env.VITE_API_URL === "string"
         ? import.meta.env.VITE_API_URL
         : "",
@@ -16,17 +24,13 @@ const backendUrl = normalizeBaseUrl(
         : "http://127.0.0.1:8000",
 );
 
-/**
- * Production MUST provide VITE_API_URL, e.g.
- * https://<fastapi-cloud-backend>/api/v1
- *
- * Local development uses the Vite /api proxy.
- */
-const API_BASE_URL = explicitApiUrl || (
-    import.meta.env.DEV
-        ? `${backendUrl}/api/v1`
-        : "/api/v1"
-);
+if (!import.meta.env.DEV && !explicitApiUrl) {
+    throw new Error(
+        "Production API is not configured. Set VITE_API_URL to the deployed FastAPI URL."
+    );
+}
+
+const API_BASE_URL = explicitApiUrl || `${backendUrl}/api/v1`;
 
 const api = axios.create({
     baseURL: API_BASE_URL,
