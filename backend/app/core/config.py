@@ -4,6 +4,8 @@ import os
 from functools import lru_cache
 from pathlib import Path
 
+from app.core.constants import PROCESSED, RAW, RAW_UPLOAD
+
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -78,17 +80,21 @@ class Settings:
         BACKEND_ROOT / "data" / "auth" / "users.json",
     )
 
+    # IMPORTANT: ETL, DuckDB and processed-artifact persistence all use the
+    # canonical paths from app.core.constants. Keeping Settings on the same
+    # paths prevents misleading startup diagnostics and split local storage
+    # between /app/data and /app/backend/data.
     DATA_PROCESSED_DIR: Path = _env_path(
         "DATA_PROCESSED_DIR",
-        BACKEND_ROOT / "data" / "processed",
+        PROCESSED,
     )
     DATA_RAW_DIR: Path = _env_path(
         "DATA_RAW_DIR",
-        BACKEND_ROOT / "data" / "raw",
+        RAW,
     )
     DATA_INCOMING_DIR: Path = _env_path(
         "DATA_INCOMING_DIR",
-        BACKEND_ROOT / "data" / "raw" / "incoming",
+        RAW_UPLOAD,
     )
     DATA_AUTH_DIR: Path = _env_path(
         "DATA_AUTH_DIR",
