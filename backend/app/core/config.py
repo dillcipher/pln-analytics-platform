@@ -27,7 +27,6 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_list(name: str, defaults: list[str]) -> list[str]:
-    """Read a comma-separated list while always preserving required origins."""
     value = os.getenv(name)
     configured = (
         [item.strip().rstrip("/") for item in value.split(",") if item.strip()]
@@ -53,15 +52,19 @@ class Settings:
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "production")
     DEBUG: bool = _env_bool("DEBUG", False)
 
-    # The deployed frontend currently has no login screen/token flow.
-    # Authentication therefore remains OFF unless it is deliberately enabled
-    # with BOTH flags. The second gate prevents a stale AUTH_REQUIRED=true
-    # environment variable from breaking the public dashboard with 401/500s.
-    # When a real login flow is ready, set:
-    #   AUTH_ENABLED=true
-    #   AUTH_REQUIRED=true
+    # ----------------------------------------------------------
+    # AUTHENTICATION
+    # ----------------------------------------------------------
+    # The deployed frontend is a public dashboard and currently has no
+    # login/token flow. Keep it public by default even when an old deployment
+    # has AUTH_REQUIRED=true or AUTH_ENABLED=true left in its environment.
+    # Authentication is enabled only when PUBLIC_DASHBOARD=false AND both
+    # AUTH_ENABLED=true and AUTH_REQUIRED=true are explicitly configured.
+    PUBLIC_DASHBOARD: bool = _env_bool("PUBLIC_DASHBOARD", True)
+    AUTH_ENABLED: bool = _env_bool("AUTH_ENABLED", False)
     AUTH_REQUIRED: bool = (
-        _env_bool("AUTH_ENABLED", False)
+        not PUBLIC_DASHBOARD
+        and AUTH_ENABLED
         and _env_bool("AUTH_REQUIRED", False)
     )
 
@@ -87,10 +90,6 @@ class Settings:
         BACKEND_ROOT / "data" / "auth" / "users.json",
     )
 
-    # IMPORTANT: ETL, DuckDB and processed-artifact persistence all use the
-    # canonical paths from app.core.constants. Keeping Settings on the same
-    # paths prevents misleading startup diagnostics and split local storage
-    # between /app/data and /app/backend/data.
     DATA_PROCESSED_DIR: Path = _env_path(
         "DATA_PROCESSED_DIR",
         PROCESSED,
