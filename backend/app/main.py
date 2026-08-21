@@ -29,9 +29,13 @@ app = FastAPI(
     openapi_url="/openapi.json",
 )
 
+# Keep the production Vercel frontend explicitly allowed and also allow
+# Vercel deployment/preview subdomains. This prevents an environment-level
+# CORS_ORIGINS override from silently breaking the live frontend.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
+    allow_origin_regex=r"https://([a-zA-Z0-9-]+\.)*vercel\.app$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
