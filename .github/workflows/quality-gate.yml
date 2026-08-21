@@ -45,4 +45,6 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
       - name: TypeScript and production build
+        env:
+          VITE_API_URL: https://ci.invalid/api/v1
         run: npm run build
