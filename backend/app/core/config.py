@@ -51,8 +51,11 @@ class Settings:
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "production")
     DEBUG: bool = _env_bool("DEBUG", False)
 
-    # The production Vercel frontend is mandatory. Environment variables may
-    # add extra origins, but must never accidentally remove the production UI.
+    # The current deployed frontend has no login screen/token flow. Keep API
+    # authentication opt-in so public dashboard deployments do not return 401
+    # for every data request. Set AUTH_REQUIRED=true when a login flow is ready.
+    AUTH_REQUIRED: bool = _env_bool("AUTH_REQUIRED", False)
+
     CORS_ORIGINS: list[str] = _env_list(
         "CORS_ORIGINS",
         [
