@@ -6,6 +6,10 @@ import logging
 import os
 from pathlib import Path
 
+import boto3
+from botocore.client import Config
+from boto3.s3.transfer import TransferConfig
+
 from app.application.etl.etl_orchestrator import ETLOrchestrator
 from app.core.constants import RAW_UPLOAD
 from app.services.upload_service import UploadService, S3_BUCKET, _create_s3_client
@@ -16,6 +20,7 @@ _RECOVERY_SEMAPHORE: asyncio.Semaphore | None = None
 
 ETL_MAX_RETRIES = max(1, int(os.getenv("ETL_MAX_RETRIES", "3")))
 ETL_RETRY_DELAY_SECONDS = max(1, int(os.getenv("ETL_RETRY_DELAY_SECONDS", "5")))
+S3_UPLOAD_RETRIES = max(1, int(os.getenv("S3_UPLOAD_RETRIES", "3")))
 
 
 def _get_recovery_semaphore() -> asyncio.Semaphore:
@@ -23,6 +28,84 @@ def _get_recovery_semaphore() -> asyncio.Semaphore:
     if _RECOVERY_SEMAPHORE is None:
         _RECOVERY_SEMAPHORE = asyncio.Semaphore(1)
     return _RECOVERY_SEMAPHORE
+
+
+def _install_stable_s3_file_upload() -> None:
+    """Use conservative S3 transfers for Supabase Storage UploadPart calls.
+
+    boto3's default multipart transfer can open several UploadPart requests at
+    once. That is unnecessarily aggressive for a small container and can fail
+    with the opaque `UploadPartOperation` error seen during recovery. Keep
+    multipart serial and avoid multipart entirely for normal Excel files.
+    """
+    if getattr(UploadService, "_pln_stable_s3_upload_installed", False):
+        return
+
+    original = UploadService._s3_put_file
+
+    async def stable_s3_put_file(cls, local_path: Path, s3_key: str) -> None:
+        size = local_path.stat().st_size
+        config = TransferConfig(
+            multipart_threshold=64 * 1024 * 1024,
+            multipart_chunksize=16 * 1024 * 1024,
+            max_concurrency=1,
+            use_threads=False,
+        )
+
+        def _upload() -> None:
+            last_error: Exception | None = None
+            for attempt in range(1, S3_UPLOAD_RETRIES + 1):
+                try:
+                    client = boto3.client(
+                        "s3",
+                        endpoint_url=os.getenv("S3_ENDPOINT", "").strip(),
+                        region_name=os.getenv("S3_REGION", "ap-southeast-1").strip(),
+                        aws_access_key_id=os.getenv("S3_ACCESS_KEY_ID", "").strip(),
+                        aws_secret_access_key=os.getenv("S3_SECRET_ACCESS_KEY", "").strip(),
+                        config=Config(
+                            signature_version="s3v4",
+                            retries={"max_attempts": 4, "mode": "adaptive"},
+                            connect_timeout=20,
+                            read_timeout=120,
+                        ),
+                    )
+                    client.upload_file(
+                        str(local_path),
+                        S3_BUCKET,
+                        s3_key,
+                        ExtraArgs={"ContentType": "application/octet-stream"},
+                        Config=config,
+                    )
+                    logger.info(
+                        "S3 FINAL FILE UPLOAD OK | FILE=%s | BYTES=%s | ATTEMPT=%s",
+                        local_path.name,
+                        size,
+                        attempt,
+                    )
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning(
+                        "S3 FINAL FILE UPLOAD RETRY | FILE=%s | BYTES=%s | ATTEMPT=%s/%s | ERROR=%r",
+                        local_path.name,
+                        size,
+                        attempt,
+                        S3_UPLOAD_RETRIES,
+                        exc,
+                    )
+                    if attempt < S3_UPLOAD_RETRIES:
+                        import time
+                        time.sleep(min(2 * attempt, 6))
+            raise last_error if last_error is not None else RuntimeError("S3 upload failed")
+
+        await asyncio.to_thread(_upload)
+
+    UploadService._s3_put_file = classmethod(stable_s3_put_file)
+    UploadService._pln_stable_s3_upload_installed = True
+    logger.info("Stable Supabase S3 file-upload transfer installed")
+
+
+_install_stable_s3_file_upload()
 
 
 def _read_json(path: Path) -> dict | None:
