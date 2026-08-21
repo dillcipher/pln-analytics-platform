@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 import boto3
+from botocore.client import Config
 
 from app.core.constants import PROCESSED, WAREHOUSE
 
@@ -27,6 +28,13 @@ def _client():
         region_name=S3_REGION,
         aws_access_key_id=S3_ACCESS_KEY_ID,
         aws_secret_access_key=S3_SECRET_ACCESS_KEY,
+        config=Config(
+            signature_version="s3v4",
+            retries={"max_attempts": 5, "mode": "adaptive"},
+            connect_timeout=30,
+            read_timeout=600,
+            s3={"addressing_style": "path"},
+        ),
     )
 
 
@@ -35,24 +43,36 @@ def _key(path: Path) -> str:
 
 
 def _download_object(client, bucket: str, key: str, destination: Path) -> None:
-    """Download without boto3's download_file/HeadObject requirement.
-
-    Some S3-compatible providers do not return ContentLength from HEAD in the
-    exact shape expected by s3transfer. download_file() then raises
-    KeyError('ContentLength') before the object body is downloaded. Using
-    get_object() streams the actual object body and works with those providers.
-    """
+    """Stream an object through GetObject instead of relying on HEAD metadata."""
     response = client.get_object(Bucket=bucket, Key=key)
     body = response["Body"]
+    temporary = destination.with_suffix(destination.suffix + ".download")
     try:
-        with destination.open("wb") as fh:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with temporary.open("wb") as fh:
             while True:
                 chunk = body.read(8 * 1024 * 1024)
                 if not chunk:
                     break
                 fh.write(chunk)
+        os.replace(temporary, destination)
     finally:
         body.close()
+        if temporary.exists():
+            temporary.unlink(missing_ok=True)
+
+
+def _upload_object(client, bucket: str, key: str, source: Path, content_type: str) -> None:
+    """Use one streaming PutObject so Supabase UploadPart is never involved."""
+    size = source.stat().st_size
+    with source.open("rb") as fh:
+        client.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=fh,
+            ContentLength=size,
+            ContentType=content_type,
+        )
 
 
 def hydrate_processed_data() -> int:
@@ -75,8 +95,6 @@ def hydrate_processed_data() -> int:
 
                 relative = key[len(f"{S3_PREFIX}/"):]
                 destination = PROCESSED / relative
-                destination.parent.mkdir(parents=True, exist_ok=True)
-
                 _download_object(client, S3_BUCKET, key, destination)
                 downloaded += 1
                 logger.info("Hydrated processed artifact: %s", relative)
@@ -88,7 +106,7 @@ def hydrate_processed_data() -> int:
 
 
 def persist_processed_data() -> int:
-    """Persist the warehouse, parquet, and metadata after successful ETL."""
+    """Persist parquet, warehouse, and metadata using durable streaming PUTs."""
     client = _client()
     if client is None:
         logger.warning("Processed storage is not configured; processed data remains local.")
@@ -109,11 +127,12 @@ def persist_processed_data() -> int:
             elif path.suffix.lower() == ".duckdb":
                 content_type = "application/vnd.duckdb"
 
-            client.upload_file(
-                str(path),
+            _upload_object(
+                client,
                 S3_BUCKET,
                 _key(path),
-                ExtraArgs={"ContentType": content_type},
+                path,
+                content_type,
             )
             uploaded += 1
 
