@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import threading
@@ -31,13 +32,7 @@ def _s3_configured() -> bool:
 
 
 def install_runtime_guards() -> None:
-    """Install the production execution contract before API routes load.
-
-    The cloud deployment has ephemeral local disk, so local files are caches.
-    Supabase Storage is the durable source of truth for uploaded files, job
-    metadata, and processed artifacts. ETL is also serialized because a second
-    large workbook must never compete for the same worker's memory.
-    """
+    """Install the production execution contract before API routes load."""
     global _INSTALLED
     if _INSTALLED:
         return
@@ -45,21 +40,13 @@ def install_runtime_guards() -> None:
     from app.application.etl.etl_orchestrator import ETLOrchestrator
     from app.services.upload_service import UploadService, S3_BUCKET
 
-    # A few legacy callers referenced UploadService.UPLOAD_FOLDER even though
-    # the canonical constant lives at module level. Keep one authoritative
-    # value and expose it on the class for backwards compatibility.
     UploadService.UPLOAD_FOLDER = RAW_UPLOAD
 
     # ----------------------------------------------------------
     # Stable S3 single-PUT upload
     # ----------------------------------------------------------
     if not getattr(UploadService, "_pln_stable_s3_upload", False):
-
-        async def _stable_s3_put_file(
-            cls,
-            local_path: Path,
-            s3_key: str,
-        ) -> None:
+        async def _stable_s3_put_file(cls, local_path: Path, s3_key: str) -> None:
             if not _s3_configured():
                 raise RuntimeError(
                     "Durable storage is not configured: S3_ENDPOINT, "
@@ -67,8 +54,7 @@ def install_runtime_guards() -> None:
                 )
 
             size = local_path.stat().st_size
-            single_put_limit = 5 * 1024 * 1024 * 1024
-            if size > single_put_limit:
+            if size > 5 * 1024 * 1024 * 1024:
                 raise ValueError(
                     f"File {local_path.name} exceeds the 5 GiB single-object upload limit."
                 )
@@ -117,10 +103,7 @@ def install_runtime_guards() -> None:
                         )
                         if attempt < S3_UPLOAD_RETRIES:
                             time.sleep(min(2 * attempt, 8))
-
-                raise last_error if last_error is not None else RuntimeError(
-                    "S3 upload failed"
-                )
+                raise last_error if last_error is not None else RuntimeError("S3 upload failed")
 
             await asyncio.to_thread(_upload)
 
@@ -131,18 +114,10 @@ def install_runtime_guards() -> None:
     # Stable S3 streaming download
     # ----------------------------------------------------------
     if not getattr(UploadService, "_pln_stable_s3_download", False):
-
-        async def _stable_s3_download_file(
-            cls,
-            s3_key: str,
-            local_path: Path,
-        ) -> None:
+        async def _stable_s3_download_file(cls, s3_key: str, local_path: Path) -> None:
             local_path.parent.mkdir(parents=True, exist_ok=True)
-
             if not _s3_configured():
-                raise RuntimeError(
-                    "Durable storage is not configured."
-                )
+                raise RuntimeError("Durable storage is not configured.")
 
             def _download() -> None:
                 client = boto3.client(
@@ -159,15 +134,9 @@ def install_runtime_guards() -> None:
                         s3={"addressing_style": "path"},
                     ),
                 )
-
-                response = client.get_object(
-                    Bucket=S3_BUCKET,
-                    Key=s3_key,
-                )
+                response = client.get_object(Bucket=S3_BUCKET, Key=s3_key)
                 body = response["Body"]
-                temporary = local_path.with_suffix(
-                    local_path.suffix + ".download"
-                )
+                temporary = local_path.with_suffix(local_path.suffix + ".download")
                 try:
                     with temporary.open("wb") as target:
                         while True:
@@ -183,9 +152,7 @@ def install_runtime_guards() -> None:
 
             await asyncio.to_thread(_download)
 
-        UploadService._s3_download_file = classmethod(
-            _stable_s3_download_file
-        )
+        UploadService._s3_download_file = classmethod(_stable_s3_download_file)
         UploadService._pln_stable_s3_download = True
 
     # ----------------------------------------------------------
@@ -196,10 +163,7 @@ def install_runtime_guards() -> None:
 
         async def _durable_save_files(cls, files):
             result = await original_save_files(cls, files)
-
             if not _s3_configured():
-                # Local development is intentionally allowed to run without
-                # object storage. Production must configure S3 credentials.
                 return result
 
             job_id = str(result.get("job_id") or "").strip()
@@ -216,19 +180,13 @@ def install_runtime_guards() -> None:
                     raise FileNotFoundError(
                         f"Uploaded file disappeared before durable persistence: {local_file}"
                     )
-
                 await cls._s3_put_file(
                     local_file,
                     cls._job_file_s3_key(job_id, filename),
                 )
 
-            # The manifest was already written by JobManager during
-            # _finalize_job. Re-persisting it here makes the ordering explicit:
-            # file object first, then the job remains durable and recoverable.
             manifest = job_folder / "manifest.json"
             if manifest.exists():
-                import json
-
                 await cls._s3_put_json(
                     cls._job_manifest_s3_key(job_id),
                     json.loads(manifest.read_text(encoding="utf-8")),
@@ -243,6 +201,38 @@ def install_runtime_guards() -> None:
 
         UploadService.save_files = classmethod(_durable_save_files)
         UploadService._pln_durable_small_upload = True
+
+    # ----------------------------------------------------------
+    # DLPD query hardening
+    # ----------------------------------------------------------
+    # The repository already owns month semantics; this guard only adds the
+    # tariff predicate that the domain filter object exposes but the legacy SQL
+    # builder omitted. It keeps all DLPD surfaces (KPI/ULP/list/map/export)
+    # consistent without duplicating the repository implementation.
+    from app.infrastructure.duckdb.dlpd_repository import DuckDbDlpdRepository
+
+    if not getattr(DuckDbDlpdRepository, "_pln_filter_hardened", False):
+        original_build_where = DuckDbDlpdRepository._build_where
+
+        def _hardened_build_where(self, customer_type, month_key, filters):
+            sql, params = original_build_where(
+                self,
+                customer_type,
+                month_key,
+                filters,
+            )
+            tariff = str(getattr(filters, "tariff", "") or "").strip()
+            if tariff:
+                clause = "TRIM(CAST(d.TARIF AS VARCHAR)) = ?"
+                if sql:
+                    sql = f"{sql}\nAND ({clause})"
+                else:
+                    sql = f"WHERE ({clause})"
+                params.append(tariff)
+            return sql, params
+
+        DuckDbDlpdRepository._build_where = _hardened_build_where
+        DuckDbDlpdRepository._pln_filter_hardened = True
 
     # ----------------------------------------------------------
     # Serialized ETL
