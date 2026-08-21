@@ -48,23 +48,29 @@ def _unauthorized(detail: str = "Authentication required") -> HTTPException:
     )
 
 
+def _developer_user() -> AuthenticatedUser:
+    return AuthenticatedUser(
+        username="developer",
+        full_name="Developer",
+        role="admin",
+        unitupi_scope=None,
+    )
+
+
 def get_current_user(
     token: str | None = Depends(_oauth2_scheme),
 ) -> AuthenticatedUser:
     settings = get_settings()
 
-    # Development mode keeps the existing local/developer bypass.
-    if settings.DEBUG:
-        return AuthenticatedUser(
-            username="developer",
-            full_name="Developer",
-            role="admin",
-            unitupi_scope=None,
-        )
+    # The deployed frontend currently has no login/token flow. Authentication
+    # is therefore opt-in through AUTH_REQUIRED=true. DEBUG remains a separate
+    # developer setting and is not used as a production auth switch.
+    if not settings.AUTH_REQUIRED:
+        return _developer_user()
 
-    # Production must never pass None into the JWT decoder. Previously a
-    # missing Authorization header reached decode_access_token(None, ...),
-    # which caused AttributeError/HTTP 500 instead of a normal 401 response.
+    if settings.DEBUG:
+        return _developer_user()
+
     if not token:
         raise _unauthorized()
 
