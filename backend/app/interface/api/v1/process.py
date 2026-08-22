@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import logging
-import time
 
 from fastapi import APIRouter, HTTPException
 
-from app.application.etl.etl_orchestrator import ETLOrchestrator
+from app.application.etl.async_job_runner import start_etl_background, is_etl_running
 from app.core.constants import RAW_UPLOAD
 from app.services.upload_service import UploadService
 
@@ -114,61 +112,53 @@ async def _ensure_job_local(job_id: str):
     )
 
 
-@router.post("/{job_id}")
+@router.post("/{job_id}", status_code=202)
 async def process_job(job_id: str):
+    """Queue ETL and return immediately.
+
+    Never execute the long-running ETL inside the HTTP request. Cloudflare and
+    the hosting proxy must only wait for durable file recovery and task enqueue.
+    """
     job_id = str(job_id or "").strip()
     if not job_id:
         raise HTTPException(status_code=400, detail="job_id tidak boleh kosong.")
 
     logger.info("=" * 80)
-    logger.info("Starting ETL Job : %s", job_id)
-    started = time.perf_counter()
+    logger.info("Queueing ETL Job : %s", job_id)
 
     job_folder = await _ensure_job_local(job_id)
 
-    try:
-        result = await asyncio.to_thread(
-            ETLOrchestrator.process,
-            job_folder,
-        )
-
-        duration = round(time.perf_counter() - started, 2)
-        logger.info("ETL finished (%s sec)", duration)
-        logger.info("=" * 80)
-
-        # ETLOrchestrator intentionally returns a structured result on both
-        # success and failure. Do not turn an ETL failure into HTTP 200.
-        if not isinstance(result, dict):
-            raise RuntimeError(
-                f"ETL returned an invalid result type: {type(result).__name__}"
-            )
-
-        if result.get("success") is not True:
-            error = str(result.get("error") or "ETL gagal tanpa pesan error.")
-            logger.error("ETL job failed | job=%s | error=%s", job_id, error)
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "job_id": job_id,
-                    "message": "ETL process gagal.",
-                    "error": error,
-                },
-            )
-
+    if is_etl_running(job_id):
         return {
             "success": True,
             "job_id": job_id,
-            "status": "FINISHED",
-            "duration_seconds": duration,
-            "message": "ETL process completed successfully.",
-            "result": result,
+            "status": "PROCESSING",
+            "message": "ETL job is already running.",
         }
 
-    except HTTPException:
-        raise
+    try:
+        started = start_etl_background(job_id, job_folder)
     except Exception as exc:
-        logger.exception("ETL failed : %s", job_id)
+        logger.exception("Could not queue ETL | job=%s", job_id)
         raise HTTPException(
             status_code=500,
-            detail=f"ETL job '{job_id}' gagal: {exc}",
+            detail=f"ETL job '{job_id}' gagal dimasukkan ke queue: {exc}",
         ) from exc
+
+    if not started:
+        return {
+            "success": True,
+            "job_id": job_id,
+            "status": "PROCESSING",
+            "message": "ETL job is already running.",
+        }
+
+    logger.info("ETL job queued successfully | job=%s", job_id)
+    logger.info("=" * 80)
+
+    return {
+        "success": True,
+        "job_id": job_id,
+        "status": "QUEUED",
+        "message": "ETL job accepted and running in background.",
+    }
