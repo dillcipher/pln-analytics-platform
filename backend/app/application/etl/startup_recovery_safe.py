@@ -99,6 +99,22 @@ def _manifest_dataset(job_id: str) -> str | None:
     return None
 
 
+def _bind_manifest_to_job(job_id: str) -> None:
+    """Add job_id to each file record so legacy FileGrouper calls stay job-local."""
+    path = RAW_UPLOAD / job_id / "manifest.json"
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        changed = False
+        for record in manifest.get("files") or []:
+            if isinstance(record, dict) and record.get("job_id") != job_id:
+                record["job_id"] = job_id
+                changed = True
+        if changed:
+            path.write_text(json.dumps(manifest, indent=4, ensure_ascii=False, default=str), encoding="utf-8")
+    except Exception:
+        logger.exception("STARTUP RECOVERY: could not bind manifest to job | job=%s", job_id)
+
+
 async def _recover_one(metadata: dict[str, Any]) -> str:
     job_id = str(metadata.get("job_id") or "").strip()
     files = metadata.get("files")
@@ -151,6 +167,7 @@ async def _recover_one(metadata: dict[str, Any]) -> str:
             logger.warning("STARTUP RECOVERY: undetectable workbook rejected before ETL | job=%s | file=%s", job_id, filename)
             return "rejected"
 
+        _bind_manifest_to_job(job_id)
         etl_result = await asyncio.to_thread(ETLOrchestrator.process, job_folder)
         if not isinstance(etl_result, dict) or not etl_result.get("success"):
             raise RuntimeError(f"Recovered ETL failed: {etl_result}")
