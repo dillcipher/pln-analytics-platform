@@ -8,6 +8,11 @@ import os
 import threading
 from pathlib import Path
 
+# Keep the large-workbook reader conservative on the 500 MB runtime.
+# This is set before the streaming merger module is imported so its module
+# level chunk-size setting picks up the safe production default.
+os.environ.setdefault("DLPD_STREAM_CHUNK_ROWS", "500")
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
