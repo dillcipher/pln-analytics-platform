@@ -11,6 +11,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.application.etl.etl_orchestrator import ETLOrchestrator
 from app.core.config import get_settings
 from app.core.logging_config import configure_logging
 from app.database.warehouse import Warehouse
@@ -22,7 +23,6 @@ from app.etl.merger.streaming_dlpd_merger_patch import install_streaming_dlpd_me
 from app.etl.runtime_guard import install_runtime_guards
 from app.infrastructure.duckdb.dlpd_query_guard import install_dlpd_query_guard
 from app.infrastructure.storage.processed_storage import hydrate_processed_data
-from app.application.etl.etl_orchestrator import ETLOrchestrator
 
 install_dlpd_transformer_patch()
 install_streaming_month_resolver_patch()
@@ -38,9 +38,12 @@ _ORIGINAL_ETL_PROCESS = ETLOrchestrator.process.__func__
 
 
 def _deduplicated_etl_process(cls, job_folder: Path):
+    """Prevent duplicate ETL execution for the same job in one replica."""
     job_id = str(job_folder.name or "").strip()
     if not job_id:
-        raise ValueError("ETL job folder does not contain a valid job_id.")
+        raise ValueError(
+            "ETL job folder does not contain a valid job_id."
+        )
 
     with _ETL_ACTIVE_LOCK:
         if job_id in _ETL_ACTIVE_JOBS:
@@ -63,7 +66,9 @@ def _deduplicated_etl_process(cls, job_folder: Path):
             _ETL_ACTIVE_JOBS.discard(job_id)
 
 
-ETLOrchestrator.process = classmethod(_deduplicated_etl_process)
+ETLOrchestrator.process = classmethod(
+    _deduplicated_etl_process
+)
 
 from app.interface.api.v1.router import api_v1_router  # noqa: E402
 
@@ -111,7 +116,9 @@ def readiness_check():
     try:
         tables = Warehouse.list_tables()
     except Exception:
-        logger.exception("Readiness warehouse inspection failed.")
+        logger.exception(
+            "Readiness warehouse inspection failed."
+        )
 
     durable_storage = all(
         os.getenv(name, "").strip()
@@ -132,7 +139,11 @@ def readiness_check():
     warehouse_ready = required_tables.issubset(set(tables))
 
     return {
-        "status": "ready" if durable_storage and warehouse_ready else "degraded",
+        "status": (
+            "ready"
+            if durable_storage and warehouse_ready
+            else "degraded"
+        ),
         "durable_storage": durable_storage,
         "warehouse_ready": warehouse_ready,
         "tables": tables,
@@ -147,17 +158,33 @@ async def on_startup():
     logger.info("Processed Data : %s", settings.DATA_PROCESSED_DIR)
 
     hydrated = hydrate_processed_data()
-    logger.info("Hydrated processed artifacts: %s", hydrated)
+    logger.info(
+        "Hydrated processed artifacts: %s",
+        hydrated,
+    )
 
     try:
         Warehouse.refresh_tables()
-        logger.info("Startup warehouse refresh completed.")
+        logger.info(
+            "Startup warehouse refresh completed."
+        )
     except Exception:
-        logger.exception("Startup warehouse refresh failed; continuing startup.")
+        logger.exception(
+            "Startup warehouse refresh failed; continuing startup."
+        )
 
-    # Recover exactly one unfinished durable job in the background. The
-    # recovery implementation is bounded to one job and uses the same ETL
-    # memory gate/deduplication path as normal processing.
+    # ----------------------------------------------------------
+    # DURABLE ETL WORKER
+    # ----------------------------------------------------------
+    #
+    # Uploaded jobs live in Supabase Storage. The worker therefore does not
+    # depend on the browser staying open and can resume after a FastAPI
+    # restart. Jobs are recovered one at a time, so a batch of large DLPD
+    # files never launches several memory-heavy ETLs concurrently in one
+    # process.
+    #
+    # AUTO_RECOVER_ETL_ON_STARTUP=0 remains available as an emergency switch.
+    # ----------------------------------------------------------
     auto_recover = os.getenv(
         "AUTO_RECOVER_ETL_ON_STARTUP",
         "1",
@@ -170,21 +197,56 @@ async def on_startup():
 
     if auto_recover:
         try:
-            from app.application.etl.startup_recovery_once import recover_one_pending_job
+            from app.application.etl.startup_recovery_once import (
+                recover_one_pending_job,
+            )
 
-            async def _explicit_recovery():
-                try:
-                    result = await recover_one_pending_job()
-                    logger.warning("STARTUP RECOVERY RESULT | %s", result)
-                except Exception:
-                    logger.exception("STARTUP RECOVERY FAILED")
+            async def _durable_recovery_worker():
+                logger.warning(
+                    "DURABLE ETL WORKER STARTED"
+                )
 
-            asyncio.create_task(_explicit_recovery())
-            logger.info("Startup ETL recovery scheduled: one eligible durable job.")
+                while True:
+                    try:
+                        result = await recover_one_pending_job()
+                        eligible = int(
+                            result.get("eligible", 0)
+                        )
+
+                        if eligible:
+                            logger.warning(
+                                "DURABLE ETL WORKER PROCESSED JOB | %s",
+                                result,
+                            )
+                            # Give the runtime a moment to release Python
+                            # objects/file handles before the next workbook.
+                            await asyncio.sleep(2)
+                        else:
+                            # Poll durable storage for newly uploaded jobs.
+                            await asyncio.sleep(15)
+
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception(
+                            "DURABLE ETL WORKER ITERATION FAILED"
+                        )
+                        await asyncio.sleep(15)
+
+            asyncio.create_task(
+                _durable_recovery_worker()
+            )
+            logger.info(
+                "Durable ETL worker scheduled."
+            )
         except Exception:
-            logger.exception("Could not schedule startup recovery.")
+            logger.exception(
+                "Could not schedule durable ETL worker."
+            )
     else:
-        logger.info("Startup ETL recovery disabled by AUTO_RECOVER_ETL_ON_STARTUP.")
+        logger.info(
+            "Startup ETL recovery disabled by AUTO_RECOVER_ETL_ON_STARTUP."
+        )
 
     logger.info("Application startup complete.")
     logger.info("=" * 80)
