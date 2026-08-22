@@ -22,13 +22,13 @@ jobs:
       - name: Compile backend
         run: python -m compileall app
       - name: Run DLPD regression tests
-        run: pytest -q tests/test_dlpd_semantics.py
+        run: pytest -q tests/test_dlpd_semantics.py tests/test_etl_recovery_safety.py
       - name: Validate critical imports
         env:
           S3_ENDPOINT: https://example.invalid/storage/v1/s3
           S3_ACCESS_KEY_ID: ci
           S3_SECRET_ACCESS_KEY: ci
-        run: python -c "from app.application.etl.startup_recovery import recover_pending_jobs; from app.etl.runtime_guard import install_runtime_guards; from app.infrastructure.duckdb.dlpd_repository import DuckDbDlpdRepository; print('backend imports ok')"
+        run: python -c "from app.application.etl.startup_recovery import recover_pending_jobs; from app.application.etl.startup_recovery_once import recover_one_pending_job; from app.etl.runtime_guard import install_runtime_guards; from app.infrastructure.duckdb.dlpd_repository import DuckDbDlpdRepository; print('backend imports ok')"
 
   frontend:
     runs-on: ubuntu-latest
