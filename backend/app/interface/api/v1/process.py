@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -18,13 +19,7 @@ router = APIRouter(
 
 
 async def _ensure_job_local(job_id: str):
-    """Ensure a durable uploaded job exists on this API replica.
-
-    FastAPI Cloud replicas have ephemeral local disks, while the upload
-    service stores the final assembled workbook and job metadata in Supabase
-    Storage. A process request must therefore recover the job when it lands
-    on a fresh replica instead of returning a misleading 404.
-    """
+    """Recover a durable job onto the current ephemeral API replica."""
     job_folder = RAW_UPLOAD / job_id
     manifest_path = job_folder / "manifest.json"
 
@@ -73,8 +68,7 @@ async def _ensure_job_local(job_id: str):
             detail=f"Metadata job '{job_id}' tidak memiliki nama file yang valid.",
         )
 
-    # First try the durable final assembled workbook. This is the normal path
-    # for jobs that already reached ASSEMBLY_COMPLETED/UPLOADED.
+    # Normal path: the final assembled workbook is already durable in S3.
     try:
         result = await UploadService.recover_assembled_job(
             job_id=job_id,
@@ -84,8 +78,6 @@ async def _ensure_job_local(job_id: str):
         if result.get("success", True) and manifest_path.exists():
             return job_folder
     except FileNotFoundError:
-        # The final workbook may not have been assembled yet. If chunk
-        # metadata is available, resume assembly from durable chunks below.
         pass
     except Exception as exc:
         logger.exception("Durable job recovery failed | job=%s", job_id)
@@ -94,9 +86,9 @@ async def _ensure_job_local(job_id: str):
             detail=f"Gagal memulihkan file job '{job_id}': {exc}",
         ) from exc
 
+    # If only durable chunks exist, assemble them now, one chunk at a time.
     upload_id = file_metadata.get("upload_id") or metadata.get("upload_id")
     total_chunks = file_metadata.get("total_chunks") or metadata.get("total_chunks")
-
     if upload_id and total_chunks is not None:
         try:
             result = await UploadService.assemble_chunk_upload(
@@ -137,16 +129,13 @@ async def process_job(job_id: str):
     job_folder = await _ensure_job_local(job_id)
 
     try:
-        # Run the CPU/file-heavy ETL outside the event loop. This keeps the
-        # health checks and other API requests responsive while a large DLPD
-        # workbook is being transformed.
-        result = await __import__("asyncio").to_thread(
+        # Large Excel ETL is file/CPU heavy; keep it off FastAPI's event loop.
+        result = await asyncio.to_thread(
             ETLOrchestrator.process,
             job_folder,
         )
 
         duration = round(time.perf_counter() - started, 2)
-
         logger.info("ETL finished (%s sec)", duration)
         logger.info("=" * 80)
 
