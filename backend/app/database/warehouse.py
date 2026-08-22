@@ -18,11 +18,10 @@ class Warehouse:
     """
     DuckDB Warehouse.
 
-    The processed parquet files are the source of truth. The warehouse
-    therefore exposes them as DuckDB views instead of copying every row into
-    a second in-process table. This is critical on the production 500 MB
-    memory tier: CREATE TABLE AS over a large DLPD dataset can temporarily
-    materialize hundreds of MB and trigger an OOM restart.
+    Processed parquet files are the source of truth. The warehouse exposes
+    them as lazy DuckDB views instead of copying the full datasets into a
+    second in-memory table. This is required for the production 500 MB
+    memory tier, especially for the large Pascabayar workbook.
     """
 
     _DUCKDB_MEMORY_LIMIT = "192MB"
@@ -37,22 +36,52 @@ class Warehouse:
         logger.info("Opening DuckDB warehouse: %s", WAREHOUSE)
         connection = duckdb.connect(str(WAREHOUSE))
 
-        # Keep DuckDB inside the small container's memory budget. Expensive
-        # query operators may spill to the local ephemeral disk instead of
-        # consuming the whole process memory allowance.
+        # Keep DuckDB from consuming the entire container. Expensive query
+        # operators can spill to local ephemeral disk instead.
         connection.execute(
             f"SET memory_limit = '{cls._DUCKDB_MEMORY_LIMIT}'"
         )
-        connection.execute(
-            f"SET threads = {cls._DUCKDB_THREADS}"
-        )
+        connection.execute(f"SET threads = {cls._DUCKDB_THREADS}")
         connection.execute("SET preserve_insertion_order = false")
-        connection.execute(
-            "SET temp_directory = ?",
-            [str(temp_dir)],
-        )
+        connection.execute("SET temp_directory = ?", [str(temp_dir)])
 
         return connection
+
+    @staticmethod
+    def _replace_with_parquet_view(
+        connection: duckdb.DuckDBPyConnection,
+        view_name: str,
+        parquet_pattern: Path,
+    ) -> None:
+        """Replace an old table/view with a lazy parquet-backed view."""
+        relation_type = connection.execute(
+            """
+            SELECT table_type
+            FROM information_schema.tables
+            WHERE table_name = ?
+            LIMIT 1
+            """,
+            [view_name],
+        ).fetchone()
+
+        if relation_type:
+            object_type = str(relation_type[0]).upper()
+            if object_type == "VIEW":
+                connection.execute(f"DROP VIEW {view_name}")
+            else:
+                # Handles the old materialized TABLE created by previous
+                # releases. Dropping it releases the old warehouse storage
+                # without scanning or rebuilding the dataset in memory.
+                connection.execute(f"DROP TABLE {view_name}")
+
+        connection.execute(
+            f"""
+            CREATE VIEW {view_name}
+            AS
+            SELECT *
+            FROM read_parquet('{parquet_pattern.as_posix()}')
+            """
+        )
 
     @classmethod
     def refresh_tables(cls) -> None:
@@ -80,27 +109,14 @@ class Warehouse:
                     logger.warning("No parquet found for %s", table_name)
                     continue
 
-                # Never materialize the full parquet dataset into DuckDB.
-                # The view is lazy and DuckDB scans only the columns/rows a
-                # dashboard query actually needs.
-                connection.execute(
-                    f"""
-                    CREATE OR REPLACE VIEW {table_name}
-                    AS
-                    SELECT *
-                    FROM read_parquet('{parquet_pattern.as_posix()}')
-                    """
-                )
-
-                rows = connection.execute(
-                    f"SELECT COUNT(*) FROM {table_name}"
-                ).fetchone()[0]
-
-                logger.info(
-                    "%s view ready (%s rows)",
+                # No COUNT(*) here. A count would force a full scan during
+                # every refresh and gives no value to the dashboard runtime.
+                cls._replace_with_parquet_view(
+                    connection,
                     table_name,
-                    rows,
+                    parquet_pattern,
                 )
+                logger.info("%s view ready", table_name)
 
             connection.execute("CHECKPOINT")
             logger.info("=")
@@ -109,9 +125,7 @@ class Warehouse:
         finally:
             connection.close()
 
-        # Processed data is ephemeral on the cloud instance. Persist it only
-        # after the warehouse refresh has completed successfully so finished
-        # ETL jobs survive container restarts/redeployments.
+        # Persist only after the lightweight warehouse refresh succeeds.
         try:
             persisted = persist_processed_data()
             logger.info(
@@ -136,7 +150,14 @@ class Warehouse:
     def list_tables(cls) -> list[str]:
         connection = cls.connect()
         try:
-            rows = connection.execute("SHOW TABLES").fetchall()
+            rows = connection.execute(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'main'
+                ORDER BY table_name
+                """
+            ).fetchall()
             return [row[0] for row in rows]
         finally:
             connection.close()
