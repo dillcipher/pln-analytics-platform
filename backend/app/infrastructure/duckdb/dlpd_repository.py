@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from typing import Any
 
@@ -1078,6 +1078,12 @@ class DuckDbDlpdRepository(DlpdRepository):
         table = self._table(
             customer_type,
         )
+
+        # A dashboard request must remain healthy while a dataset is not
+        # installed yet. Returning an empty ULP list is preferable to a
+        # 503/CatalogException that breaks the entire dashboard.
+        if not dataset_exists(table):
+            return []
 
         where_sql, params = self._build_where(
             customer_type,
