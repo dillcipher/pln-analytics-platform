@@ -71,6 +71,14 @@ ETLOrchestrator.process = classmethod(
 )
 
 from app.interface.api.v1.router import api_v1_router  # noqa: E402
+from app.interface.api.v1.durable_upload_queue_patch import (  # noqa: E402
+    install_durable_upload_queue_patch,
+)
+
+# The /upload/complete endpoint still returns immediately, but its old
+# in-process assembly task is disabled. The durable worker below is now the
+# single owner of chunk assembly + ETL, eliminating races after restarts.
+install_durable_upload_queue_patch()
 
 settings = get_settings()
 configure_logging(settings.DEBUG)
@@ -176,15 +184,11 @@ async def on_startup():
     # ----------------------------------------------------------
     # DURABLE ETL WORKER
     # ----------------------------------------------------------
-    #
     # Uploaded jobs live in Supabase Storage. The worker therefore does not
     # depend on the browser staying open and can resume after a FastAPI
     # restart. Jobs are recovered one at a time, so a batch of large DLPD
     # files never launches several memory-heavy ETLs concurrently in one
     # process.
-    #
-    # AUTO_RECOVER_ETL_ON_STARTUP=0 remains available as an emergency switch.
-    # ----------------------------------------------------------
     auto_recover = os.getenv(
         "AUTO_RECOVER_ETL_ON_STARTUP",
         "1",
@@ -218,9 +222,9 @@ async def on_startup():
                                 "DURABLE ETL WORKER PROCESSED JOB | %s",
                                 result,
                             )
-                            # Give the runtime a moment to release Python
-                            # objects/file handles before the next workbook.
-                            await asyncio.sleep(2)
+                            # Let Python release workbook/parquet objects
+                            # before starting the next large job.
+                            await asyncio.sleep(3)
                         else:
                             # Poll durable storage for newly uploaded jobs.
                             await asyncio.sleep(15)
