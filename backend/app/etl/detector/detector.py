@@ -47,11 +47,15 @@ class FileDetector:
         """
         Detect a renamed/generic Excel upload from header columns.
 
-        Only the first 15 rows of the first few worksheets are inspected.
-        This is intentionally cheap enough to run for large DLPD workbooks.
+        The scan is intentionally bounded. It checks several worksheets and
+        the first 50 rows so files with title/metadata rows before the real
+        header are still detected, while openpyxl read-only mode keeps memory
+        usage low for large workbooks.
         """
         path = Path(filepath)
         if path.suffix.lower() not in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
+            return cls.UNKNOWN
+        if not path.exists() or not path.is_file():
             return cls.UNKNOWN
 
         try:
@@ -64,10 +68,10 @@ class FileDetector:
             )
 
             try:
-                for worksheet in workbook.worksheets[:5]:
+                for worksheet in workbook.worksheets[:8]:
                     for row in worksheet.iter_rows(
                         min_row=1,
-                        max_row=15,
+                        max_row=50,
                         values_only=True,
                     ):
                         columns = {
@@ -76,6 +80,9 @@ class FileDetector:
                             if value is not None
                         }
 
+                        # Most specific signatures first. A DLPD workbook
+                        # also commonly contains IDPEL, so DLPD must win over
+                        # the generic PENGECEKAN IDPEL+NAMA signature.
                         if {"IDPEL", "THBLREK", "DLPD"}.issubset(columns):
                             return cls.DLPD_PASCABAYAR
 
@@ -88,17 +95,17 @@ class FileDetector:
                         ):
                             return cls.CUSTOMER_LOCATION
 
-                        if {"IDPEL", "NAMA"}.issubset(columns):
-                            return cls.PENGECEKAN
-
                         if {"LOCATIONCODE", "READDATE", "SUSPECTNAME"}.issubset(columns):
                             return cls.ANEV
+
+                        if {"IDPEL", "NAMA"}.issubset(columns):
+                            return cls.PENGECEKAN
             finally:
                 workbook.close()
 
         except Exception:
-            # Filename detection remains available even if the workbook
-            # cannot be inspected. Validator will report the actual error.
+            # Detection must remain non-fatal. DatasetValidator/ETL will
+            # provide the detailed workbook error once a dataset is known.
             return cls.UNKNOWN
 
         return cls.UNKNOWN
