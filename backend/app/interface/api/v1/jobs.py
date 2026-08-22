@@ -9,7 +9,6 @@ from fastapi import APIRouter, HTTPException
 from app.core.constants import RAW_UPLOAD
 from app.infrastructure.storage.processed_storage import persist_processed_data
 from app.services.upload_service import UploadService
-from app.application.jobs.job_recovery import ensure_job_processing
 
 
 router = APIRouter(
@@ -66,11 +65,6 @@ async def get_job(job_id: str):
     local_manifest = job_folder / "manifest.json"
     local_job_json = job_folder / "job.json"
     local_chunk_metadata = job_folder / "chunk_upload.json"
-
-    try:
-        ensure_job_processing(job_id)
-    except Exception:
-        pass
 
     local_manifest_data = _read_json_file(local_manifest)
     if local_manifest_data is not None:
