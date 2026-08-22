@@ -6,6 +6,7 @@ from typing import Any
 
 from app.application.etl.startup_recovery import (
     MAX_FAILED_RECOVERY_ATTEMPTS,
+    RECOVERY_POLICY_VERSION,
     _RECOVERY_LOCK,
     _load_pending_jobs,
     _recover_one,
@@ -27,6 +28,28 @@ def _file_size(metadata: dict[str, Any]) -> int:
         return 0
 
 
+def _is_eligible(metadata: dict[str, Any]) -> bool:
+    """Allow retries after a recovery-policy/code fix."""
+    attempts = int(metadata.get("recovery_attempts") or 0)
+    policy = str(metadata.get("recovery_policy_version") or "")
+
+    if attempts < MAX_FAILED_RECOVERY_ATTEMPTS:
+        return True
+
+    if policy != RECOVERY_POLICY_VERSION:
+        logger.warning(
+            "STARTUP RECOVERY: old exhausted job is eligible after policy change | "
+            "job=%s | attempts=%s | old_policy=%s | new_policy=%s",
+            metadata.get("job_id"),
+            attempts,
+            policy or "<none>",
+            RECOVERY_POLICY_VERSION,
+        )
+        return True
+
+    return False
+
+
 async def recover_one_pending_job() -> dict[str, Any]:
     """Recover at most one unfinished durable ETL job safely."""
     async with _RECOVERY_LOCK:
@@ -35,14 +58,10 @@ async def recover_one_pending_job() -> dict[str, Any]:
         eligible_jobs = []
         exhausted_jobs = 0
         for metadata in jobs:
-            attempts = int(metadata.get("recovery_attempts") or 0)
-            # Retry budget applies to every recoverable state. A job must not
-            # escape the limit merely because its last state remained MERGING
-            # or TRANSFORMING after a container restart.
-            if attempts >= MAX_FAILED_RECOVERY_ATTEMPTS:
+            if _is_eligible(metadata):
+                eligible_jobs.append(metadata)
+            else:
                 exhausted_jobs += 1
-                continue
-            eligible_jobs.append(metadata)
 
         if not eligible_jobs:
             logger.info(
