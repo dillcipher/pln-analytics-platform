@@ -167,13 +167,20 @@ async def on_startup():
     except Exception:
         logger.exception("Startup warehouse refresh failed; continuing startup.")
 
-    # CRITICAL: default is OFF. A server restart must never automatically pick
-    # a large pending DLPD workbook and run an unbounded Excel scan. That was
-    # the direct cause of the repeated OOM/restart cycle seen in production.
-    auto_recover = os.getenv(
+    # CRITICAL SAFETY RULE:
+    # A production restart must never automatically pick a large pending DLPD
+    # workbook. The old default caused the service to scan the workbook during
+    # boot, hit the memory ceiling, restart, and immediately repeat the same
+    # cycle. Automatic recovery therefore requires an explicit second opt-in.
+    requested_auto_recover = os.getenv(
         "AUTO_RECOVER_ETL_ON_STARTUP",
         "0",
     ).strip().lower() in {"1", "true", "yes", "on"}
+    explicit_recovery_opt_in = os.getenv(
+        "ENABLE_AUTO_RECOVER_ETL",
+        "0",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    auto_recover = requested_auto_recover and explicit_recovery_opt_in
 
     if auto_recover:
         try:
@@ -205,8 +212,9 @@ async def on_startup():
             logger.exception("Could not schedule durable ETL worker.")
     else:
         logger.info(
-            "Startup ETL recovery disabled by default. Use POST /api/v1/process/{job_id} "
-            "for explicit recovery/processing."
+            "Startup ETL recovery disabled. Explicit processing is required; "
+            "automatic recovery needs AUTO_RECOVER_ETL_ON_STARTUP=1 and "
+            "ENABLE_AUTO_RECOVER_ETL=1."
         )
 
     logger.info("Application startup complete.")
