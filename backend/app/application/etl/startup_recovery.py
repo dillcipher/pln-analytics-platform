@@ -36,9 +36,9 @@ RECOVERABLE_STATUSES = {
 }
 MAX_FAILED_RECOVERY_ATTEMPTS = max(1, int(os.getenv("MAX_FAILED_RECOVERY_ATTEMPTS", "3")))
 
-# Deliberately versioned: changing this gives already-exhausted jobs one
-# fresh retry budget after a real recovery/ETL fix, without retrying forever.
-RECOVERY_POLICY_VERSION = "2026-08-22-v2"
+# Bump this whenever the recovery implementation is materially fixed.
+# Exhausted jobs from an older policy are granted a fresh retry budget.
+RECOVERY_POLICY_VERSION = "2026-08-23-v3"
 
 _RECOVERY_LOCK = asyncio.Lock()
 
@@ -218,6 +218,7 @@ async def _recover_one(metadata: dict[str, Any]) -> bool:
                 RECOVERY_POLICY_VERSION,
             )
             metadata["recovery_attempts"] = 0
+            attempts = 0
         else:
             logger.error(
                 "STARTUP RECOVERY: retry limit reached | job=%s | attempts=%s | policy=%s",
