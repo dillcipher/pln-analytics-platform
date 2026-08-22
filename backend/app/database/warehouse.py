@@ -43,7 +43,13 @@ class Warehouse:
         )
         connection.execute(f"SET threads = {cls._DUCKDB_THREADS}")
         connection.execute("SET preserve_insertion_order = false")
-        connection.execute("SET temp_directory = ?", [str(temp_dir)])
+
+        # SET does not need a bound parameter here. Escape the path so this
+        # remains valid even if a deployment path contains an apostrophe.
+        escaped_temp_dir = str(temp_dir).replace("'", "''")
+        connection.execute(
+            f"SET temp_directory = '{escaped_temp_dir}'"
+        )
 
         return connection
 
@@ -74,12 +80,13 @@ class Warehouse:
                 # without scanning or rebuilding the dataset in memory.
                 connection.execute(f"DROP TABLE {view_name}")
 
+        pattern = str(parquet_pattern).replace("'", "''")
         connection.execute(
             f"""
             CREATE VIEW {view_name}
             AS
             SELECT *
-            FROM read_parquet('{parquet_pattern.as_posix()}')
+            FROM read_parquet('{pattern}')
             """
         )
 
