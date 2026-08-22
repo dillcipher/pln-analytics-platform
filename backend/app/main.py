@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -82,6 +83,7 @@ def readiness_check():
         "fact_dlpd_prabayar",
         "fact_dlpd_pascabayar",
         "fact_pengecekan",
+        "fact_customer_location",
     }
     warehouse_ready = required_tables.issubset(set(tables))
 
@@ -100,6 +102,8 @@ async def on_startup():
     logger.info("Environment : %s", settings.ENVIRONMENT)
     logger.info("Processed Data : %s", settings.DATA_PROCESSED_DIR)
 
+    # Restore durable processed artifacts before touching DuckDB. The cloud
+    # filesystem is ephemeral, so this is required for restart-safe dashboards.
     hydrated = hydrate_processed_data()
     logger.info("Hydrated processed artifacts: %s", hydrated)
 
@@ -109,12 +113,15 @@ async def on_startup():
     except Exception:
         logger.exception("Startup warehouse refresh failed; continuing startup.")
 
-    logger.info("Startup ETL recovery disabled; ETL runs from explicit upload/reprocess actions.")
+    # Recovery is asynchronous so a large unfinished workbook never blocks
+    # FastAPI startup. recover_pending_jobs serializes recovery and persists
+    # checkpoints/status, preventing duplicate processing across restarts.
+    try:
+        from app.application.etl.startup_recovery import recover_pending_jobs
 
-    if not settings.DATA_PROCESSED_DIR.exists():
-        logger.warning(
-            "Processed data directory not found. Upload and run the ETL pipeline "
-            "to populate the dashboard."
-        )
+        asyncio.create_task(recover_pending_jobs())
+        logger.info("Startup ETL recovery scheduled in background.")
+    except Exception:
+        logger.exception("Could not schedule startup ETL recovery.")
 
     logger.info("=" * 80)
