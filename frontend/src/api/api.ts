@@ -123,6 +123,23 @@ api.interceptors.request.use(async (config) => {
     normalizeDlpdCustomerParams(config);
 
     if (isDlpdRead(config)) {
+        // Axios starts its timeout after the request interceptor chain. The
+        // DLPD FIFO intentionally waits for the previous heavy read, so the
+        // normal 120s timeout is too short for queued all-month requests.
+        // Give DLPD reads a generous ceiling while keeping other API calls
+        // on their normal timeout.
+        const configuredTimeout = Number(
+            import.meta.env.VITE_DLPD_API_TIMEOUT ||
+            import.meta.env.VITE_API_TIMEOUT ||
+            120000,
+        );
+        config.timeout = Math.max(
+            Number.isFinite(configuredTimeout)
+                ? configuredTimeout
+                : 120000,
+            600000,
+        );
+
         let release!: () => void;
         const turn = new Promise<void>((resolve) => {
             release = resolve;
