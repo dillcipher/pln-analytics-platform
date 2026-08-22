@@ -7,309 +7,189 @@ import {
 import UploadDropzone from "../components/upload/UploadDropzone";
 import UploadFileTable from "../components/upload/UploadFileTable";
 
-import { uploadFiles } from "../api/upload";
+import { uploadBatchFiles, type BatchUploadResponse } from "../api/upload_batch";
 import {
     getJobStatus,
     type JobHistory,
 } from "../api/system";
 
-const POLL_INTERVAL = 2000;
+const POLL_INTERVAL = 3000;
+
+type JobMap = Record<string, JobHistory>;
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+        window.setTimeout(resolve, ms);
+    });
+}
+
+function statusOf(job: JobHistory | undefined): string {
+    return String(job?.status || "UPLOADED").toUpperCase();
+}
+
+function isTerminal(job: JobHistory | undefined): boolean {
+    const status = statusOf(job);
+    return status === "FINISHED" || status === "FAILED" || status === "ERROR";
+}
 
 export default function UploadPage() {
-
-    const [files, setFiles] =
-        useState<File[]>([]);
-
-    const [uploadResult, setUploadResult] =
-        useState<any>(null);
-
-    const [job, setJob] =
-        useState<JobHistory | null>(null);
-
-    const [loading, setLoading] =
-        useState(false);
-
-    const pollTimer =
-        useRef<number | null>(null);
+    const [files, setFiles] = useState<File[]>([]);
+    const [uploadResult, setUploadResult] = useState<BatchUploadResponse | null>(null);
+    const [jobs, setJobs] = useState<JobMap>({});
+    const [loading, setLoading] = useState(false);
+    const pollingRef = useRef(false);
 
     useEffect(() => {
-
         return () => {
-
-            if (pollTimer.current !== null) {
-                window.clearTimeout(
-                    pollTimer.current,
-                );
-            }
-
+            pollingRef.current = false;
         };
-
     }, []);
 
-    async function pollJob(
-        jobId: string,
-    ): Promise<JobHistory> {
+    async function pollJobs(jobIds: string[]): Promise<JobMap> {
+        const pending = new Set(jobIds);
+        const latest: JobMap = {};
+        const transientFailures: Record<string, number> = {};
 
-        const current =
-            await getJobStatus(jobId);
+        while (pollingRef.current && pending.size > 0) {
+            const ids = Array.from(pending);
 
-        setJob(current);
-
-        const status =
-            String(
-                current.status || "",
-            ).toUpperCase();
-
-        if (status === "FINISHED") {
-            return current;
-        }
-
-        if (
-            status === "FAILED" ||
-            status === "ERROR"
-        ) {
-
-            const errorMessage =
-                current.error != null
-                    ? String(current.error)
-                    : `ETL gagal dengan status ${status}`;
-
-            throw new Error(
-                errorMessage,
+            const responses = await Promise.allSettled(
+                ids.map(async (jobId) => ({
+                    jobId,
+                    value: await getJobStatus(jobId),
+                })),
             );
+
+            for (let index = 0; index < responses.length; index += 1) {
+                const response = responses[index];
+                const jobId = ids[index];
+
+                if (response.status === "fulfilled") {
+                    latest[jobId] = response.value.value;
+                    transientFailures[jobId] = 0;
+
+                    if (isTerminal(response.value.value)) {
+                        pending.delete(jobId);
+                    }
+                    continue;
+                }
+
+                const error: any = response.reason;
+                const httpStatus = Number(error?.response?.status || 0);
+                transientFailures[jobId] = (transientFailures[jobId] || 0) + 1;
+
+                // A temporary network/proxy failure must not stop a long ETL.
+                // A real 404 means the durable job cannot be found anymore.
+                if (httpStatus === 404) {
+                    latest[jobId] = {
+                        job_id: jobId,
+                        status: "FAILED",
+                        progress: 100,
+                        current_step: "JOB TIDAK DITEMUKAN",
+                        error: "Job tidak ditemukan pada backend durable storage.",
+                    };
+                    pending.delete(jobId);
+                }
+            }
+
+            setJobs({ ...latest });
+
+            if (pending.size > 0) {
+                await sleep(POLL_INTERVAL);
+            }
         }
 
-        await new Promise<void>(
-            (resolve) => {
-
-                pollTimer.current =
-                    window.setTimeout(
-                        resolve,
-                        POLL_INTERVAL,
-                    );
-
-            },
-        );
-
-        return pollJob(jobId);
+        return latest;
     }
 
     async function handleUpload() {
-
         if (files.length === 0) {
-
-            alert(
-                "Pilih file terlebih dahulu.",
-            );
-
+            alert("Pilih file terlebih dahulu.");
             return;
         }
 
+        pollingRef.current = true;
         setLoading(true);
         setUploadResult(null);
-        setJob(null);
-
-        if (pollTimer.current !== null) {
-
-            window.clearTimeout(
-                pollTimer.current,
-            );
-
-            pollTimer.current = null;
-        }
+        setJobs({});
 
         try {
+            console.log("==============================");
+            console.log("MULTI-FILE UPLOAD START");
+            console.log("Total Files:", files.length);
+            console.log("==============================");
 
-            console.log(
-                "==============================",
-            );
-
-            console.log(
-                "UPLOAD START",
-            );
-
-            console.log(
-                "Total Files :",
-                files.length,
-            );
-
-            const result =
-                await uploadFiles(files);
-
-            console.log(
-                "UPLOAD RESPONSE",
-                result,
-            );
-
+            // Files are uploaded one-by-one intentionally. The backend durable
+            // worker then processes them one-by-one as well.
+            const result = await uploadBatchFiles(files);
             setUploadResult(result);
 
-            /*
-             * Backend response sekarang:
-             *
-             * {
-             *   success: true,
-             *   total_files: 1,
-             *   files: [...],
-             *   jobs: [
-             *     {
-             *       filename: "...",
-             *       upload_id: "...",
-             *       job_id: "...",
-             *       total_chunks: 143,
-             *       status: "UPLOADED"
-             *     }
-             *   ]
-             * }
-             *
-             * Jadi job_id berada di:
-             *
-             * result.jobs[0].job_id
-             */
+            const jobIds = result.jobs
+                .map((item) => String(item.job_id || "").trim())
+                .filter(Boolean);
 
-            const jobs =
-                Array.isArray(result?.jobs)
-                    ? result.jobs
-                    : [];
-
-            if (jobs.length === 0) {
-
+            if (!jobIds.length) {
                 throw new Error(
-                    "Upload berhasil tetapi daftar job tidak ditemukan.",
+                    "Tidak ada job yang berhasil dibuat. Periksa daftar file gagal.",
                 );
             }
 
-            const firstJob =
-                jobs[0];
+            const finished = await pollJobs(jobIds);
+            setJobs(finished);
 
-            const jobId =
-                firstJob?.job_id;
+            const failed = Object.values(finished).filter((job) => {
+                const status = statusOf(job);
+                return status === "FAILED" || status === "ERROR";
+            });
 
-            if (!jobId) {
-
+            if (failed.length > 0) {
                 throw new Error(
-                    "Upload berhasil tetapi job_id tidak ditemukan.",
+                    `${failed.length} job gagal. Lihat status per file di bawah.`,
                 );
             }
-
-            console.log(
-                "ETL JOB:",
-                jobId,
+        } catch (error: any) {
+            console.error("UPLOAD / ETL FAILED", error);
+            alert(
+                error?.message
+                    ? String(error.message)
+                    : "Upload atau proses ETL gagal.",
             );
-
-            /*
-             * Backend sudah membuat job.
-             * Sekarang frontend polling status
-             * sampai FINISHED / FAILED.
-             */
-
-            const finishedJob =
-                await pollJob(
-                    String(jobId),
-                );
-
-            console.log(
-                "ETL FINISHED:",
-                finishedJob,
-            );
-
-            setJob(
-                finishedJob,
-            );
-
-        }
-
-        catch (err: any) {
-
-            console.error(
-                "UPLOAD / ETL FAILED",
-                err,
-            );
-
-            const message =
-                err?.response?.data?.detail != null
-                    ? Array.isArray(
-                        err.response.data.detail,
-                    )
-                        ? err.response.data.detail
-                            .map((item: any) =>
-                                typeof item === "string"
-                                    ? item
-                                    : item?.msg ||
-                                      JSON.stringify(item),
-                            )
-                            .join("\n")
-                        : String(
-                            err.response.data.detail,
-                        )
-                    : err?.message
-                        ? String(err.message)
-                        : "Upload atau proses ETL gagal.";
-
-            alert(message);
-
-        }
-
-        finally {
-
+        } finally {
+            pollingRef.current = false;
             setLoading(false);
-
         }
     }
 
-    const progress =
-        Number(
-            job?.progress ?? 0,
-        );
+    const jobList = Object.entries(jobs);
+    const totalJobs = uploadResult?.jobs.length || 0;
+    const finishedJobs = jobList.filter(([, job]) => statusOf(job) === "FINISHED").length;
+    const failedJobs = jobList.filter(([, job]) => {
+        const status = statusOf(job);
+        return status === "FAILED" || status === "ERROR";
+    }).length;
 
-    const safeProgress =
-        Math.min(
-            Math.max(
-                Number.isFinite(progress)
-                    ? progress
-                    : 0,
-                0,
-            ),
-            100,
-        );
+    const averageProgress = totalJobs > 0
+        ? Math.round(
+            uploadResult.jobs.reduce((sum, item) => {
+                const current = jobs[String(item.job_id)]?.progress;
+                return sum + Math.min(Math.max(Number(current ?? 0), 0), 100);
+            }, 0) / totalJobs,
+        )
+        : 0;
 
-    const status =
-        String(
-            job?.status || "",
-        ).toUpperCase();
-
-    const isFinished =
-        status === "FINISHED";
-
-    const isFailed =
-        status === "FAILED" ||
-        status === "ERROR";
-
-    const currentStep =
-        job?.current_step != null
-            ? String(job.current_step)
-            : "Menunggu proses...";
-
-    const jobError =
-        job?.error != null
-            ? String(job.error)
-            : "";
+    const allFinished = totalJobs > 0 && finishedJobs === totalJobs;
+    const anyFailed = failedJobs > 0;
 
     return (
-
         <div>
-
-            <h1>
-                Upload Center
-            </h1>
+            <h1>Upload Center</h1>
 
             <UploadDropzone
                 files={files}
                 setFiles={setFiles}
             />
 
-            <UploadFileTable
-                files={files}
-            />
+            <UploadFileTable files={files} />
 
             <button
                 onClick={handleUpload}
@@ -317,220 +197,170 @@ export default function UploadPage() {
                 style={{
                     marginTop: 20,
                     padding: "12px 24px",
-                    cursor: loading
-                        ? "not-allowed"
-                        : "pointer",
+                    cursor: loading ? "not-allowed" : "pointer",
                 }}
             >
-                {loading
-                    ? "Processing..."
-                    : "Upload Files"}
+                {loading ? "Uploading & Processing..." : "Upload Files"}
             </button>
 
-            {loading && (
-
+            {uploadResult && (
                 <div
                     style={{
                         marginTop: 20,
                         padding: 20,
-                        border:
-                            "1px solid #2d4f70",
+                        border: "1px solid #2d4f70",
                         borderRadius: 10,
-                        background:
-                            "#111827",
+                        background: "#111827",
                     }}
                 >
-
-                    <h3>
-                        ETL sedang diproses
-                    </h3>
-
-                    <div
-                        style={{
-                            marginBottom: 10,
-                        }}
-                    >
-                        Status:{" "}
-                        <strong>
-                            {job?.status
-                                ? String(job.status)
-                                : "UPLOADED"}
-                        </strong>
-                    </div>
-
-                    <div
-                        style={{
-                            marginBottom: 10,
-                        }}
-                    >
-                        Step:{" "}
-                        <strong>
-                            {currentStep}
-                        </strong>
-                    </div>
+                    <h3>Batch Status</h3>
+                    <p>
+                        Upload: <strong>{uploadResult.uploaded_files}/{uploadResult.total_files}</strong>
+                    </p>
+                    <p>
+                        ETL: <strong>{finishedJobs}/{totalJobs} selesai</strong>
+                        {failedJobs > 0 ? ` • ${failedJobs} gagal` : ""}
+                    </p>
 
                     <div
                         style={{
                             width: "100%",
                             height: 10,
-                            background:
-                                "#374151",
+                            background: "#374151",
                             borderRadius: 999,
                             overflow: "hidden",
                         }}
                     >
-
                         <div
                             style={{
-                                width:
-                                    `${safeProgress}%`,
+                                width: `${averageProgress}%`,
                                 height: "100%",
-                                background:
-                                    "#22c55e",
-                                transition:
-                                    "width 0.4s ease",
+                                background: "#22c55e",
+                                transition: "width 0.4s ease",
                             }}
                         />
-
+                    </div>
+                    <div style={{ marginTop: 8 }}>
+                        {averageProgress}% overall
                     </div>
 
-                    <div
-                        style={{
-                            marginTop: 8,
-                        }}
-                    >
-                        {safeProgress}%
-                    </div>
-
+                    {uploadResult.failures.length > 0 && (
+                        <div style={{ marginTop: 16 }}>
+                            <strong>File yang gagal upload:</strong>
+                            {uploadResult.failures.map((failure) => (
+                                <div key={failure.filename}>
+                                    {failure.filename}: {failure.error}
+                                </div>
+                            ))}
+                        </div>
+                    )}
                 </div>
-
             )}
 
-            {isFinished && (
-
+            {jobList.length > 0 && (
                 <div
                     style={{
                         marginTop: 20,
                         padding: 20,
-                        border:
-                            "1px solid #22c55e",
+                        border: "1px solid #2d4f70",
                         borderRadius: 10,
-                        background:
-                            "#111827",
+                        background: "#111827",
                     }}
                 >
+                    <h3>ETL Per File</h3>
 
-                    <h3>
-                        Upload & ETL Selesai
-                    </h3>
+                    {jobList.map(([jobId, job]) => {
+                        const progress = Math.min(
+                            Math.max(Number(job.progress ?? 0), 0),
+                            100,
+                        );
+                        const status = statusOf(job);
 
-                    <p>
-                        Seluruh file sudah
-                        diproses dan warehouse
-                        sudah diperbarui.
-                    </p>
-
-                    {job?.job_id && (
-
-                        <p>
-                            Job:{" "}
-                            <strong>
-                                {String(job.job_id)}
-                            </strong>
-                        </p>
-
-                    )}
-
+                        return (
+                            <div
+                                key={jobId}
+                                style={{
+                                    marginBottom: 16,
+                                    paddingBottom: 12,
+                                    borderBottom: "1px solid #263244",
+                                }}
+                            >
+                                <div>
+                                    <strong>{job.files?.[0] ? String((job.files[0] as any)?.filename || jobId) : jobId}</strong>
+                                </div>
+                                <div style={{ marginTop: 4 }}>
+                                    Status: <strong>{status}</strong>
+                                    {job.current_step ? ` • ${String(job.current_step)}` : ""}
+                                </div>
+                                <div
+                                    style={{
+                                        marginTop: 8,
+                                        width: "100%",
+                                        height: 8,
+                                        background: "#374151",
+                                        borderRadius: 999,
+                                        overflow: "hidden",
+                                    }}
+                                >
+                                    <div
+                                        style={{
+                                            width: `${progress}%`,
+                                            height: "100%",
+                                            background: status === "FAILED" || status === "ERROR"
+                                                ? "#ef4444"
+                                                : "#22c55e",
+                                        }}
+                                    />
+                                </div>
+                                <div style={{ marginTop: 4 }}>
+                                    {progress}% • Job {jobId}
+                                </div>
+                                {job.error && (
+                                    <div style={{ marginTop: 4 }}>
+                                        Error: {String(job.error)}
+                                    </div>
+                                )}
+                            </div>
+                        );
+                    })}
                 </div>
-
             )}
 
-            {isFailed && (
-
+            {allFinished && !anyFailed && (
                 <div
                     style={{
                         marginTop: 20,
                         padding: 20,
-                        border:
-                            "1px solid #ef4444",
+                        border: "1px solid #22c55e",
                         borderRadius: 10,
-                        background:
-                            "#111827",
+                        background: "#111827",
                     }}
                 >
-
-                    <h3>
-                        ETL Gagal
-                    </h3>
-
+                    <h3>Upload & ETL Selesai</h3>
                     <p>
-                        Proses ETL gagal
-                        dijalankan.
+                        Semua job yang berhasil di-upload sudah FINISHED dan
+                        warehouse sudah diperbarui.
                     </p>
-
-                    {job?.job_id && (
-
-                        <p>
-                            Job:{" "}
-                            <strong>
-                                {String(job.job_id)}
-                            </strong>
-                        </p>
-
-                    )}
-
-                    {jobError && (
-
-                        <p>
-                            Error:{" "}
-                            <strong>
-                                {jobError}
-                            </strong>
-                        </p>
-
-                    )}
-
                 </div>
-
             )}
 
-            {uploadResult && (
-
+            {anyFailed && (
                 <div
                     style={{
-                        marginTop: 30,
+                        marginTop: 20,
                         padding: 20,
-                        border:
-                            "1px solid #2d4f70",
+                        border: "1px solid #ef4444",
                         borderRadius: 10,
-                        background:
-                            "#111827",
+                        background: "#111827",
                     }}
                 >
-
-                    <h3>
-                        Upload Result
-                    </h3>
-
-                    <pre
-                        style={{
-                            whiteSpace:
-                                "pre-wrap",
-                            overflowX:
-                                "auto",
-                        }}
-                    >
-                        {JSON.stringify(
-                            uploadResult,
-                            null,
-                            2,
-                        )}
-                    </pre>
-
+                    <h3>Ada Job yang Gagal</h3>
+                    <p>
+                        Job gagal tidak menghentikan file lain. Durable worker
+                        tetap akan melanjutkan job berikutnya.
+                    </p>
                 </div>
-
             )}
-
         </div>
     );
 }
