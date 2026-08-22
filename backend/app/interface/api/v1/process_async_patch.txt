@@ -1,0 +1,1 @@
+Temporary patch marker: process endpoint must be changed to return immediately after durable file recovery and schedule ETL in the background. Use the existing job-status endpoint for polling. Do not keep a synchronous await/to_thread ETL call behind Cloudflare.
