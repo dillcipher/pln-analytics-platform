@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.application.etl.startup_recovery import recover_pending_jobs
 from app.core.config import get_settings
 from app.core.logging_config import configure_logging
 from app.database.warehouse import Warehouse
@@ -109,8 +107,11 @@ async def on_startup():
     except Exception:
         logger.exception("Startup warehouse refresh failed; continuing startup.")
 
-    logger.info("Scheduling durable recovery of unfinished uploads.")
-    asyncio.create_task(_startup_recovery_task())
+    # Never replay a pile of old XLSX jobs from the API process on startup.
+    # Large DLPD workbooks can consume more memory than the web container has,
+    # and repeated recovery was previously responsible for endless retries and
+    # container churn. Upload-triggered ETL remains serialized by runtime_guard.
+    logger.info("Startup ETL recovery disabled; ETL runs from explicit upload/reprocess actions.")
 
     if not settings.DATA_PROCESSED_DIR.exists():
         logger.warning(
@@ -119,11 +120,3 @@ async def on_startup():
         )
 
     logger.info("=" * 80)
-
-
-async def _startup_recovery_task() -> None:
-    try:
-        result = await recover_pending_jobs()
-        logger.info("Startup ETL recovery result: %s", result)
-    except Exception:
-        logger.exception("Startup ETL recovery task failed.")
