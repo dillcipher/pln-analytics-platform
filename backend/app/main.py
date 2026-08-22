@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import threading
@@ -149,19 +150,67 @@ async def on_startup():
     hydrated = hydrate_processed_data()
     logger.info("Hydrated processed artifacts: %s", hydrated)
 
+    tables: set[str] = set()
     try:
         Warehouse.refresh_tables()
+        tables = set(Warehouse.list_tables())
         logger.info("Startup warehouse refresh completed.")
     except Exception:
         logger.exception("Startup warehouse refresh failed; continuing startup.")
 
-    # IMPORTANT: never launch unfinished ETL jobs from application startup.
-    # FastAPI Cloud instances have finite memory and may restart at any time.
-    # Automatic recovery of every durable job was the direct cause of the
-    # previous OOM/restart loop. New uploads explicitly enqueue ETL, while an
-    # existing durable job is resumable through POST /api/v1/process/{job_id}.
-    logger.info(
-        "Startup ETL recovery disabled: API readiness is independent of durable job processing."
-    )
+    # ==============================================================
+    # BOUNDED SELF-HEALING RECOVERY
+    # ==============================================================
+    #
+    # The previous implementation either recovered every unfinished job
+    # during startup (which could OOM the instance) or disabled recovery
+    # completely (which left a fresh deployment with zero dashboard data).
+    #
+    # Correct behavior:
+    #   1. Hydrate durable processed parquet.
+    #   2. Refresh DuckDB views.
+    #   3. If the DLPD warehouse is still missing, recover ONE durable job
+    #      in the background.
+    #   4. Never block FastAPI startup and never fan out across all jobs.
+    #
+    # One-job recovery is enough for the normal deployment model where the
+    # uploaded workbook is the durable source for the whole DLPD dataset.
+    # If another unfinished job remains, it can be recovered on the next
+    # restart without creating a simultaneous memory spike.
+    required_data_tables = {
+        "fact_dlpd_prabayar",
+        "fact_dlpd_pascabayar",
+    }
+
+    if not required_data_tables.issubset(tables):
+        try:
+            from app.application.etl.startup_recovery_once import (
+                recover_one_pending_job,
+            )
+
+            async def _bounded_recovery():
+                try:
+                    result = await recover_one_pending_job()
+                    logger.warning(
+                        "BOUNDED STARTUP RECOVERY COMPLETED | %s",
+                        result,
+                    )
+                except Exception:
+                    logger.exception(
+                        "BOUNDED STARTUP RECOVERY FAILED",
+                    )
+
+            asyncio.create_task(_bounded_recovery())
+            logger.warning(
+                "DLPD warehouse is incomplete; one durable ETL job was queued for background recovery."
+            )
+        except Exception:
+            logger.exception(
+                "Could not schedule bounded startup recovery."
+            )
+    else:
+        logger.info(
+            "DLPD warehouse is present; startup ETL recovery is not required."
+        )
 
     logger.info("=" * 80)
