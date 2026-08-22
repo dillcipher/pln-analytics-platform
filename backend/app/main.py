@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import get_settings
 from app.core.logging_config import configure_logging
 from app.database.warehouse import Warehouse
+from app.etl.detector.dlpd_month_fallback_patch import install_dlpd_month_fallback_patch
 from app.etl.detector.dlpd_transformer_patch import install_dlpd_transformer_patch
 from app.etl.detector.streaming_month_resolver_patch import install_streaming_month_resolver_patch
 from app.etl.merger.idpel_normalization_patch import install_idpel_normalization_patch
@@ -27,13 +28,10 @@ install_dlpd_transformer_patch()
 install_streaming_month_resolver_patch()
 install_idpel_normalization_patch()
 install_streaming_dlpd_merger_patch()
+install_dlpd_month_fallback_patch()
 install_runtime_guards()
 install_dlpd_query_guard()
 
-# A single deployment can receive the same job from multiple paths:
-# upload completion, frontend polling/retry, or manual recovery. The
-# runtime guard serializes ETL for memory safety, while this registry
-# prevents the same job from being executed twice concurrently.
 _ETL_ACTIVE_JOBS: set[str] = set()
 _ETL_ACTIVE_LOCK = threading.Lock()
 _ORIGINAL_ETL_PROCESS = ETLOrchestrator.process.__func__
@@ -148,41 +146,21 @@ async def on_startup():
     logger.info("Environment : %s", settings.ENVIRONMENT)
     logger.info("Processed Data : %s", settings.DATA_PROCESSED_DIR)
 
-    # Restore already-processed parquet artifacts before opening DuckDB.
-    # This is intentionally the only data-heavy operation performed during
-    # startup. It restores existing dashboard data without re-reading the
-    # source Excel workbook.
     hydrated = hydrate_processed_data()
     logger.info("Hydrated processed artifacts: %s", hydrated)
 
-    tables: set[str] = set()
     try:
         Warehouse.refresh_tables()
-        tables = set(Warehouse.list_tables())
         logger.info("Startup warehouse refresh completed.")
     except Exception:
         logger.exception("Startup warehouse refresh failed; continuing startup.")
 
-    # ==============================================================
-    # STARTUP ETL SAFETY
-    # ==============================================================
-    #
-    # NEVER launch a large Excel ETL automatically during application boot.
-    # A previous bounded-recovery implementation still started one durable
-    # DLPD workbook whenever the warehouse was incomplete. That is exactly
-    # the failure mode that can put a memory-constrained container into an
-    # OOM/restart loop: boot -> ETL -> memory spike -> restart -> ETL again.
-    #
-    # New uploads already trigger ETL after the upload request completes.
-    # Existing durable jobs can be resumed explicitly through the process
-    # endpoint, where the normal runtime memory gate and duplicate-job guard
-    # apply.
-    #
-    # Automatic recovery is available only as an explicit emergency opt-in.
-    # It is OFF by default and should remain OFF on the production instance.
+    # Recover exactly one unfinished durable job in the background. The
+    # recovery implementation is bounded to one job and uses the same ETL
+    # memory gate/deduplication path as normal processing.
     auto_recover = os.getenv(
         "AUTO_RECOVER_ETL_ON_STARTUP",
-        "0",
+        "1",
     ).strip().lower() in {
         "1",
         "true",
@@ -197,26 +175,16 @@ async def on_startup():
             async def _explicit_recovery():
                 try:
                     result = await recover_one_pending_job()
-                    logger.warning(
-                        "EXPLICIT STARTUP RECOVERY COMPLETED | %s",
-                        result,
-                    )
+                    logger.warning("STARTUP RECOVERY RESULT | %s", result)
                 except Exception:
-                    logger.exception("EXPLICIT STARTUP RECOVERY FAILED")
+                    logger.exception("STARTUP RECOVERY FAILED")
 
             asyncio.create_task(_explicit_recovery())
-            logger.warning(
-                "AUTO_RECOVER_ETL_ON_STARTUP=1: startup ETL recovery is ENABLED. "
-                "This may consume substantial memory."
-            )
+            logger.info("Startup ETL recovery scheduled: one eligible durable job.")
         except Exception:
-            logger.exception("Could not schedule explicit startup recovery.")
+            logger.exception("Could not schedule startup recovery.")
     else:
-        logger.info(
-            "Startup ETL recovery disabled for memory safety. "
-            "Existing durable jobs must be resumed explicitly via "
-            "POST /api/v1/process/{job_id}."
-        )
+        logger.info("Startup ETL recovery disabled by AUTO_RECOVER_ETL_ON_STARTUP.")
 
     logger.info("Application startup complete.")
     logger.info("=" * 80)
