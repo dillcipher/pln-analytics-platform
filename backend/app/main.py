@@ -12,11 +12,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import get_settings
 from app.core.logging_config import configure_logging
 from app.database.warehouse import Warehouse
+from app.etl.detector.dlpd_transformer_patch import install_dlpd_transformer_patch
 from app.etl.detector.streaming_month_resolver_patch import install_streaming_month_resolver_patch
 from app.etl.merger.streaming_dlpd_merger_patch import install_streaming_dlpd_merger_patch
 from app.etl.runtime_guard import install_runtime_guards
 from app.infrastructure.storage.processed_storage import hydrate_processed_data
 
+install_dlpd_transformer_patch()
 install_streaming_month_resolver_patch()
 install_streaming_dlpd_merger_patch()
 install_runtime_guards()
