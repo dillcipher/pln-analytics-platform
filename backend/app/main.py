@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,11 +18,50 @@ from app.etl.detector.streaming_month_resolver_patch import install_streaming_mo
 from app.etl.merger.streaming_dlpd_merger_patch import install_streaming_dlpd_merger_patch
 from app.etl.runtime_guard import install_runtime_guards
 from app.infrastructure.storage.processed_storage import hydrate_processed_data
+from app.application.etl.etl_orchestrator import ETLOrchestrator
 
 install_dlpd_transformer_patch()
 install_streaming_month_resolver_patch()
 install_streaming_dlpd_merger_patch()
 install_runtime_guards()
+
+# A single deployment can receive the same job from multiple paths:
+# upload completion, frontend polling/retry, or manual recovery.  The
+# runtime guard serializes ETL for memory safety, but serialization alone
+# would make a duplicate request run the same job twice.  Keep a process-
+# local active-job registry so a duplicate trigger becomes a harmless no-op.
+_ETL_ACTIVE_JOBS: set[str] = set()
+_ETL_ACTIVE_LOCK = threading.Lock()
+_ORIGINAL_ETL_PROCESS = ETLOrchestrator.process.__func__
+
+
+def _deduplicated_etl_process(cls, job_folder: Path):
+    job_id = str(job_folder.name or "").strip()
+    if not job_id:
+        raise ValueError("ETL job folder does not contain a valid job_id.")
+
+    with _ETL_ACTIVE_LOCK:
+        if job_id in _ETL_ACTIVE_JOBS:
+            logging.getLogger(__name__).warning(
+                "ETL DUPLICATE TRIGGER IGNORED | JOB=%s",
+                job_id,
+            )
+            return {
+                "success": True,
+                "job_id": job_id,
+                "status": "ALREADY_RUNNING",
+                "message": "ETL job is already running in this instance.",
+            }
+        _ETL_ACTIVE_JOBS.add(job_id)
+
+    try:
+        return _ORIGINAL_ETL_PROCESS(cls, job_folder)
+    finally:
+        with _ETL_ACTIVE_LOCK:
+            _ETL_ACTIVE_JOBS.discard(job_id)
+
+
+ETLOrchestrator.process = classmethod(_deduplicated_etl_process)
 
 from app.interface.api.v1.router import api_v1_router  # noqa: E402
 
@@ -114,12 +155,11 @@ async def on_startup():
     except Exception:
         logger.exception("Startup warehouse refresh failed; continuing startup.")
 
-    # IMPORTANT: do not launch ETL from application startup. FastAPI Cloud
-    # instances have a finite memory budget and may restart at any time.
-    # Launching every durable unfinished workbook here created an OOM loop and
-    # made the API unavailable. New uploads enqueue ETL through the upload
-    # pipeline; an existing durable job is explicitly resumable through
-    # POST /api/v1/process/{job_id}.
+    # IMPORTANT: never launch unfinished ETL jobs from application startup.
+    # FastAPI Cloud instances have finite memory and may restart at any time.
+    # Automatic recovery of every durable job was the direct cause of the
+    # previous OOM/restart loop. New uploads explicitly enqueue ETL, while an
+    # existing durable job is resumable through POST /api/v1/process/{job_id}.
     logger.info(
         "Startup ETL recovery disabled: API readiness is independent of durable job processing."
     )
