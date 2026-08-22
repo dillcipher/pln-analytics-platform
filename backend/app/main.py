@@ -20,6 +20,7 @@ from app.etl.detector.dlpd_transformer_patch import install_dlpd_transformer_pat
 from app.etl.detector.streaming_month_resolver_patch import install_streaming_month_resolver_patch
 from app.etl.merger.idpel_normalization_patch import install_idpel_normalization_patch
 from app.etl.merger.streaming_dlpd_merger_patch import install_streaming_dlpd_merger_patch
+from app.etl.merger.streaming_dlpd_publish_guard import install_streaming_dlpd_publish_guard
 from app.etl.runtime_guard import install_runtime_guards
 from app.infrastructure.duckdb.dlpd_query_guard import install_dlpd_query_guard
 from app.infrastructure.storage.processed_storage import hydrate_processed_data
@@ -28,6 +29,7 @@ install_dlpd_transformer_patch()
 install_streaming_month_resolver_patch()
 install_idpel_normalization_patch()
 install_streaming_dlpd_merger_patch()
+install_streaming_dlpd_publish_guard()
 install_dlpd_month_fallback_patch()
 install_runtime_guards()
 install_dlpd_query_guard()
@@ -222,11 +224,8 @@ async def on_startup():
                                 "DURABLE ETL WORKER PROCESSED JOB | %s",
                                 result,
                             )
-                            # Let Python release workbook/parquet objects
-                            # before starting the next large job.
                             await asyncio.sleep(3)
                         else:
-                            # Poll durable storage for newly uploaded jobs.
                             await asyncio.sleep(15)
 
                     except asyncio.CancelledError:
