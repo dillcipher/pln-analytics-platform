@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+from datetime import datetime
 from typing import Any
 
 import boto3
@@ -57,7 +58,7 @@ def _client():
 
 
 def _load_pending_jobs() -> list[dict[str, Any]]:
-    """Read only lightweight durable job metadata from object storage."""
+    """Read lightweight durable job metadata from object storage."""
     client = _client()
     if client is None:
         logger.warning("STARTUP RECOVERY: durable upload storage is not configured.")
@@ -135,18 +136,48 @@ def _write_local_recovery_metadata(job_id: str, attempts: int) -> None:
         logger.exception("STARTUP RECOVERY: could not update local recovery metadata | job=%s", job_id)
 
 
+async def _persist_job_metadata(metadata: dict[str, Any]) -> None:
+    job_id = str(metadata.get("job_id") or "").strip()
+    if not job_id:
+        return
+    await UploadService._s3_put_json(
+        UploadService._job_metadata_s3_key(job_id),
+        metadata,
+    )
+
+
 async def _mark_recovery_attempt(metadata: dict[str, Any], job_id: str) -> int:
     attempts = int(metadata.get("recovery_attempts") or 0) + 1
     metadata["recovery_attempts"] = attempts
+    metadata["last_recovery_at"] = datetime.now().isoformat()
     _write_local_recovery_metadata(job_id, attempts)
     try:
-        await UploadService._s3_put_json(
-            UploadService._job_metadata_s3_key(job_id),
-            metadata,
-        )
+        await _persist_job_metadata(metadata)
     except Exception:
         logger.exception("STARTUP RECOVERY: could not persist retry counter | job=%s", job_id)
     return attempts
+
+
+async def _mark_recovery_success(metadata: dict[str, Any], job_id: str) -> None:
+    metadata["status"] = "FINISHED"
+    metadata["progress"] = 100
+    metadata["current_step"] = "FINISHED"
+    metadata["finished_at"] = datetime.now().isoformat()
+    metadata["recovery_completed_at"] = datetime.now().isoformat()
+    metadata.pop("last_error", None)
+    _write_local_recovery_metadata(job_id, int(metadata.get("recovery_attempts") or 1))
+    await _persist_job_metadata(metadata)
+
+
+async def _mark_recovery_failure(metadata: dict[str, Any], job_id: str, exc: Exception) -> None:
+    metadata["status"] = "FAILED"
+    metadata["current_step"] = "RECOVERY_FAILED"
+    metadata["last_error"] = str(exc)
+    metadata["last_failed_at"] = datetime.now().isoformat()
+    try:
+        await _persist_job_metadata(metadata)
+    except Exception:
+        logger.exception("STARTUP RECOVERY: could not persist failed state | job=%s", job_id)
 
 
 async def _recover_one(metadata: dict[str, Any]) -> bool:
@@ -210,13 +241,21 @@ async def _recover_one(metadata: dict[str, Any]) -> bool:
             raise FileNotFoundError(f"Recovered manifest not found: {manifest_path}")
 
         _write_local_recovery_metadata(job_id, int(metadata.get("recovery_attempts") or 1))
+
+        # ETLOrchestrator already performs the full pipeline, including
+        # CUSTOMER_LOCATION creation, DLPD month expansion, warehouse refresh,
+        # registry update, and durable processed-data persistence.
         etl_result = await asyncio.to_thread(ETLOrchestrator.process, job_folder)
         if not isinstance(etl_result, dict) or not etl_result.get("success"):
             raise RuntimeError(f"Recovered ETL failed: {etl_result}")
 
+        # The durable job record must leave the recovery queue. Otherwise the
+        # same successfully processed job is discovered again on every restart.
+        await _mark_recovery_success(metadata, job_id)
         logger.info("STARTUP RECOVERY: job=%s finished successfully", job_id)
         return True
-    except Exception:
+    except Exception as exc:
+        await _mark_recovery_failure(metadata, job_id, exc)
         logger.exception("STARTUP RECOVERY: job=%s failed", job_id)
         return False
 
