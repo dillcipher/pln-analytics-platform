@@ -1,5 +1,7 @@
 import axios from "axios";
 
+const DEFAULT_BACKEND_ORIGIN = "https://pln-analytics-platform.fastapicloud.dev";
+
 function normalizeBaseUrl(url: string): string {
     return url.trim().replace(/\/+$/, "");
 }
@@ -18,19 +20,49 @@ const explicitApiUrl = normalizeProductionApiUrl(
         : "",
 );
 
-const backendUrl = normalizeBaseUrl(
+const configuredBackendUrl = normalizeBaseUrl(
     typeof import.meta.env.VITE_BACKEND_URL === "string"
         ? import.meta.env.VITE_BACKEND_URL
-        : "http://127.0.0.1:8000",
+        : "",
 );
 
-if (!import.meta.env.DEV && !explicitApiUrl) {
-    throw new Error(
-        "Production API is not configured. Set VITE_API_URL to the deployed FastAPI URL."
-    );
-}
+const sameOrigin =
+    typeof window !== "undefined"
+        ? normalizeBaseUrl(window.location.origin)
+        : "";
 
-const API_BASE_URL = explicitApiUrl || `${backendUrl}/api/v1`;
+/**
+ * Production deployment is intentionally self-contained:
+ *
+ * 1. VITE_API_URL may explicitly point to the deployed FastAPI service.
+ * 2. Otherwise Vercel's /api/v1 rewrite proxies to the production backend.
+ * 3. Local development keeps using VITE_BACKEND_URL or localhost.
+ *
+ * This prevents a successful Vercel build from producing a frontend that
+ * silently points at 127.0.0.1 or requires a missing production env var.
+ */
+const backendOrigin =
+    explicitApiUrl
+        ? explicitApiUrl.replace(/\/api\/v1$/, "")
+        : configuredBackendUrl ||
+          (!import.meta.env.DEV
+              ? DEFAULT_BACKEND_ORIGIN
+              : "http://127.0.0.1:8000");
+
+export const API_ORIGIN = normalizeBaseUrl(
+    explicitApiUrl
+        ? explicitApiUrl.replace(/\/api\/v1$/, "")
+        : configuredBackendUrl ||
+          (!import.meta.env.DEV
+              ? DEFAULT_BACKEND_ORIGIN
+              : "http://127.0.0.1:8000"),
+);
+
+const API_BASE_URL =
+    explicitApiUrl ||
+    (sameOrigin && !import.meta.env.DEV
+        ? `${sameOrigin}/api/v1`
+        : `${backendOrigin}/api/v1`);
 
 const api = axios.create({
     baseURL: API_BASE_URL,
