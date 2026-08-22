@@ -1,11 +1,9 @@
-"""Memory-safe DLPD month resolution for very large XLSX workbooks.
+"""Memory-safe DLPD month resolution for large XLSX workbooks.
 
-The normal MonthResolver implementation uses pandas.read_excel() for the
-entire DLPD sheet.  That is unsafe for 700+ MB workbooks on a small cloud
-container because pandas materializes a large in-memory dataframe.
-
-This module installs a narrow runtime patch that keeps the existing business
-month rules unchanged while reading XLSX rows with openpyxl's read_only mode.
+The normal MonthResolver implementation can materialize an entire workbook.
+This patch keeps the existing month business rules but makes the streaming
+pass substantially cheaper: only the required columns are iterated instead of
+allocating every column of every row, and the workbook is always closed.
 """
 
 from __future__ import annotations
@@ -28,6 +26,7 @@ def _stream_read_dlpd_months(
     sheet_name: str,
 ) -> list[str]:
     """Resolve all DLPD business months without materializing the workbook."""
+    del dataset  # The DLPD month rules are shared by both customer types.
     filepath = Path(filepath)
 
     thbl_column = DatasetValidator.normalize_column("THBL")
@@ -43,8 +42,9 @@ def _stream_read_dlpd_months(
             data_only=True,
         )
 
-        # Respect the already-resolved sheet name, but fall back safely if a
-        # provider/version changed the workbook sheet metadata.
+        if not workbook.sheetnames:
+            return []
+
         if sheet_name in workbook.sheetnames:
             worksheet = workbook[sheet_name]
         else:
@@ -59,11 +59,11 @@ def _stream_read_dlpd_months(
                 )
             ]
 
-        header_row = None
+        header_row: int | None = None
         header_indexes: dict[str, int] = {}
 
-        # Existing validator searches the first 15 rows. Keep the same
-        # behavior, but do it with streaming openpyxl instead of pandas.
+        # Preserve the existing detector behavior: a DLPD header is normally
+        # identified by IDPEL/LOCATIONCODE within the first 15 rows.
         for row_index, row in enumerate(
             worksheet.iter_rows(
                 min_row=1,
@@ -72,25 +72,20 @@ def _stream_read_dlpd_months(
             ),
             start=1,
         ):
-            indexes = {}
-            for column_index, value in enumerate(row):
-                normalized = DatasetValidator.normalize_column(value)
+            normalized_row = [
+                DatasetValidator.normalize_column(value)
+                for value in row
+            ]
+            indexes: dict[str, int] = {}
+            for column_index, normalized in enumerate(normalized_row):
                 if normalized in required and normalized not in indexes:
                     indexes[normalized] = column_index
 
-            if "IDPEL" in {
-                DatasetValidator.normalize_column(value)
-                for value in row
-            } or "LOCATIONCODE" in {
-                DatasetValidator.normalize_column(value)
-                for value in row
-            }:
+            if "IDPEL" in normalized_row or "LOCATIONCODE" in normalized_row:
                 header_row = row_index
                 header_indexes = indexes
                 break
 
-        # DLPD files normally expose IDPEL in the header. If a malformed file
-        # does not, retain the old detector's header=0 behavior.
         if header_row is None:
             header_row = 1
             header_values = next(
@@ -107,40 +102,49 @@ def _stream_read_dlpd_months(
                 if DatasetValidator.normalize_column(value) in required
             }
 
-        months: set[str] = set()
-
-        # If the required fields are absent, return [] exactly as the old
-        # implementation did after its exception-safe fallback.
         if not header_indexes:
             return []
 
-        max_index = max(header_indexes.values())
+        # openpyxl otherwise creates a tuple for every cell in every row.
+        # Restrict iteration to the smallest span containing the three fields
+        # so a wide DLPD workbook does not temporarily allocate hundreds of
+        # unrelated cells per row.
+        absolute_indexes = sorted(header_indexes.values())
+        min_col = absolute_indexes[0] + 1
+        max_col = absolute_indexes[-1] + 1
+        relative_indexes = {
+            key: index - absolute_indexes[0]
+            for key, index in header_indexes.items()
+        }
+
+        months: set[str] = set()
+        rows_seen = 0
 
         for row in worksheet.iter_rows(
             min_row=header_row + 1,
+            min_col=min_col,
+            max_col=max_col,
             values_only=True,
         ):
-            if not row:
-                continue
+            rows_seen += 1
 
-            values = row[: max_index + 1]
+            thbl_index = relative_indexes.get(thbl_column)
+            thblrek_index = relative_indexes.get(thblrek_column)
+            date_index = relative_indexes.get(date_column)
 
             thbl = (
-                values[header_indexes[thbl_column]]
-                if thbl_column in header_indexes
-                and header_indexes[thbl_column] < len(values)
+                row[thbl_index]
+                if thbl_index is not None and thbl_index < len(row)
                 else None
             )
             thblrek = (
-                values[header_indexes[thblrek_column]]
-                if thblrek_column in header_indexes
-                and header_indexes[thblrek_column] < len(values)
+                row[thblrek_index]
+                if thblrek_index is not None and thblrek_index < len(row)
                 else None
             )
             detail_date = (
-                values[header_indexes[date_column]]
-                if date_column in header_indexes
-                and header_indexes[date_column] < len(values)
+                row[date_index]
+                if date_index is not None and date_index < len(row)
                 else None
             )
 
@@ -166,10 +170,7 @@ def _stream_read_dlpd_months(
 
             if (
                 parsed_date is not None
-                and (
-                    thbl_start is not None
-                    or thblrek_start is not None
-                )
+                and (thbl_start is not None or thblrek_start is not None)
             ):
                 months.add(parsed_date.strftime("%Y%m"))
                 continue
@@ -205,7 +206,5 @@ def install_streaming_month_resolver_patch() -> None:
     if _INSTALLED:
         return
 
-    MonthResolver._read_dlpd_months = classmethod(
-        _stream_read_dlpd_months
-    )
+    MonthResolver._read_dlpd_months = classmethod(_stream_read_dlpd_months)
     _INSTALLED = True
