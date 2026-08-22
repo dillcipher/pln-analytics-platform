@@ -18,19 +18,41 @@ class Warehouse:
     """
     DuckDB Warehouse.
 
-    Responsible for:
-    - Opening database connections
-    - Refreshing warehouse from parquet files
-    - Executing SQL queries
-    - Warehouse utilities
-    - Persisting processed artifacts after a successful refresh
+    The processed parquet files are the source of truth. The warehouse
+    therefore exposes them as DuckDB views instead of copying every row into
+    a second in-process table. This is critical on the production 500 MB
+    memory tier: CREATE TABLE AS over a large DLPD dataset can temporarily
+    materialize hundreds of MB and trigger an OOM restart.
     """
+
+    _DUCKDB_MEMORY_LIMIT = "192MB"
+    _DUCKDB_THREADS = 1
 
     @classmethod
     def connect(cls) -> duckdb.DuckDBPyConnection:
         WAREHOUSE.parent.mkdir(parents=True, exist_ok=True)
+        temp_dir = WAREHOUSE.parent / "duckdb_tmp"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
         logger.info("Opening DuckDB warehouse: %s", WAREHOUSE)
-        return duckdb.connect(str(WAREHOUSE))
+        connection = duckdb.connect(str(WAREHOUSE))
+
+        # Keep DuckDB inside the small container's memory budget. Expensive
+        # query operators may spill to the local ephemeral disk instead of
+        # consuming the whole process memory allowance.
+        connection.execute(
+            f"SET memory_limit = '{cls._DUCKDB_MEMORY_LIMIT}'"
+        )
+        connection.execute(
+            f"SET threads = {cls._DUCKDB_THREADS}"
+        )
+        connection.execute("SET preserve_insertion_order = false")
+        connection.execute(
+            "SET temp_directory = ?",
+            [str(temp_dir)],
+        )
+
+        return connection
 
     @classmethod
     def refresh_tables(cls) -> None:
@@ -47,7 +69,7 @@ class Warehouse:
         try:
             for table_name, parquet_pattern in datasets.items():
                 logger.info("=" * 80)
-                logger.info("Refreshing table : %s", table_name)
+                logger.info("Refreshing warehouse view : %s", table_name)
                 logger.info("Source : %s", parquet_pattern)
 
                 files = sorted(
@@ -58,26 +80,31 @@ class Warehouse:
                     logger.warning("No parquet found for %s", table_name)
                     continue
 
+                # Never materialize the full parquet dataset into DuckDB.
+                # The view is lazy and DuckDB scans only the columns/rows a
+                # dashboard query actually needs.
                 connection.execute(
                     f"""
-                    CREATE OR REPLACE TABLE {table_name}
+                    CREATE OR REPLACE VIEW {table_name}
                     AS
                     SELECT *
                     FROM read_parquet('{parquet_pattern.as_posix()}')
                     """
                 )
 
-                connection.execute(f"ANALYZE {table_name}")
-
                 rows = connection.execute(
                     f"SELECT COUNT(*) FROM {table_name}"
                 ).fetchone()[0]
 
-                logger.info("%s refreshed (%s rows)", table_name, rows)
+                logger.info(
+                    "%s view ready (%s rows)",
+                    table_name,
+                    rows,
+                )
 
             connection.execute("CHECKPOINT")
             logger.info("=")
-            logger.info("WAREHOUSE REFRESH COMPLETED")
+            logger.info("WAREHOUSE REFRESH COMPLETED (LAZY PARQUET VIEWS)")
             logger.info("=")
         finally:
             connection.close()
