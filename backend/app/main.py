@@ -29,10 +29,9 @@ install_streaming_dlpd_merger_patch()
 install_runtime_guards()
 
 # A single deployment can receive the same job from multiple paths:
-# upload completion, frontend polling/retry, or manual recovery.  The
-# runtime guard serializes ETL for memory safety, but serialization alone
-# would make a duplicate request run the same job twice.  Keep a process-
-# local active-job registry so a duplicate trigger becomes a harmless no-op.
+# upload completion, frontend polling/retry, or manual recovery. The
+# runtime guard serializes ETL for memory safety, while this registry
+# prevents the same job from being executed twice concurrently.
 _ETL_ACTIVE_JOBS: set[str] = set()
 _ETL_ACTIVE_LOCK = threading.Lock()
 _ORIGINAL_ETL_PROCESS = ETLOrchestrator.process.__func__
@@ -148,7 +147,9 @@ async def on_startup():
     logger.info("Processed Data : %s", settings.DATA_PROCESSED_DIR)
 
     # Restore already-processed parquet artifacts before opening DuckDB.
-    # This is lightweight compared with re-reading the source workbooks.
+    # This is intentionally the only data-heavy operation performed during
+    # startup. It restores existing dashboard data without re-reading the
+    # source Excel workbook.
     hydrated = hydrate_processed_data()
     logger.info("Hydrated processed artifacts: %s", hydrated)
 
@@ -161,58 +162,59 @@ async def on_startup():
         logger.exception("Startup warehouse refresh failed; continuing startup.")
 
     # ==============================================================
-    # BOUNDED SELF-HEALING RECOVERY
+    # STARTUP ETL SAFETY
     # ==============================================================
     #
-    # The previous implementation either recovered every unfinished job
-    # during startup (which could OOM the instance) or disabled recovery
-    # completely (which left a fresh deployment with zero dashboard data).
+    # NEVER launch a large Excel ETL automatically during application boot.
+    # A previous bounded-recovery implementation still started one durable
+    # DLPD workbook whenever the warehouse was incomplete. That is exactly
+    # the failure mode that can put a memory-constrained container into an
+    # OOM/restart loop: boot -> ETL -> memory spike -> restart -> ETL again.
     #
-    # Correct behavior:
-    #   1. Hydrate durable processed parquet.
-    #   2. Refresh DuckDB views.
-    #   3. If the DLPD warehouse is still missing, recover ONE durable job
-    #      in the background.
-    #   4. Never block FastAPI startup and never fan out across all jobs.
+    # New uploads already trigger ETL after the upload request completes.
+    # Existing durable jobs can be resumed explicitly through the process
+    # endpoint, where the normal runtime memory gate and duplicate-job guard
+    # apply.
     #
-    # One-job recovery is enough for the normal deployment model where the
-    # uploaded workbook is the durable source for the whole DLPD dataset.
-    # If another unfinished job remains, it can be recovered on the next
-    # restart without creating a simultaneous memory spike.
-    required_data_tables = {
-        "fact_dlpd_prabayar",
-        "fact_dlpd_pascabayar",
+    # Automatic recovery is available only as an explicit emergency opt-in.
+    # It is OFF by default and should remain OFF on the production instance.
+    auto_recover = os.getenv(
+        "AUTO_RECOVER_ETL_ON_STARTUP",
+        "0",
+    ).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
     }
 
-    if not required_data_tables.issubset(tables):
+    if auto_recover:
         try:
-            from app.application.etl.startup_recovery_once import (
-                recover_one_pending_job,
-            )
+            from app.application.etl.startup_recovery_once import recover_one_pending_job
 
-            async def _bounded_recovery():
+            async def _explicit_recovery():
                 try:
                     result = await recover_one_pending_job()
                     logger.warning(
-                        "BOUNDED STARTUP RECOVERY COMPLETED | %s",
+                        "EXPLICIT STARTUP RECOVERY COMPLETED | %s",
                         result,
                     )
                 except Exception:
-                    logger.exception(
-                        "BOUNDED STARTUP RECOVERY FAILED",
-                    )
+                    logger.exception("EXPLICIT STARTUP RECOVERY FAILED")
 
-            asyncio.create_task(_bounded_recovery())
+            asyncio.create_task(_explicit_recovery())
             logger.warning(
-                "DLPD warehouse is incomplete; one durable ETL job was queued for background recovery."
+                "AUTO_RECOVER_ETL_ON_STARTUP=1: startup ETL recovery is ENABLED. "
+                "This may consume substantial memory."
             )
         except Exception:
-            logger.exception(
-                "Could not schedule bounded startup recovery."
-            )
+            logger.exception("Could not schedule explicit startup recovery.")
     else:
         logger.info(
-            "DLPD warehouse is present; startup ETL recovery is not required."
+            "Startup ETL recovery disabled for memory safety. "
+            "Existing durable jobs must be resumed explicitly via "
+            "POST /api/v1/process/{job_id}."
         )
 
+    logger.info("Application startup complete.")
     logger.info("=" * 80)
