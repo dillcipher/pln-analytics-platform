@@ -6,7 +6,6 @@ from typing import Any
 
 from app.application.etl.startup_recovery_safe import (
     MAX_FAILED_RECOVERY_ATTEMPTS,
-    RECOVERY_POLICY_VERSION,
     _LOCK,
     _load_jobs,
     _recover_one,
@@ -29,28 +28,57 @@ def _file_size(metadata: dict[str, Any]) -> int:
 
 
 def _is_eligible(metadata: dict[str, Any]) -> bool:
+    """Return only genuinely unfinished jobs that have retry budget left.
+
+    Exhausted jobs must stay out of the automatic startup queue even when the
+    recovery policy version changes. Resetting old attempts was the reason a
+    restart could continuously re-run historical DLPD workbooks and eventually
+    OOM the 500 MB service.
+
+    FAILED jobs are intentionally manual-recovery jobs. A transient failure can
+    be retried through the explicit process endpoint after the root cause is
+    fixed; it must never be re-launched forever by every service restart.
+    """
+    status = str(metadata.get("status") or "").strip().upper()
+    if status == "FAILED":
+        return False
+
     attempts = int(metadata.get("recovery_attempts") or 0)
-    policy = str(metadata.get("recovery_policy_version") or "")
-    if attempts < MAX_FAILED_RECOVERY_ATTEMPTS:
-        return True
-    if policy != RECOVERY_POLICY_VERSION:
-        logger.warning(
-            "STARTUP RECOVERY: old exhausted job is eligible after policy change | job=%s | attempts=%s | old_policy=%s | new_policy=%s",
-            metadata.get("job_id"), attempts, policy or "<none>", RECOVERY_POLICY_VERSION,
-        )
-        return True
-    return False
+    if attempts >= MAX_FAILED_RECOVERY_ATTEMPTS:
+        return False
+
+    return status in {
+        "UPLOADED",
+        "DETECTING",
+        "VALIDATING",
+        "MERGING",
+        "TRANSFORMING",
+        "EXPORTING",
+        "ASSEMBLY_QUEUED",
+        "ASSEMBLY_COMPLETED",
+    }
 
 
 async def recover_one_pending_job() -> dict[str, Any]:
-    """Recover at most one durable job; terminal detector failures are rejected."""
+    """Recover at most one durable job without retry storms."""
     async with _LOCK:
         jobs = await asyncio.to_thread(_load_jobs)
         eligible = [job for job in jobs if _is_eligible(job)]
         exhausted = len(jobs) - len(eligible)
+
         if not eligible:
-            logger.info("STARTUP RECOVERY: no eligible unfinished durable jobs found | exhausted=%s", exhausted)
-            return {"found": len(jobs), "eligible": 0, "recovered": 0, "failed": 0, "rejected": 0, "exhausted": exhausted}
+            logger.info(
+                "STARTUP RECOVERY: no eligible unfinished durable jobs found | exhausted=%s",
+                exhausted,
+            )
+            return {
+                "found": len(jobs),
+                "eligible": 0,
+                "recovered": 0,
+                "failed": 0,
+                "rejected": 0,
+                "exhausted": exhausted,
+            }
 
         metadata = min(
             eligible,
@@ -62,8 +90,12 @@ async def recover_one_pending_job() -> dict[str, Any]:
         job_id = str(metadata.get("job_id") or "").strip()
         logger.warning(
             "STARTUP RECOVERY: processing one eligible pending job | job=%s | size=%s | eligible=%s | exhausted=%s",
-            job_id, _file_size(metadata), len(eligible), exhausted,
+            job_id,
+            _file_size(metadata),
+            len(eligible),
+            exhausted,
         )
+
         result = await _recover_one(metadata)
         return {
             "found": len(jobs),
