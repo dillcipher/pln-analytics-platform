@@ -126,7 +126,14 @@ class MonthResolver:
         wb = load_workbook(filepath, read_only=True, data_only=True)
         try:
             ws = wb[sheet_name]
-            header_values = next(ws.iter_rows(min_row=header + 1, max_row=header + 1, values_only=True), None)
+            header_values = next(
+                ws.iter_rows(
+                    min_row=header + 1,
+                    max_row=header + 1,
+                    values_only=True,
+                ),
+                None,
+            )
             if not header_values:
                 return []
 
@@ -134,7 +141,11 @@ class MonthResolver:
             thbl_key = DatasetValidator.normalize_column("THBL")
             thblrek_key = DatasetValidator.normalize_column("THBLREK")
             date_key = DatasetValidator.normalize_column("DLPD_TGLBACA")
-            indexes = {name: i for i, name in enumerate(normalized) if name in {thbl_key, thblrek_key, date_key}}
+            indexes = {
+                name: i
+                for i, name in enumerate(normalized)
+                if name in {thbl_key, thblrek_key, date_key}
+            }
             thbl_idx = indexes.get(thbl_key)
             thblrek_idx = indexes.get(thblrek_key)
             date_idx = indexes.get(date_key)
@@ -170,80 +181,105 @@ class MonthResolver:
 
     @classmethod
     def _read_dlpd_months(cls, filepath: Path, dataset: str, sheet_name: str) -> list[str]:
-        try:
-            header = DatasetValidator.detect_header_row(filepath=filepath, sheet_name=sheet_name)
-            if Path(filepath).stat().st_size >= 20 * 1024 * 1024:
-                return cls._read_dlpd_months_streaming(filepath, dataset, sheet_name, header)
+        header = DatasetValidator.detect_header_row(filepath=filepath, sheet_name=sheet_name)
+        if Path(filepath).stat().st_size >= 20 * 1024 * 1024:
+            return cls._read_dlpd_months_streaming(filepath, dataset, sheet_name, header)
 
-            dataframe = pd.read_excel(
-                filepath,
-                sheet_name=sheet_name,
-                header=header,
-                usecols=lambda column: DatasetValidator.normalize_column(column) in {
-                    DatasetValidator.normalize_column("THBL"),
-                    DatasetValidator.normalize_column("THBLREK"),
-                    DatasetValidator.normalize_column("DLPD_TGLBACA"),
-                },
-            )
-            if dataframe.empty:
-                return []
-            dataframe.columns = [DatasetValidator.normalize_column(c) for c in dataframe.columns]
-            thbl_column = DatasetValidator.normalize_column("THBL")
-            thblrek_column = DatasetValidator.normalize_column("THBLREK")
-            date_column = DatasetValidator.normalize_column("DLPD_TGLBACA")
-            for column in (thbl_column, thblrek_column, date_column):
-                if column not in dataframe.columns:
-                    dataframe[column] = None
+        dataframe = pd.read_excel(
+            filepath,
+            sheet_name=sheet_name,
+            header=header,
+            usecols=lambda column: DatasetValidator.normalize_column(column) in {
+                DatasetValidator.normalize_column("THBL"),
+                DatasetValidator.normalize_column("THBLREK"),
+                DatasetValidator.normalize_column("DLPD_TGLBACA"),
+            },
+        )
+        if dataframe.empty:
+            return []
 
-            months: set[str] = set()
-            for _, row in dataframe.iterrows():
-                thbl = row.get(thbl_column)
-                thblrek = row.get(thblrek_column)
-                detail_date = row.get(date_column)
-                thbl_start = cls._month_start(thbl)
-                thblrek_start = cls._month_start(thblrek)
-                parsed_date = cls._parse_date(detail_date)
-                if parsed_date is not None and thbl_start is not None and thblrek_start is not None:
-                    period_start = min(thbl_start, thblrek_start)
-                    period_end = cls._month_end(max(thbl_start, thblrek_start))
-                    if period_end is not None and period_start <= parsed_date <= period_end:
-                        months.add(parsed_date.strftime("%Y%m"))
-                        continue
-                if parsed_date is not None and (thbl_start is not None or thblrek_start is not None):
+        dataframe.columns = [DatasetValidator.normalize_column(c) for c in dataframe.columns]
+        thbl_column = DatasetValidator.normalize_column("THBL")
+        thblrek_column = DatasetValidator.normalize_column("THBLREK")
+        date_column = DatasetValidator.normalize_column("DLPD_TGLBACA")
+        for column in (thbl_column, thblrek_column, date_column):
+            if column not in dataframe.columns:
+                dataframe[column] = None
+
+        months: set[str] = set()
+        for _, row in dataframe.iterrows():
+            thbl = row.get(thbl_column)
+            thblrek = row.get(thblrek_column)
+            detail_date = row.get(date_column)
+            thbl_start = cls._month_start(thbl)
+            thblrek_start = cls._month_start(thblrek)
+            parsed_date = cls._parse_date(detail_date)
+
+            if parsed_date is not None and thbl_start is not None and thblrek_start is not None:
+                period_start = min(thbl_start, thblrek_start)
+                period_end = cls._month_end(max(thbl_start, thblrek_start))
+                if period_end is not None and period_start <= parsed_date <= period_end:
                     months.add(parsed_date.strftime("%Y%m"))
                     continue
-                month = cls._normalize_month(thblrek) or cls._normalize_month(thbl)
-                if month:
-                    months.add(month)
-            return sorted(months)
-        except Exception as exc:
-            print(f"[MonthResolver] {filepath.name}: {exc}")
-            return []
+
+            if parsed_date is not None and (thbl_start is not None or thblrek_start is not None):
+                months.add(parsed_date.strftime("%Y%m"))
+                continue
+
+            month = cls._normalize_month(thblrek) or cls._normalize_month(thbl)
+            if month:
+                months.add(month)
+
+        return sorted(months)
 
     @classmethod
     def _read_first_month(cls, filepath: Path, dataset: str, sheet_name: str, column_name: str) -> str | None:
-        try:
-            header = DatasetValidator.detect_header_row(filepath=filepath, sheet_name=sheet_name)
-            dataframe = pd.read_excel(filepath, sheet_name=sheet_name, header=header, usecols=lambda column: DatasetValidator.normalize_column(column) == DatasetValidator.normalize_column(column_name))
-            if dataframe.empty:
-                return None
-            for value in dataframe.iloc[:, 0].tolist():
-                month = cls._normalize_month(value)
-                if month:
-                    return month
+        header = DatasetValidator.detect_header_row(filepath=filepath, sheet_name=sheet_name)
+        dataframe = pd.read_excel(
+            filepath,
+            sheet_name=sheet_name,
+            header=header,
+            usecols=lambda column: DatasetValidator.normalize_column(column) == DatasetValidator.normalize_column(column_name),
+        )
+        if dataframe.empty:
             return None
-        except Exception as exc:
-            print(f"[MonthResolver] {filepath.name}: {exc}")
-            return None
+        for value in dataframe.iloc[:, 0].tolist():
+            month = cls._normalize_month(value)
+            if month:
+                return month
+        return None
 
     @classmethod
-    def resolve_months(cls, filepath: Path, dataset: str) -> list[str]:
+    def resolve_months(cls, filepath: Path, dataset: str | None = None) -> list[str]:
+        """
+        Resolve business months for a workbook.
+
+        ``dataset`` is optional for backwards compatibility with older
+        callers that passed only a path. When omitted, use the same
+        lightweight filename/schema detector used by the upload pipeline.
+        This prevents the old one-argument call from raising a TypeError
+        during recovery.
+        """
         filepath = Path(filepath)
         if cls.is_coordinate_master(filepath):
             return []
+
+        if dataset is None:
+            dataset = FileDetector.detect(filepath)
+
+        if dataset == FileDetector.UNKNOWN:
+            raise ValueError(
+                f"Unable to determine dataset type for month resolution: {filepath.name}"
+            )
+
         sheet_name = cls._get_sheet_name(filepath, dataset)
         if dataset in {"DLPD_PASCABAYAR", "DLPD_PRABAYAR"}:
             return cls._read_dlpd_months(filepath, dataset, sheet_name)
-        column_name = {"ANEV": "READ_DATE", "PENGECEKAN": "WAKTU_PERIKSA", "CUSTOMER_LOCATION": "MONTH"}.get(dataset, "MONTH")
+
+        column_name = {
+            "ANEV": "READ_DATE",
+            "PENGECEKAN": "WAKTU_PERIKSA",
+            "CUSTOMER_LOCATION": "MONTH",
+        }.get(dataset, "MONTH")
         month = cls._read_first_month(filepath, dataset, sheet_name, column_name)
         return [month] if month else []
