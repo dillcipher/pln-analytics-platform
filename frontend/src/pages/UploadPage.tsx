@@ -48,7 +48,6 @@ export default function UploadPage() {
     async function pollJobs(jobIds: string[]): Promise<JobMap> {
         const pending = new Set(jobIds);
         const latest: JobMap = {};
-        const transientFailures: Record<string, number> = {};
 
         while (pollingRef.current && pending.size > 0) {
             const ids = Array.from(pending);
@@ -66,7 +65,6 @@ export default function UploadPage() {
 
                 if (response.status === "fulfilled") {
                     latest[jobId] = response.value.value;
-                    transientFailures[jobId] = 0;
 
                     if (isTerminal(response.value.value)) {
                         pending.delete(jobId);
@@ -76,7 +74,6 @@ export default function UploadPage() {
 
                 const error: any = response.reason;
                 const httpStatus = Number(error?.response?.status || 0);
-                transientFailures[jobId] = (transientFailures[jobId] || 0) + 1;
 
                 // A temporary network/proxy failure must not stop a long ETL.
                 // A real 404 means the durable job cannot be found anymore.
@@ -286,7 +283,11 @@ export default function UploadPage() {
                                 }}
                             >
                                 <div>
-                                    <strong>{job.files?.[0] ? String((job.files[0] as any)?.filename || jobId) : jobId}</strong>
+                                    <strong>
+                                        {job.files?.[0]
+                                            ? String((job.files[0] as any)?.filename || jobId)
+                                            : jobId}
+                                    </strong>
                                 </div>
                                 <div style={{ marginTop: 4 }}>
                                     Status: <strong>{status}</strong>
