@@ -102,8 +102,10 @@ async def on_startup():
     logger.info("Environment : %s", settings.ENVIRONMENT)
     logger.info("Processed Data : %s", settings.DATA_PROCESSED_DIR)
 
-    # Restore durable processed artifacts before touching DuckDB. The cloud
-    # filesystem is ephemeral, so this is required for restart-safe dashboards.
+    # Restore already-processed parquet artifacts before opening DuckDB.
+    # Never scan and ETL every durable job automatically during container
+    # startup: a large Excel recovery can exceed the serverless memory limit
+    # and cause an OOM restart loop before the API becomes ready.
     hydrated = hydrate_processed_data()
     logger.info("Hydrated processed artifacts: %s", hydrated)
 
@@ -113,15 +115,30 @@ async def on_startup():
     except Exception:
         logger.exception("Startup warehouse refresh failed; continuing startup.")
 
-    # Recovery is asynchronous so a large unfinished workbook never blocks
-    # FastAPI startup. recover_pending_jobs serializes recovery and persists
-    # checkpoints/status, preventing duplicate processing across restarts.
-    try:
-        from app.application.etl.startup_recovery import recover_pending_jobs
+    # Automatic recovery is an explicit opt-in. New uploads already enqueue
+    # their ETL immediately, and an existing durable job can be resumed with
+    # POST /api/v1/process/{job_id}. This keeps ordinary restarts memory-safe.
+    auto_recover = os.getenv("AUTO_RECOVER_ETL_ON_STARTUP", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
-        asyncio.create_task(recover_pending_jobs())
-        logger.info("Startup ETL recovery scheduled in background.")
-    except Exception:
-        logger.exception("Could not schedule startup ETL recovery.")
+    if auto_recover:
+        try:
+            from app.application.etl.startup_recovery import recover_pending_jobs
+
+            asyncio.create_task(recover_pending_jobs())
+            logger.warning(
+                "AUTO_RECOVER_ETL_ON_STARTUP is enabled; background recovery may consume significant memory."
+            )
+        except Exception:
+            logger.exception("Could not schedule startup ETL recovery.")
+    else:
+        logger.info(
+            "Startup ETL recovery disabled by default. "
+            "Use POST /api/v1/process/{job_id} to resume a durable job explicitly."
+        )
 
     logger.info("=" * 80)
