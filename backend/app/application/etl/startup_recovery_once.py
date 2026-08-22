@@ -28,22 +28,18 @@ def _file_size(metadata: dict[str, Any]) -> int:
 
 
 async def recover_one_pending_job() -> dict[str, Any]:
-    """Recover at most one unfinished durable ETL job.
-
-    Recovery is intentionally bounded to one job per deployment so a restart
-    cannot fan out into every historical workbook. Among eligible jobs we
-    prefer the smallest source file; this avoids selecting a ~700 MB workbook
-    when a smaller pending job can restore useful dashboard data safely.
-    """
+    """Recover at most one unfinished durable ETL job safely."""
     async with _RECOVERY_LOCK:
         jobs = await asyncio.to_thread(_load_pending_jobs)
 
         eligible_jobs = []
         exhausted_jobs = 0
         for metadata in jobs:
-            status = str(metadata.get("status") or "").upper()
             attempts = int(metadata.get("recovery_attempts") or 0)
-            if status == "FAILED" and attempts >= MAX_FAILED_RECOVERY_ATTEMPTS:
+            # Retry budget applies to every recoverable state. A job must not
+            # escape the limit merely because its last state remained MERGING
+            # or TRANSFORMING after a container restart.
+            if attempts >= MAX_FAILED_RECOVERY_ATTEMPTS:
                 exhausted_jobs += 1
                 continue
             eligible_jobs.append(metadata)
@@ -62,8 +58,7 @@ async def recover_one_pending_job() -> dict[str, Any]:
             }
 
         # Smallest-first is deliberate. A pending 40 MB DLPD workbook is a
-        # much safer startup recovery candidate than a 745+ MB Pascabayar
-        # workbook when both are waiting.
+        # much safer startup recovery candidate than a 745+ MB workbook.
         metadata = min(
             eligible_jobs,
             key=lambda item: (
