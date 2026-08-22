@@ -43,9 +43,7 @@ def _deduplicated_etl_process(cls, job_folder: Path):
     """Prevent duplicate ETL execution for the same job in one replica."""
     job_id = str(job_folder.name or "").strip()
     if not job_id:
-        raise ValueError(
-            "ETL job folder does not contain a valid job_id."
-        )
+        raise ValueError("ETL job folder does not contain a valid job_id.")
 
     with _ETL_ACTIVE_LOCK:
         if job_id in _ETL_ACTIVE_JOBS:
@@ -68,18 +66,17 @@ def _deduplicated_etl_process(cls, job_folder: Path):
             _ETL_ACTIVE_JOBS.discard(job_id)
 
 
-ETLOrchestrator.process = classmethod(
-    _deduplicated_etl_process
-)
+ETLOrchestrator.process = classmethod(_deduplicated_etl_process)
 
 from app.interface.api.v1.router import api_v1_router  # noqa: E402
 from app.interface.api.v1.durable_upload_queue_patch import (  # noqa: E402
     install_durable_upload_queue_patch,
 )
 
-# The /upload/complete endpoint still returns immediately, but its old
-# in-process assembly task is disabled. The durable worker below is now the
-# single owner of chunk assembly + ETL, eliminating races after restarts.
+# /upload/complete remains HTTP-fast. Durable assembly/ETL is not started
+# automatically during application boot because a large XLSX can exceed the
+# memory limit and cause a restart loop. Explicit processing remains available
+# through POST /api/v1/process/{job_id} and the upload workflow.
 install_durable_upload_queue_patch()
 
 settings = get_settings()
@@ -126,9 +123,7 @@ def readiness_check():
     try:
         tables = Warehouse.list_tables()
     except Exception:
-        logger.exception(
-            "Readiness warehouse inspection failed."
-        )
+        logger.exception("Readiness warehouse inspection failed.")
 
     durable_storage = all(
         os.getenv(name, "").strip()
@@ -149,11 +144,7 @@ def readiness_check():
     warehouse_ready = required_tables.issubset(set(tables))
 
     return {
-        "status": (
-            "ready"
-            if durable_storage and warehouse_ready
-            else "degraded"
-        ),
+        "status": "ready" if durable_storage and warehouse_ready else "degraded",
         "durable_storage": durable_storage,
         "warehouse_ready": warehouse_ready,
         "tables": tables,
@@ -168,57 +159,32 @@ async def on_startup():
     logger.info("Processed Data : %s", settings.DATA_PROCESSED_DIR)
 
     hydrated = hydrate_processed_data()
-    logger.info(
-        "Hydrated processed artifacts: %s",
-        hydrated,
-    )
+    logger.info("Hydrated processed artifacts: %s", hydrated)
 
     try:
         Warehouse.refresh_tables()
-        logger.info(
-            "Startup warehouse refresh completed."
-        )
+        logger.info("Startup warehouse refresh completed.")
     except Exception:
-        logger.exception(
-            "Startup warehouse refresh failed; continuing startup."
-        )
+        logger.exception("Startup warehouse refresh failed; continuing startup.")
 
-    # ----------------------------------------------------------
-    # DURABLE ETL WORKER
-    # ----------------------------------------------------------
-    # Uploaded jobs live in Supabase Storage. The worker therefore does not
-    # depend on the browser staying open and can resume after a FastAPI
-    # restart. Jobs are recovered one at a time, so a batch of large DLPD
-    # files never launches several memory-heavy ETLs concurrently in one
-    # process.
+    # CRITICAL: default is OFF. A server restart must never automatically pick
+    # a large pending DLPD workbook and run an unbounded Excel scan. That was
+    # the direct cause of the repeated OOM/restart cycle seen in production.
     auto_recover = os.getenv(
         "AUTO_RECOVER_ETL_ON_STARTUP",
-        "1",
-    ).strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+        "0",
+    ).strip().lower() in {"1", "true", "yes", "on"}
 
     if auto_recover:
         try:
-            from app.application.etl.startup_recovery_once import (
-                recover_one_pending_job,
-            )
+            from app.application.etl.startup_recovery_once import recover_one_pending_job
 
             async def _durable_recovery_worker():
-                logger.warning(
-                    "DURABLE ETL WORKER STARTED"
-                )
-
+                logger.warning("DURABLE ETL WORKER STARTED")
                 while True:
                     try:
                         result = await recover_one_pending_job()
-                        eligible = int(
-                            result.get("eligible", 0)
-                        )
-
+                        eligible = int(result.get("eligible", 0))
                         if eligible:
                             logger.warning(
                                 "DURABLE ETL WORKER PROCESSED JOB | %s",
@@ -227,28 +193,20 @@ async def on_startup():
                             await asyncio.sleep(3)
                         else:
                             await asyncio.sleep(15)
-
                     except asyncio.CancelledError:
                         raise
                     except Exception:
-                        logger.exception(
-                            "DURABLE ETL WORKER ITERATION FAILED"
-                        )
+                        logger.exception("DURABLE ETL WORKER ITERATION FAILED")
                         await asyncio.sleep(15)
 
-            asyncio.create_task(
-                _durable_recovery_worker()
-            )
-            logger.info(
-                "Durable ETL worker scheduled."
-            )
+            asyncio.create_task(_durable_recovery_worker())
+            logger.info("Durable ETL worker scheduled.")
         except Exception:
-            logger.exception(
-                "Could not schedule durable ETL worker."
-            )
+            logger.exception("Could not schedule durable ETL worker.")
     else:
         logger.info(
-            "Startup ETL recovery disabled by AUTO_RECOVER_ETL_ON_STARTUP."
+            "Startup ETL recovery disabled by default. Use POST /api/v1/process/{job_id} "
+            "for explicit recovery/processing."
         )
 
     logger.info("Application startup complete.")
