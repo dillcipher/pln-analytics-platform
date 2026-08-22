@@ -1,0 +1,16 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/v1/:path*",
+      "destination": "https://pln-analytics-platform.fastapicloud.dev/api/v1/:path*"
+    },
+    {
+      "source": "/health",
+      "destination": "https://pln-analytics-platform.fastapicloud.dev/health"
+    },
+    {
+      "source": "/health/:path*",
+      "destination": "https://pln-analytics-platform.fastapicloud.dev/health/:path*"
+    }
+  ]
+}
