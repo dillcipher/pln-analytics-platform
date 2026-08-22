@@ -35,6 +35,11 @@ RECOVERABLE_STATUSES = {
     "FAILED",
 }
 MAX_FAILED_RECOVERY_ATTEMPTS = max(1, int(os.getenv("MAX_FAILED_RECOVERY_ATTEMPTS", "3")))
+
+# Deliberately versioned: changing this gives already-exhausted jobs one
+# fresh retry budget after a real recovery/ETL fix, without retrying forever.
+RECOVERY_POLICY_VERSION = "2026-08-22-v2"
+
 _RECOVERY_LOCK = asyncio.Lock()
 
 
@@ -128,6 +133,7 @@ def _write_local_recovery_metadata(job_id: str, attempts: int) -> None:
     try:
         data = json.loads(manifest.read_text(encoding="utf-8"))
         data["recovery_attempts"] = attempts
+        data["recovery_policy_version"] = RECOVERY_POLICY_VERSION
         manifest.write_text(
             json.dumps(data, indent=4, ensure_ascii=False, default=str),
             encoding="utf-8",
@@ -149,6 +155,7 @@ async def _persist_job_metadata(metadata: dict[str, Any]) -> None:
 async def _mark_recovery_attempt(metadata: dict[str, Any], job_id: str) -> int:
     attempts = int(metadata.get("recovery_attempts") or 0) + 1
     metadata["recovery_attempts"] = attempts
+    metadata["recovery_policy_version"] = RECOVERY_POLICY_VERSION
     metadata["last_recovery_at"] = datetime.now().isoformat()
     _write_local_recovery_metadata(job_id, attempts)
     try:
@@ -164,6 +171,7 @@ async def _mark_recovery_success(metadata: dict[str, Any], job_id: str) -> None:
     metadata["current_step"] = "FINISHED"
     metadata["finished_at"] = datetime.now().isoformat()
     metadata["recovery_completed_at"] = datetime.now().isoformat()
+    metadata["recovery_policy_version"] = RECOVERY_POLICY_VERSION
     metadata.pop("last_error", None)
     _write_local_recovery_metadata(job_id, int(metadata.get("recovery_attempts") or 1))
     await _persist_job_metadata(metadata)
@@ -174,6 +182,7 @@ async def _mark_recovery_failure(metadata: dict[str, Any], job_id: str, exc: Exc
     metadata["current_step"] = "RECOVERY_FAILED"
     metadata["last_error"] = str(exc)
     metadata["last_failed_at"] = datetime.now().isoformat()
+    metadata["recovery_policy_version"] = RECOVERY_POLICY_VERSION
     try:
         await _persist_job_metadata(metadata)
     except Exception:
@@ -197,9 +206,26 @@ async def _recover_one(metadata: dict[str, Any]) -> bool:
 
     status = str(metadata.get("status") or "").upper()
     attempts = int(metadata.get("recovery_attempts") or 0)
-    if status == "FAILED" and attempts >= MAX_FAILED_RECOVERY_ATTEMPTS:
-        logger.error("STARTUP RECOVERY: retry limit reached | job=%s | attempts=%s", job_id, attempts)
-        return False
+    previous_policy = str(metadata.get("recovery_policy_version") or "")
+
+    if attempts >= MAX_FAILED_RECOVERY_ATTEMPTS:
+        if previous_policy != RECOVERY_POLICY_VERSION:
+            logger.warning(
+                "STARTUP RECOVERY: resetting exhausted retry budget after policy change | "
+                "job=%s | old_policy=%s | new_policy=%s",
+                job_id,
+                previous_policy or "<none>",
+                RECOVERY_POLICY_VERSION,
+            )
+            metadata["recovery_attempts"] = 0
+        else:
+            logger.error(
+                "STARTUP RECOVERY: retry limit reached | job=%s | attempts=%s | policy=%s",
+                job_id,
+                attempts,
+                RECOVERY_POLICY_VERSION,
+            )
+            return False
 
     await _mark_recovery_attempt(metadata, job_id)
     job_folder = RAW_UPLOAD / job_id
@@ -207,10 +233,12 @@ async def _recover_one(metadata: dict[str, Any]) -> bool:
 
     try:
         logger.info(
-            "STARTUP RECOVERY: recovering job=%s file=%s status=%s",
+            "STARTUP RECOVERY: recovering job=%s file=%s status=%s attempt=%s/%s",
             job_id,
             filename,
             status,
+            metadata.get("recovery_attempts"),
+            MAX_FAILED_RECOVERY_ATTEMPTS,
         )
         try:
             result = await UploadService.recover_assembled_job(
@@ -242,15 +270,10 @@ async def _recover_one(metadata: dict[str, Any]) -> bool:
 
         _write_local_recovery_metadata(job_id, int(metadata.get("recovery_attempts") or 1))
 
-        # ETLOrchestrator already performs the full pipeline, including
-        # CUSTOMER_LOCATION creation, DLPD month expansion, warehouse refresh,
-        # registry update, and durable processed-data persistence.
         etl_result = await asyncio.to_thread(ETLOrchestrator.process, job_folder)
         if not isinstance(etl_result, dict) or not etl_result.get("success"):
             raise RuntimeError(f"Recovered ETL failed: {etl_result}")
 
-        # The durable job record must leave the recovery queue. Otherwise the
-        # same successfully processed job is discovered again on every restart.
         await _mark_recovery_success(metadata, job_id)
         logger.info("STARTUP RECOVERY: job=%s finished successfully", job_id)
         return True
