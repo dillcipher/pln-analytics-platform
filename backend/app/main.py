@@ -12,10 +12,12 @@ from app.core.config import get_settings
 from app.core.logging_config import configure_logging
 from app.database.warehouse import Warehouse
 from app.etl.detector.streaming_month_resolver_patch import install_streaming_month_resolver_patch
+from app.etl.merger.streaming_dlpd_merger_patch import install_streaming_dlpd_merger_patch
 from app.etl.runtime_guard import install_runtime_guards
 from app.infrastructure.storage.processed_storage import hydrate_processed_data
 
 install_streaming_month_resolver_patch()
+install_streaming_dlpd_merger_patch()
 install_runtime_guards()
 
 from app.interface.api.v1.router import api_v1_router  # noqa: E402
@@ -107,10 +109,6 @@ async def on_startup():
     except Exception:
         logger.exception("Startup warehouse refresh failed; continuing startup.")
 
-    # Never replay a pile of old XLSX jobs from the API process on startup.
-    # Large DLPD workbooks can consume more memory than the web container has,
-    # and repeated recovery was previously responsible for endless retries and
-    # container churn. Upload-triggered ETL remains serialized by runtime_guard.
     logger.info("Startup ETL recovery disabled; ETL runs from explicit upload/reprocess actions.")
 
     if not settings.DATA_PROCESSED_DIR.exists():
