@@ -1,0 +1,56 @@
+name: One-time DLPD safety fix
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: ${{ !startsWith(github.event.head_commit.message, 'chore(auto-fix):') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch DLPD empty-dataset handling
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          path = Path('backend/app/infrastructure/duckdb/dlpd_repository.py')
+          text = path.read_text(encoding='utf-8-sig')
+
+          marker = '    def get_dashboard_ulp(\n'
+          start = text.index(marker)
+          end = text.index('    # ==========================================================\n    # CUSTOMER LIST', start)
+          block = text[start:end]
+
+          if 'if not dataset_exists(table):' not in block:
+              needle = '''        table = self._table(\n            customer_type,\n        )\n\n        where_sql, params = self._build_where(\n'''
+              replacement = '''        table = self._table(\n            customer_type,\n        )\n\n        # A dashboard request must remain healthy while a dataset is not\n        # installed yet. Returning an empty ULP list is preferable to a\n        # 503/CatalogException that breaks the entire dashboard.\n        if not dataset_exists(table):\n            return []\n\n        where_sql, params = self._build_where(\n'''
+              if needle not in block:
+                  raise SystemExit('Expected get_dashboard_ulp pattern not found')
+              block = block.replace(needle, replacement, 1)
+              text = text[:start] + block + text[end:]
+              path.write_text(text, encoding='utf-8')
+
+          # Keep the one-time workflow itself out of the repository after it
+          # has applied the patch.
+          workflow = Path('.github/workflows/one-time-dlpd-fix.yml')
+          if workflow.exists():
+              workflow.unlink()
+      - name: Commit patch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend/app/infrastructure/duckdb/dlpd_repository.py .github/workflows/one-time-dlpd-fix.yml
+          if git diff --cached --quiet; then
+            echo "No patch needed"
+            exit 0
+          fi
+          git commit -m "chore(auto-fix): harden DLPD empty dataset"
+          git push
