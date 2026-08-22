@@ -1,0 +1,1 @@
+Implemented design: long ETL work must not execute inside the request/response lifecycle. The process route should schedule the ETL task and return a durable job acknowledgement immediately; status is obtained from the durable job state.
