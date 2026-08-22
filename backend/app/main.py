@@ -19,6 +19,7 @@ from app.etl.detector.streaming_month_resolver_patch import install_streaming_mo
 from app.etl.merger.idpel_normalization_patch import install_idpel_normalization_patch
 from app.etl.merger.streaming_dlpd_merger_patch import install_streaming_dlpd_merger_patch
 from app.etl.runtime_guard import install_runtime_guards
+from app.infrastructure.duckdb.dlpd_query_guard import install_dlpd_query_guard
 from app.infrastructure.storage.processed_storage import hydrate_processed_data
 from app.application.etl.etl_orchestrator import ETLOrchestrator
 
@@ -27,6 +28,7 @@ install_streaming_month_resolver_patch()
 install_idpel_normalization_patch()
 install_streaming_dlpd_merger_patch()
 install_runtime_guards()
+install_dlpd_query_guard()
 
 # A single deployment can receive the same job from multiple paths:
 # upload completion, frontend polling/retry, or manual recovery. The
