@@ -68,7 +68,6 @@ async def _ensure_job_local(job_id: str):
             detail=f"Metadata job '{job_id}' tidak memiliki nama file yang valid.",
         )
 
-    # Normal path: the final assembled workbook is already durable in S3.
     try:
         result = await UploadService.recover_assembled_job(
             job_id=job_id,
@@ -86,7 +85,6 @@ async def _ensure_job_local(job_id: str):
             detail=f"Gagal memulihkan file job '{job_id}': {exc}",
         ) from exc
 
-    # If only durable chunks exist, assemble them now, one chunk at a time.
     upload_id = file_metadata.get("upload_id") or metadata.get("upload_id")
     total_chunks = file_metadata.get("total_chunks") or metadata.get("total_chunks")
     if upload_id and total_chunks is not None:
@@ -129,7 +127,6 @@ async def process_job(job_id: str):
     job_folder = await _ensure_job_local(job_id)
 
     try:
-        # Large Excel ETL is file/CPU heavy; keep it off FastAPI's event loop.
         result = await asyncio.to_thread(
             ETLOrchestrator.process,
             job_folder,
@@ -138,6 +135,25 @@ async def process_job(job_id: str):
         duration = round(time.perf_counter() - started, 2)
         logger.info("ETL finished (%s sec)", duration)
         logger.info("=" * 80)
+
+        # ETLOrchestrator intentionally returns a structured result on both
+        # success and failure. Do not turn an ETL failure into HTTP 200.
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                f"ETL returned an invalid result type: {type(result).__name__}"
+            )
+
+        if result.get("success") is not True:
+            error = str(result.get("error") or "ETL gagal tanpa pesan error.")
+            logger.error("ETL job failed | job=%s | error=%s", job_id, error)
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "job_id": job_id,
+                    "message": "ETL process gagal.",
+                    "error": error,
+                },
+            )
 
         return {
             "success": True,
