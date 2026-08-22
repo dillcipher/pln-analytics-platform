@@ -31,16 +31,6 @@ const sameOrigin =
         ? normalizeBaseUrl(window.location.origin)
         : "";
 
-/**
- * Production deployment is intentionally self-contained:
- *
- * 1. VITE_API_URL may explicitly point to the deployed FastAPI service.
- * 2. Otherwise Vercel's /api/v1 rewrite proxies to the production backend.
- * 3. Local development keeps using VITE_BACKEND_URL or localhost.
- *
- * This prevents a successful Vercel build from producing a frontend that
- * silently points at 127.0.0.1 or requires a missing production env var.
- */
 const backendOrigin =
     explicitApiUrl
         ? explicitApiUrl.replace(/\/api\/v1$/, "")
@@ -88,6 +78,36 @@ function isDlpdRead(config: any): boolean {
     return method === "get" && url.includes("/dlpd/");
 }
 
+function normalizeDlpdCustomerParams(config: any): void {
+    if (!isDlpdRead(config)) return;
+
+    const url = String(config?.url ?? "");
+    if (!url.endsWith("/dlpd/customers")) return;
+
+    const params = config.params;
+    if (!params || typeof params !== "object") return;
+
+    // The customer table historically used camelCase while FastAPI exposes
+    // snake_case query parameters. Normalize at the transport boundary so
+    // older callers cannot silently fall back to the default customer type.
+    if (
+        params.customer_type == null &&
+        params.customerType != null
+    ) {
+        params.customer_type = params.customerType;
+    }
+
+    if (
+        params.page_size == null &&
+        params.pageSize != null
+    ) {
+        params.page_size = params.pageSize;
+    }
+
+    delete params.customerType;
+    delete params.pageSize;
+}
+
 api.interceptors.request.use(async (config) => {
     const token = localStorage.getItem("access_token");
     if (token) {
@@ -99,6 +119,8 @@ api.interceptors.request.use(async (config) => {
         delete (config.headers as any)["Content-Type"];
         delete (config.headers as any)["content-type"];
     }
+
+    normalizeDlpdCustomerParams(config);
 
     if (isDlpdRead(config)) {
         let release!: () => void;
