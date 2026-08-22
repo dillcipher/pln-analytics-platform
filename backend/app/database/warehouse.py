@@ -36,16 +36,12 @@ class Warehouse:
         logger.info("Opening DuckDB warehouse: %s", WAREHOUSE)
         connection = duckdb.connect(str(WAREHOUSE))
 
-        # Keep DuckDB from consuming the entire container. Expensive query
-        # operators can spill to local ephemeral disk instead.
         connection.execute(
             f"SET memory_limit = '{cls._DUCKDB_MEMORY_LIMIT}'"
         )
         connection.execute(f"SET threads = {cls._DUCKDB_THREADS}")
         connection.execute("SET preserve_insertion_order = false")
 
-        # SET does not need a bound parameter here. Escape the path so this
-        # remains valid even if a deployment path contains an apostrophe.
         escaped_temp_dir = str(temp_dir).replace("'", "''")
         connection.execute(
             f"SET temp_directory = '{escaped_temp_dir}'"
@@ -59,7 +55,13 @@ class Warehouse:
         view_name: str,
         parquet_pattern: Path,
     ) -> None:
-        """Replace an old table/view with a lazy parquet-backed view."""
+        """Replace an old table/view with a lazy parquet-backed view.
+
+        Monthly DLPD partitions can legitimately evolve as different source
+        workbooks introduce optional columns. ``union_by_name`` makes the
+        all-month warehouse view tolerant of those schema differences while
+        keeping existing month-specific queries unchanged.
+        """
         relation_type = connection.execute(
             """
             SELECT table_type
@@ -75,9 +77,6 @@ class Warehouse:
             if object_type == "VIEW":
                 connection.execute(f"DROP VIEW {view_name}")
             else:
-                # Handles the old materialized TABLE created by previous
-                # releases. Dropping it releases the old warehouse storage
-                # without scanning or rebuilding the dataset in memory.
                 connection.execute(f"DROP TABLE {view_name}")
 
         pattern = str(parquet_pattern).replace("'", "''")
@@ -86,7 +85,10 @@ class Warehouse:
             CREATE VIEW {view_name}
             AS
             SELECT *
-            FROM read_parquet('{pattern}')
+            FROM read_parquet(
+                '{pattern}',
+                union_by_name = true
+            )
             """
         )
 
@@ -116,8 +118,6 @@ class Warehouse:
                     logger.warning("No parquet found for %s", table_name)
                     continue
 
-                # No COUNT(*) here. A count would force a full scan during
-                # every refresh and gives no value to the dashboard runtime.
                 cls._replace_with_parquet_view(
                     connection,
                     table_name,
@@ -132,7 +132,6 @@ class Warehouse:
         finally:
             connection.close()
 
-        # Persist only after the lightweight warehouse refresh succeeds.
         try:
             persisted = persist_processed_data()
             logger.info(
