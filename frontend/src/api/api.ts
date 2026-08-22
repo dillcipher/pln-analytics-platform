@@ -70,7 +70,25 @@ const api = axios.create({
     headers: { Accept: "application/json" },
 });
 
-api.interceptors.request.use((config) => {
+/**
+ * DLPD is the heaviest read surface in the application. The page can mount
+ * KPI, ULP, customer-list and map requests at the same time. Sending those
+ * parquet scans concurrently defeats the backend memory guard and can push
+ * a 500 MB container into OOM.
+ *
+ * Keep a tiny FIFO gate in the browser for DLPD GET requests. This does not
+ * affect uploads or unrelated API calls, and it preserves the existing API
+ * contract. A rejected request always releases the next request.
+ */
+let dlpdReadQueue: Promise<void> = Promise.resolve();
+
+function isDlpdRead(config: any): boolean {
+    const method = String(config?.method ?? "get").toLowerCase();
+    const url = String(config?.url ?? "");
+    return method === "get" && url.includes("/dlpd/");
+}
+
+api.interceptors.request.use(async (config) => {
     const token = localStorage.getItem("access_token");
     if (token) {
         config.headers = config.headers ?? {};
@@ -82,12 +100,38 @@ api.interceptors.request.use((config) => {
         delete (config.headers as any)["content-type"];
     }
 
+    if (isDlpdRead(config)) {
+        let release!: () => void;
+        const turn = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+
+        const previous = dlpdReadQueue;
+        dlpdReadQueue = previous.then(() => turn);
+
+        await previous;
+        (config as any).__dlpdRelease = release;
+    }
+
     return config;
 });
 
+function releaseDlpdRead(config: any): void {
+    const release = config?.__dlpdRelease;
+    if (typeof release === "function") {
+        delete config.__dlpdRelease;
+        release();
+    }
+}
+
 api.interceptors.response.use(
-    (response) => response,
+    (response) => {
+        releaseDlpdRead(response.config);
+        return response;
+    },
     (error) => {
+        releaseDlpdRead(error?.config);
+
         if (error?.response?.status === 401) {
             const requestUrl = String(error?.config?.url ?? "");
             if (!requestUrl.includes("/auth/login")) {
