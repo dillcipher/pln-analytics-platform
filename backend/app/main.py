@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 
@@ -105,9 +104,7 @@ async def on_startup():
     logger.info("Processed Data : %s", settings.DATA_PROCESSED_DIR)
 
     # Restore already-processed parquet artifacts before opening DuckDB.
-    # Never scan and ETL every durable job automatically during container
-    # startup: a large Excel recovery can exceed the serverless memory limit
-    # and cause an OOM restart loop before the API becomes ready.
+    # This is lightweight compared with re-reading the source workbooks.
     hydrated = hydrate_processed_data()
     logger.info("Hydrated processed artifacts: %s", hydrated)
 
@@ -117,30 +114,14 @@ async def on_startup():
     except Exception:
         logger.exception("Startup warehouse refresh failed; continuing startup.")
 
-    # Automatic recovery is an explicit opt-in. New uploads already enqueue
-    # their ETL immediately, and an existing durable job can be resumed with
-    # POST /api/v1/process/{job_id}. This keeps ordinary restarts memory-safe.
-    auto_recover = os.getenv("AUTO_RECOVER_ETL_ON_STARTUP", "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-    if auto_recover:
-        try:
-            from app.application.etl.startup_recovery import recover_pending_jobs
-
-            asyncio.create_task(recover_pending_jobs())
-            logger.warning(
-                "AUTO_RECOVER_ETL_ON_STARTUP is enabled; background recovery may consume significant memory."
-            )
-        except Exception:
-            logger.exception("Could not schedule startup ETL recovery.")
-    else:
-        logger.info(
-            "Startup ETL recovery disabled by default. "
-            "Use POST /api/v1/process/{job_id} to resume a durable job explicitly."
-        )
+    # IMPORTANT: do not launch ETL from application startup. FastAPI Cloud
+    # instances have a finite memory budget and may restart at any time.
+    # Launching every durable unfinished workbook here created an OOM loop and
+    # made the API unavailable. New uploads enqueue ETL through the upload
+    # pipeline; an existing durable job is explicitly resumable through
+    # POST /api/v1/process/{job_id}.
+    logger.info(
+        "Startup ETL recovery disabled: API readiness is independent of durable job processing."
+    )
 
     logger.info("=" * 80)
